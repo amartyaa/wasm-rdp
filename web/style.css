@@ -25,6 +25,8 @@ html, body {
     background: linear-gradient(135deg, var(--bg-start), var(--bg-end));
 }
 
+[hidden] { display: none !important; }
+
 /* ── Login Screen ─────────────────────────────────────── */
 .login-screen {
     display: flex;
