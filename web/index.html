@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Web-based Remote Desktop Client powered by IronRDP">
+    <title>Web RDP</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Login Screen -->
+    <div id="login-screen" class="login-screen">
+        <div class="login-card">
+            <div class="login-header">
+                <svg class="login-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <rect x="2" y="3" width="20" height="14" rx="2"/>
+                    <path d="M8 21h8M12 17v4"/>
+                </svg>
+                <h1>Remote Desktop</h1>
+                <p class="login-subtitle">Connect to your machine</p>
+            </div>
+            <form id="login-form" autocomplete="off">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" name="username" required autocomplete="username" placeholder="user@domain">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" required autocomplete="current-password" placeholder="••••••••">
+                </div>
+                <div class="form-group">
+                    <label for="domain">Domain <span class="optional">(optional)</span></label>
+                    <input type="text" id="domain" name="domain" autocomplete="off" placeholder="WORKGROUP">
+                </div>
+                <div class="form-row">
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="fullscreen-preconnect" checked>
+                        <span>Fullscreen on connect</span>
+                    </label>
+                </div>
+                <button type="submit" id="connect-btn" class="btn-connect">
+                    <span class="btn-text">Connect</span>
+                    <span class="btn-loader" hidden></span>
+                </button>
+                <div id="login-error" class="login-error" hidden></div>
+            </form>
+        </div>
+    </div>
+
+    <!-- RDP Canvas (hidden until connected) -->
+    <div id="canvas-container" class="canvas-container" hidden>
+        <canvas id="rdp-canvas"></canvas>
+    </div>
+
+    <!-- Floating Toolbar -->
+    <div id="toolbar" class="toolbar" hidden>
+        <div class="toolbar-inner">
+            <div class="toolbar-group">
+                <span id="fps-badge" class="badge" title="Frames per second">0 FPS</span>
+                <span id="resolution-badge" class="badge" title="Desktop resolution">--</span>
+                <span id="codec-badge" class="badge badge-accent" title="Active codec">RFX</span>
+            </div>
+            <div class="toolbar-group">
+                <button id="btn-cad" class="toolbar-btn" title="Send Ctrl+Alt+Del">
+                    <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16"><path d="M10 2a8 8 0 100 16 8 8 0 000-16zm0 14.5A6.5 6.5 0 1116.5 10 6.51 6.51 0 0110 16.5zm.7-10.2l-1.4 1.4L11.6 10l-2.3 2.3 1.4 1.4L13 11.4l2.3 2.3 1.4-1.4L14.4 10l2.3-2.3-1.4-1.4L13 8.6z"/></svg>
+                    <span>CAD</span>
+                </button>
+                <button id="btn-alttab" class="toolbar-btn" title="Send Alt+Tab">
+                    <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16"><path d="M3 4h14a1 1 0 011 1v10a1 1 0 01-1 1H3a1 1 0 01-1-1V5a1 1 0 011-1zm1 2v8h12V6H4z"/></svg>
+                    <span>Alt+Tab</span>
+                </button>
+                <button id="btn-fullscreen" class="toolbar-btn" title="Toggle fullscreen">
+                    <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16"><path d="M3 3h5v2H5v3H3V3zm9 0h5v5h-2V5h-3V3zM3 12h2v3h3v2H3v-5zm12 3h-3v2h5v-5h-2v3z"/></svg>
+                </button>
+                <button id="btn-disconnect" class="toolbar-btn toolbar-btn-danger" title="Disconnect">
+                    <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16"><path d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z"/></svg>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

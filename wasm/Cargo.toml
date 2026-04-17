@@ -1,0 +1,47 @@
+[package]
+name = "wasm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# IronRDP
+ironrdp = { version = "0.14", features = [
+    "connector", "session", "input", "graphics",
+    "dvc", "cliprdr", "svc", "displaycontrol", "pdu"
+] }
+ironrdp-core = "0.1"
+
+# Auth
+sspi = "0.18"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+
+# WASM bindings
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "HtmlCanvasElement", "CanvasRenderingContext2d", "ImageData",
+    "HtmlElement", "CssStyleDeclaration", "Document", "Element",
+    "Window", "Performance", "Navigator", "console",
+    "Clipboard", "ClipboardEvent", "DataTransfer",
+] }
+js-sys = "0.3"
+gloo-net = { version = "0.7", default-features = false, features = ["websocket", "io-util"] }
+gloo-timers = { version = "0.4", default-features = false, features = ["futures"] }
+
+# Async (non-tokio, WASM-compatible)
+futures-util = { version = "0.3", features = ["sink", "io"] }
+futures-channel = "0.3"
+
+# WASM compat for random/time
+getrandom = { version = "0.3", features = ["wasm_js"] }
+chrono = { version = "0.4", features = ["wasmbind"] }
+time = { version = "0.3", features = ["wasm-bindgen"] }
+
+# Utils
+anyhow = "1"
+tracing = { version = "0.1", features = ["log"] }
+smallvec = "1.15"
+bytes = "1"
