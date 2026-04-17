@@ -1,0 +1,10 @@
+C:\Users\amart\Downloads\web-rdp-rust\target\wasm32-unknown-unknown\debug\deps\ironrdp_displaycontrol-8e305c576527b7cb.d: C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\lib.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\client.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\pdu\mod.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\server.rs
+
+C:\Users\amart\Downloads\web-rdp-rust\target\wasm32-unknown-unknown\debug\deps\libironrdp_displaycontrol-8e305c576527b7cb.rlib: C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\lib.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\client.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\pdu\mod.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\server.rs
+
+C:\Users\amart\Downloads\web-rdp-rust\target\wasm32-unknown-unknown\debug\deps\libironrdp_displaycontrol-8e305c576527b7cb.rmeta: C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\lib.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\client.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\pdu\mod.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\server.rs
+
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\lib.rs:
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\client.rs:
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\pdu\mod.rs:
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.5.0\src\server.rs:

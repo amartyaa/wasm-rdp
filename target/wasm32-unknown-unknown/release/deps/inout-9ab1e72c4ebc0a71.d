@@ -1,0 +1,11 @@
+C:\Users\amart\Downloads\web-rdp-rust\target\wasm32-unknown-unknown\release\deps\inout-9ab1e72c4ebc0a71.d: C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\lib.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\errors.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\inout.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\inout_buf.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\reserved.rs
+
+C:\Users\amart\Downloads\web-rdp-rust\target\wasm32-unknown-unknown\release\deps\libinout-9ab1e72c4ebc0a71.rlib: C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\lib.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\errors.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\inout.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\inout_buf.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\reserved.rs
+
+C:\Users\amart\Downloads\web-rdp-rust\target\wasm32-unknown-unknown\release\deps\libinout-9ab1e72c4ebc0a71.rmeta: C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\lib.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\errors.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\inout.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\inout_buf.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\reserved.rs
+
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\lib.rs:
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\errors.rs:
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\inout.rs:
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\inout_buf.rs:
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.0-rc.6\src\reserved.rs:

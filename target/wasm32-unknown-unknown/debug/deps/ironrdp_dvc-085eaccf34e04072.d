@@ -1,0 +1,11 @@
+C:\Users\amart\Downloads\web-rdp-rust\target\wasm32-unknown-unknown\debug\deps\ironrdp_dvc-085eaccf34e04072.d: C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\lib.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\complete_data.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\client.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\server.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\pdu.rs
+
+C:\Users\amart\Downloads\web-rdp-rust\target\wasm32-unknown-unknown\debug\deps\libironrdp_dvc-085eaccf34e04072.rlib: C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\lib.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\complete_data.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\client.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\server.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\pdu.rs
+
+C:\Users\amart\Downloads\web-rdp-rust\target\wasm32-unknown-unknown\debug\deps\libironrdp_dvc-085eaccf34e04072.rmeta: C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\lib.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\complete_data.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\client.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\server.rs C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\pdu.rs
+
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\lib.rs:
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\complete_data.rs:
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\client.rs:
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\server.rs:
+C:\Users\amart\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.5.0\src\pdu.rs:
