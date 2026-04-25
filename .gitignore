@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# WASM build artifacts (rebuilt from source)
+/web/pkg/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Build output (scripts create this)
+/build-out/
+
+# Logs
+*.log

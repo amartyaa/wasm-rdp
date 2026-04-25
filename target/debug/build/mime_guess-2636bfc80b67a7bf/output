@@ -1,1 +1,0 @@
-cargo:rustc-env=MIME_TYPES_GENERATED_PATH=C:\Users\amart\Downloads\web-rdp-rust\target\debug\build\mime_guess-2636bfc80b67a7bf\out\mime_types_generated.rs
