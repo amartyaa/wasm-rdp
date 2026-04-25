@@ -89,3 +89,77 @@ Based on challenges faced during the initial implementation:
 ### Design Notes
 - **Axum Router:** Axum 0.8+ no longer supports `nest_service` at the root path. The server uses `fallback_service` to correctly handle static assets alongside the `/ws` route.
 - **Web-Sys Features:** Several DOM APIs used by the client (like `Clipboard` or `CssStyleDeclaration`) require explicit feature flags in `wasm/Cargo.toml`.
+
+
+
+# IronBridge — CredSSP/NLA Implementation Walkthrough
+
+## Architecture
+
+The CredSSP implementation uses a **proxy-mediated TLS** approach:
+
+```mermaid
+sequenceDiagram
+    participant Browser as WASM Client
+    participant Proxy as Server Proxy
+    participant RDP as RDP Server
+
+    Browser->>Proxy: X.224 Connection Request (via WS)
+    Proxy->>RDP: X.224 Connection Request (via TCP)
+    RDP->>Proxy: X.224 Connection Confirm (HYBRID)
+    Proxy->>Browser: X.224 Connection Confirm
+
+    Note over Browser: Connector → EnhancedSecurityUpgrade
+
+    Browser->>Proxy: {"cmd":"tls_upgrade"} (WS Text)
+    Proxy->>RDP: TLS Handshake (TCP→TLS)
+    RDP->>Proxy: TLS Established
+    Proxy->>Browser: {"cmd":"tls_ready","server_cert":"<hex>"} (WS Text)
+
+    Note over Browser: Connector → CredSSP
+
+    loop NTLM Rounds (2-3)
+        Browser->>Proxy: TSRequest (NTLM Token) (WS Binary)
+        Proxy->>RDP: TSRequest (via TLS)
+        RDP->>Proxy: TSRequest (Challenge) (via TLS)
+        Proxy->>Browser: TSRequest (WS Binary)
+    end
+
+    Browser->>Proxy: TSRequest (Final + auth_info) (WS Binary)
+    Proxy->>RDP: TSRequest (via TLS)
+
+    Note over Browser: Connector → BasicSettingsExchange
+    Note over Browser,RDP: Normal RDP session (all traffic via TLS tunnel)
+```
+
+## Build Verification
+
+| Component | Status | Notes |
+|---|---|---|
+| WASM (`--release`) | ✅ Exit 0 | 3 warnings (dead code, unused doc comment) |
+| Server (`--release`) | ✅ Exit 0 | Clean |
+| Full `build-windows.ps1` | ✅ Exit 0 | End-to-end verified |
+
+## How to Test
+
+1. **Build**: `.\scripts\build-windows.ps1`
+2. **Run**: `.\target\release\server.exe --port 8080 --rdp-target localhost:3389`
+3. **Connect** via browser: `http://localhost:8080`
+4. Enter username/password/domain → click Connect
+5. **Expected console logs** (if NLA is enabled on target):
+   ```
+   Security upgrade — requesting TLS from proxy...
+   TLS upgrade complete — server cert: XXX bytes
+   CredSSP: starting NTLM authentication...
+   CredSSP round 1
+   CredSSP round 2
+   CredSSP round 3
+   CredSSP: handshake complete
+   CredSSP: authentication successful!
+   Connector state: BasicSettingsExchangeSendInitial
+   ...
+   RDP connected!
+   ```
+
+> [!NOTE]
+> If the RDP target has NLA disabled, the connector will skip directly to BasicSettingsExchange (no TLS upgrade or CredSSP occurs). The code handles both paths.

@@ -14,6 +14,9 @@ futures-util = "0.3"
 rust-embed = "8"
 mime_guess = "2"
 axum-extra = { version = "0.10", features = ["typed-header"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"

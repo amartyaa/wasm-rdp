@@ -138,4 +138,69 @@ impl WasmFramed {
         let payload = self.buf.split_to(pdu_length).to_vec();
         Ok((action, payload))
     }
+
+    /// Read a text message from the WebSocket (used for proxy commands).
+    /// Skips any binary messages that may arrive and buffers them.
+    pub async fn read_text_message(&mut self) -> anyhow::Result<String> {
+        loop {
+            match self.ws_read.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    return Ok(text);
+                }
+                Some(Ok(Message::Bytes(data))) => {
+                    // Buffer binary data that arrives while we wait for text
+                    self.buf.extend_from_slice(&data);
+                }
+                Some(Err(e)) => {
+                    anyhow::bail!("WebSocket read error: {e}");
+                }
+                None => {
+                    anyhow::bail!("WebSocket closed while waiting for text message");
+                }
+            }
+        }
+    }
+
+    /// Read a CredSSP TSRequest response from the server.
+    /// TSRequest is BER-encoded: starts with a SEQUENCE tag (0x30)
+    /// followed by the length. We read the length then the full payload.
+    pub async fn read_credssp_response(&mut self) -> anyhow::Result<Vec<u8>> {
+        // Need at least 2 bytes to determine the TSRequest length
+        while self.buf.len() < 2 {
+            self.fill_buf().await?;
+        }
+
+        // BER SEQUENCE tag
+        if self.buf[0] != 0x30 {
+            anyhow::bail!(
+                "Expected BER SEQUENCE tag (0x30), got 0x{:02x}",
+                self.buf[0]
+            );
+        }
+
+        // Parse BER length
+        let (header_len, payload_len) = if self.buf[1] & 0x80 == 0 {
+            // Short form: length < 128
+            (2, self.buf[1] as usize)
+        } else {
+            // Long form: byte 1 indicates how many bytes encode the length
+            let num_len_bytes = (self.buf[1] & 0x7F) as usize;
+            while self.buf.len() < 2 + num_len_bytes {
+                self.fill_buf().await?;
+            }
+            let mut len: usize = 0;
+            for i in 0..num_len_bytes {
+                len = (len << 8) | (self.buf[2 + i] as usize);
+            }
+            (2 + num_len_bytes, len)
+        };
+
+        let total_len = header_len + payload_len;
+        while self.buf.len() < total_len {
+            self.fill_buf().await?;
+        }
+
+        Ok(self.buf.split_to(total_len).to_vec())
+    }
 }
+

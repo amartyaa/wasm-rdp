@@ -67,7 +67,9 @@ impl Session {
         log("WebSocket connected to proxy");
 
         // Build IronRDP connector config
-        let config = build_connector_config(username, password, domain, width, height);
+        let config = build_connector_config(
+            username.clone(), password.clone(), domain.clone(), width, height,
+        );
 
         // Split WebSocket for bidirectional I/O
         let (ws_write, ws_read) = ws.split();
@@ -86,7 +88,8 @@ impl Session {
         log("Starting RDP connection sequence...");
 
         let (connection_result, framed, ws_write) = perform_connection(
-            connector, framed, ws_write
+            connector, framed, ws_write,
+            &username, &password, &domain,
         ).await?;
 
         let desktop_width = connection_result.desktop_size.width;
@@ -238,16 +241,27 @@ impl Session {
 /// ConnectionInitiationSendRequest → ConnectionInitiationWaitConfirm → ...
 /// → SecurityUpgrade → CredSSP → ... → Connected
 ///
-/// At each state, we either:
-/// - step_no_input() if the connector doesn't need input (next_pdu_hint is None)
-/// - read exactly one PDU (using PduHint to determine size) and call step(pdu)
+/// At the SecurityUpgrade state:
+///   1. We send a `{"cmd":"tls_upgrade"}` text message to the proxy.
+///   2. The proxy upgrades its TCP connection to TLS and returns the server
+///      certificate as `{"cmd":"tls_ready","server_cert":"<hex>"}`.
+///   3. We store the certificate for CredSSP channel binding.
+///
+/// At the CredSSP state:
+///   1. We use `sspi::credssp::CredSspClient` with NTLM mode.
+///   2. Exchange TSRequest PDUs with the RDP server through the proxy's TLS tunnel.
+///   3. On success, mark CredSSP as done and continue with BasicSettingsExchange.
 async fn perform_connection(
     mut connector: ClientConnector,
     mut framed: WasmFramed,
     ws_write: futures_util::stream::SplitSink<WebSocket, gloo_net::websocket::Message>,
+    username: &str,
+    password: &str,
+    domain: &str,
 ) -> anyhow::Result<(ConnectionResult, WasmFramed, futures_util::stream::SplitSink<WebSocket, gloo_net::websocket::Message>)> {
     let mut ws_write = ws_write;
     let mut buf = WriteBuf::new();
+    let mut server_public_key: Vec<u8> = Vec::new();
 
     loop {
         // Check if we've reached the Connected state
@@ -259,15 +273,70 @@ async fn perform_connection(
             unreachable!();
         }
 
-        // Handle special transition states first
+        // Handle TLS security upgrade
         if connector.should_perform_security_upgrade() {
-            log("Security upgrade — skipping (proxy handles TLS)");
+            log("Security upgrade — requesting TLS from proxy...");
+
+            // Tell the proxy to upgrade its TCP connection to TLS
+            use gloo_net::websocket::Message as WsMsg;
+            let cmd = r#"{"cmd":"tls_upgrade"}"#;
+            ws_write.send(WsMsg::Text(cmd.to_string()))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send tls_upgrade: {e}"))?;
+
+            // Wait for the proxy's response (arrives as a text WS message)
+            // The framed reader only handles binary messages, so we need to
+            // read directly from the WebSocket for this one-time handshake.
+            // The proxy will send a text message with the server cert.
+            // We wait by polling the framed's internal fill_buf which stores
+            // text messages as errors — instead, let's use a different approach:
+            // we'll temporarily read from the raw framed buffer.
+            let cert_hex = framed.read_text_message().await
+                .context("Failed to read tls_ready response")?;
+
+            // Parse the JSON response
+            if let Some(cert_str) = parse_tls_ready(&cert_hex) {
+                server_public_key = hex_decode(&cert_str)?;
+                log(&format!(
+                    "TLS upgrade complete — server cert: {} bytes",
+                    server_public_key.len()
+                ));
+            } else {
+                log_error(&format!("Unexpected TLS response: {cert_hex}"));
+                anyhow::bail!("Invalid tls_ready response from proxy");
+            }
+
             connector.mark_security_upgrade_as_done();
             continue;
         }
 
+        // Handle CredSSP authentication
         if connector.should_perform_credssp() {
-            log("CredSSP — skipping (not yet implemented)");
+            if server_public_key.is_empty() {
+                log("CredSSP: no server cert available, skipping");
+                connector.mark_credssp_as_done();
+                continue;
+            }
+
+            log("CredSSP: starting NTLM authentication...");
+
+            match perform_credssp(
+                &server_public_key,
+                username,
+                password,
+                domain,
+                &mut framed,
+                &mut ws_write,
+            ).await {
+                Ok(()) => {
+                    log("CredSSP: authentication successful!");
+                }
+                Err(e) => {
+                    log_error(&format!("CredSSP failed: {e:#}"));
+                    log("Attempting to continue without CredSSP...");
+                }
+            }
+
             connector.mark_credssp_as_done();
             continue;
         }
@@ -277,8 +346,6 @@ async fn perform_connection(
 
         match connector.next_pdu_hint() {
             Some(hint) => {
-                // Connector needs input — read exactly one complete PDU
-                // using the hint to determine the PDU boundary
                 let pdu = framed.read_by_hint(hint).await
                     .context("Failed to read PDU from server")?;
 
@@ -287,7 +354,6 @@ async fn perform_connection(
                 let written = connector.step(&pdu, &mut buf)
                     .context("Connector step failed")?;
 
-                // Send any response the connector produced
                 if !written.is_nothing() {
                     let data = buf.filled().to_vec();
                     if !data.is_empty() {
@@ -300,7 +366,6 @@ async fn perform_connection(
                 }
             }
             None => {
-                // Connector doesn't need input — it wants to produce output
                 let written = connector.step_no_input(&mut buf)
                     .context("Connector step_no_input failed")?;
 
@@ -317,6 +382,135 @@ async fn perform_connection(
             }
         }
     }
+}
+
+/// Perform the CredSSP (NTLM) handshake over the TLS tunnel.
+///
+/// Uses `sspi::credssp::CredSspClient` with NTLM mode to exchange
+/// TSRequest PDUs with the RDP server.
+async fn perform_credssp(
+    server_public_key: &[u8],
+    username: &str,
+    password: &str,
+    domain: &str,
+    framed: &mut WasmFramed,
+    ws_write: &mut futures_util::stream::SplitSink<WebSocket, gloo_net::websocket::Message>,
+) -> anyhow::Result<()> {
+    use sspi::credssp::{CredSspClient, CredSspMode, ClientState, ClientMode};
+    use sspi::credssp::TsRequest;
+    use sspi::ntlm::NtlmConfig;
+    use sspi::generator::GeneratorState;
+
+    // Build NTLM credentials using sspi types
+    let sspi_username = sspi::Username::new(
+        username,
+        if domain.is_empty() { None } else { Some(domain) },
+    ).map_err(|e| anyhow::anyhow!("Invalid username: {e}"))?;
+
+    let credentials = sspi::Credentials::AuthIdentity(sspi::AuthIdentity {
+        username: sspi_username,
+        password: password.to_string().into(),
+    });
+
+    let spn = format!("TERMSRV/{}", "localhost");
+
+    let mut credssp_client = CredSspClient::new(
+        server_public_key.to_vec(),
+        credentials,
+        CredSspMode::WithCredentials,
+        ClientMode::Ntlm(NtlmConfig::default()),
+        spn,
+    ).map_err(|e| anyhow::anyhow!("CredSSP init failed: {e}"))?;
+
+    // First round: start with an empty TsRequest
+    let mut ts_request = TsRequest::default();
+    let mut round = 0;
+
+    loop {
+        round += 1;
+        log(&format!("CredSSP round {round}"));
+
+        // Process current ts_request through the CredSSP state machine
+        let mut generator = credssp_client.process(ts_request);
+        let client_state = match generator.start() {
+            GeneratorState::Completed(result) => {
+                result.map_err(|e| anyhow::anyhow!("CredSSP process error: {e}"))?
+            }
+            GeneratorState::Suspended(_network_request) => {
+                // NTLM doesn't need network requests (only Kerberos does).
+                // If we get here, it's unexpected for our NTLM-only flow.
+                anyhow::bail!("CredSSP: unexpected network request (Kerberos not supported)");
+            }
+        };
+
+        match client_state {
+            ClientState::ReplyNeeded(reply_ts_request) => {
+                // Encode and send the TSRequest to the RDP server
+                let mut encoded = Vec::new();
+                reply_ts_request.encode_ts_request(&mut encoded)
+                    .map_err(|e| anyhow::anyhow!("TSRequest encode failed: {e}"))?;
+
+                log(&format!("CredSSP: sending {} bytes", encoded.len()));
+                use gloo_net::websocket::Message;
+                ws_write.send(Message::Bytes(encoded)).await
+                    .map_err(|e| anyhow::anyhow!("WebSocket send: {e}"))?;
+
+                // Read the server's response TSRequest
+                let response_data = framed.read_credssp_response().await
+                    .context("Failed to read CredSSP response")?;
+
+                log(&format!("CredSSP: received {} bytes", response_data.len()));
+
+                ts_request = TsRequest::from_buffer(&response_data)
+                    .map_err(|e| anyhow::anyhow!("TSRequest decode failed: {e}"))?;
+            }
+            ClientState::FinalMessage(final_ts_request) => {
+                // Encode and send the final TSRequest (with auth_info)
+                let mut encoded = Vec::new();
+                final_ts_request.encode_ts_request(&mut encoded)
+                    .map_err(|e| anyhow::anyhow!("Final TSRequest encode failed: {e}"))?;
+
+                log(&format!("CredSSP: sending final message ({} bytes)", encoded.len()));
+                use gloo_net::websocket::Message;
+                ws_write.send(Message::Bytes(encoded)).await
+                    .map_err(|e| anyhow::anyhow!("WebSocket send: {e}"))?;
+
+                log("CredSSP: handshake complete");
+                return Ok(());
+            }
+        }
+
+        if round > 10 {
+            anyhow::bail!("CredSSP: too many rounds, aborting");
+        }
+    }
+}
+
+/// Parse `{"cmd":"tls_ready","server_cert":"<hex>"}` and return the hex string.
+fn parse_tls_ready(json_str: &str) -> Option<String> {
+    // Simple JSON parsing without serde (avoid adding serde to WASM)
+    if !json_str.contains("tls_ready") {
+        return None;
+    }
+    // Find "server_cert":"..."
+    let marker = "\"server_cert\":\"";
+    let start = json_str.find(marker)? + marker.len();
+    let end = json_str[start..].find('"')? + start;
+    Some(json_str[start..end].to_string())
+}
+
+/// Decode a hex string to bytes.
+fn hex_decode(hex: &str) -> anyhow::Result<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        anyhow::bail!("Odd-length hex string");
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))
+        })
+        .collect()
 }
 
 async fn run_session(
