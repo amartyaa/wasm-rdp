@@ -37,7 +37,9 @@ let frameCount = 0;
 let lastFpsUpdate = performance.now();
 let toolbarTimeout = null;
 let lastMouseTime = 0;
+let resizeTimeout = null;
 const MOUSE_THROTTLE_MS = 16; // ~60fps cap on mouse events
+const RESIZE_DEBOUNCE_MS = 250;
 
 // ── AT-101 Scancode Map ──────────────────────────────────
 // Maps KeyboardEvent.code → [scancode, isExtended]
@@ -119,6 +121,7 @@ loginForm.addEventListener('submit', async (e) => {
 
         resBadge.textContent = `${session.width}×${session.height}`;
         setupInputHandlers();
+        setupResizeHandler();
         startFpsCounter();
         showToolbar();
 
@@ -243,12 +246,34 @@ function onWheel(e) {
 }
 
 function onPaste(e) {
-    if (!session) return;
+    if (!session || !wasm) return;
     const text = e.clipboardData?.getData('text/plain');
     if (text) {
-        // TODO: Send clipboard text to WASM when cliprdr is implemented
-        console.log('Clipboard paste:', text.length, 'chars');
+        try {
+            wasm.clipboard_paste(text);
+        } catch (err) {
+            console.warn('Clipboard paste to WASM failed:', err);
+        }
     }
+}
+
+// ── Resize Handler ───────────────────────────────────────
+function setupResizeHandler() {
+    const onResize = () => {
+        if (!session) return;
+        clearTimeout(resizeTimeout);
+        resizeTimeout = setTimeout(() => {
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+            canvas.width = w;
+            canvas.height = h;
+            session.resize(w, h);
+            resBadge.textContent = `${w}×${h}`;
+        }, RESIZE_DEBOUNCE_MS);
+    };
+
+    document.addEventListener('fullscreenchange', onResize);
+    window.addEventListener('resize', onResize);
 }
 
 // ── Special Keys ─────────────────────────────────────────

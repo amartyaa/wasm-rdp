@@ -86,9 +86,65 @@ impl Canvas {
 
     /// Set the cursor style on the canvas element.
     pub fn set_cursor(&self, style: &str) {
-        // HtmlCanvasElement inherits from HtmlElement via Element
-        // Use the js interop to set the style
         let element: &web_sys::HtmlElement = self.canvas.unchecked_ref();
         let _ = element.style().set_property("cursor", style);
+    }
+
+    /// Set a custom cursor from an RGBA bitmap.
+    /// Creates an offscreen canvas, renders the bitmap, converts to data URL,
+    /// and sets it as CSS cursor with the given hotspot.
+    pub fn set_custom_cursor(
+        &self,
+        rgba_data: &[u8],
+        width: u32,
+        height: u32,
+        hotspot_x: u32,
+        hotspot_y: u32,
+    ) {
+        let window = match web_sys::window() {
+            Some(w) => w,
+            None => return,
+        };
+        let document = match window.document() {
+            Some(d) => d,
+            None => return,
+        };
+
+        // Create an offscreen canvas to render the cursor bitmap
+        let off_canvas = match document.create_element("canvas") {
+            Ok(el) => el,
+            Err(_) => return,
+        };
+        let off_canvas: HtmlCanvasElement = match off_canvas.dyn_into() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        off_canvas.set_width(width);
+        off_canvas.set_height(height);
+
+        let off_ctx: CanvasRenderingContext2d = match off_canvas
+            .get_context("2d")
+            .ok()
+            .flatten()
+            .and_then(|c| c.dyn_into().ok())
+        {
+            Some(ctx) => ctx,
+            None => return,
+        };
+
+        // putImageData expects RGBA — pointer bitmaps from IronRDP are already RGBA
+        if let Ok(img_data) = ImageData::new_with_u8_clamped_array_and_sh(
+            Clamped(&rgba_data[..]),
+            width,
+            height,
+        ) {
+            let _ = off_ctx.put_image_data(&img_data, 0.0, 0.0);
+        }
+
+        // Convert to data URL and set as CSS cursor
+        if let Ok(data_url) = off_canvas.to_data_url() {
+            let cursor_css = format!("url({data_url}) {hotspot_x} {hotspot_y}, auto");
+            self.set_cursor(&cursor_css);
+        }
     }
 }

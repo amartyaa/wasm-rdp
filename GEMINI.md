@@ -65,6 +65,3 @@ Whenever building locally, use the following command:
 ```bash
 .\scripts\build-windows.ps1
 ``` 
-
----
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

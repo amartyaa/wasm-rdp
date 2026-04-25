@@ -7,9 +7,11 @@ use ironrdp::pdu::Action;
 
 /// Async framed reader for WASM WebSocket transport.
 ///
-/// Reads raw bytes from the WebSocket, buffers them, and extracts
-/// complete RDP PDUs by examining the first byte for the Action type
-/// and reading the appropriate length.
+/// Buffers raw bytes from the WebSocket and extracts complete RDP PDUs.
+/// TCP doesn't guarantee message boundaries, and the proxy relays raw TCP
+/// reads as individual WebSocket messages. A single PDU may span multiple
+/// WS messages, or a single WS message may contain multiple PDUs.
+/// This struct handles both cases via internal buffering.
 pub(crate) struct WasmFramed {
     ws_read: SplitStream<WebSocket>,
     buf: BytesMut,
@@ -23,7 +25,7 @@ impl WasmFramed {
         }
     }
 
-    /// Read raw bytes from the WebSocket, appending to internal buffer.
+    /// Read more bytes from the WebSocket into the internal buffer.
     async fn fill_buf(&mut self) -> anyhow::Result<()> {
         match self.ws_read.next().await {
             Some(Ok(Message::Bytes(data))) => {
@@ -43,12 +45,53 @@ impl WasmFramed {
         }
     }
 
-    /// Read the next complete RDP PDU from the WebSocket stream.
+    /// Read exactly `n` bytes from the WebSocket, buffering as needed.
+    /// Returns the bytes and leaves any excess in the internal buffer.
+    async fn read_exact(&mut self, n: usize) -> anyhow::Result<Vec<u8>> {
+        while self.buf.len() < n {
+            self.fill_buf().await?;
+        }
+        Ok(self.buf.split_to(n).to_vec())
+    }
+
+    /// Read exactly one complete PDU using the connector's PduHint.
     ///
-    /// RDP frames start with a header byte that indicates whether it's
-    /// FastPath (0x00/0x04/0x08/0x0C) or X224 (0x03).
-    /// For FastPath: byte 1 is the length (1 or 2 bytes).
-    /// For X224: bytes 2-3 are the 16-bit big-endian length.
+    /// The PduHint knows how to determine PDU size from the first few header
+    /// bytes. We keep buffering WebSocket data until the hint can tell us
+    /// the full size, then we extract exactly that many bytes.
+    pub async fn read_by_hint(
+        &mut self,
+        hint: &dyn ironrdp::pdu::PduHint,
+    ) -> anyhow::Result<Vec<u8>> {
+        loop {
+            // Try to determine the PDU size from what we have buffered
+            match hint.find_size(&self.buf) {
+                Ok(Some((_hint_matched, pdu_length))) => {
+                    if pdu_length == 0 {
+                        anyhow::bail!("PduHint returned zero-length PDU");
+                    }
+                    // We know the size — ensure we have all the bytes
+                    while self.buf.len() < pdu_length {
+                        self.fill_buf().await?;
+                    }
+                    return Ok(self.buf.split_to(pdu_length).to_vec());
+                }
+                Ok(None) => {
+                    // Not enough bytes to determine size yet — read more
+                    self.fill_buf().await?;
+                }
+                Err(e) => {
+                    anyhow::bail!("PduHint find_size error: {e}");
+                }
+            }
+        }
+    }
+
+    /// Read the next complete RDP PDU from the WebSocket stream.
+    /// Used during the active session phase (after connection).
+    ///
+    /// Determines Action (FastPath vs X224) from the first byte and
+    /// reads the full PDU length from the wire format header.
     pub async fn read_pdu(&mut self) -> anyhow::Result<(Action, Vec<u8>)> {
         // Ensure we have at least 2 bytes for the header
         while self.buf.len() < 2 {
@@ -66,19 +109,17 @@ impl WasmFramed {
                 while self.buf.len() < 4 {
                     self.fill_buf().await?;
                 }
-                let len = u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize;
-                len
+                u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize
             }
             Action::FastPath => {
                 // FastPath: byte 0 = header, byte 1 = length
-                // If bit 7 of byte 1 is set, length is 2 bytes (byte1[6:0] << 8 | byte2)
+                // If bit 7 of byte 1 is set, length is 2 bytes
                 let len_byte = self.buf[1];
                 if len_byte & 0x80 != 0 {
                     while self.buf.len() < 3 {
                         self.fill_buf().await?;
                     }
-                    let len = (((len_byte & 0x7F) as usize) << 8) | (self.buf[2] as usize);
-                    len
+                    (((len_byte & 0x7F) as usize) << 8) | (self.buf[2] as usize)
                 } else {
                     len_byte as usize
                 }
@@ -94,31 +135,7 @@ impl WasmFramed {
             self.fill_buf().await?;
         }
 
-        // Extract the complete PDU
         let payload = self.buf.split_to(pdu_length).to_vec();
         Ok((action, payload))
-    }
-
-    /// Read raw bytes from the WebSocket (for connector phase).
-    /// Returns whatever the WebSocket gives us in one message.
-    pub async fn read_bytes(&mut self) -> anyhow::Result<Vec<u8>> {
-        if !self.buf.is_empty() {
-            return Ok(self.buf.split().to_vec());
-        }
-
-        match self.ws_read.next().await {
-            Some(Ok(Message::Bytes(data))) => Ok(data),
-            Some(Ok(Message::Text(_))) => Box::pin(self.read_bytes()).await,
-            Some(Err(e)) => anyhow::bail!("WebSocket read error: {e}"),
-            None => anyhow::bail!("WebSocket closed"),
-        }
-    }
-
-    /// Push data back into the buffer.
-    pub fn push_back(&mut self, data: &[u8]) {
-        let mut new_buf = BytesMut::with_capacity(data.len() + self.buf.len());
-        new_buf.extend_from_slice(data);
-        new_buf.extend_from_slice(&self.buf);
-        self.buf = new_buf;
     }
 }

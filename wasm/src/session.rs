@@ -32,6 +32,7 @@ pub struct Session {
 
 pub(crate) enum InputEvent {
     FastPath(smallvec::SmallVec<[FastPathInputEvent; 2]>),
+    Resize { width: u16, height: u16 },
     Terminate,
 }
 
@@ -216,6 +217,14 @@ impl Session {
         self.desktop_height
     }
 
+    /// Request desktop resize (e.g. on fullscreen change)
+    #[wasm_bindgen]
+    pub fn resize(&mut self, width: u16, height: u16) {
+        self.desktop_width = width;
+        self.desktop_height = height;
+        let _ = self.input_tx.unbounded_send(InputEvent::Resize { width, height });
+    }
+
     /// Terminate the session
     #[wasm_bindgen]
     pub fn shutdown(&self) {
@@ -230,8 +239,8 @@ impl Session {
 /// → SecurityUpgrade → CredSSP → ... → Connected
 ///
 /// At each state, we either:
-/// - step_no_input() if the connector needs to produce an outgoing PDU, or
-/// - step(input) if the connector needs to process an incoming PDU
+/// - step_no_input() if the connector doesn't need input (next_pdu_hint is None)
+/// - read exactly one PDU (using PduHint to determine size) and call step(pdu)
 async fn perform_connection(
     mut connector: ClientConnector,
     mut framed: WasmFramed,
@@ -243,7 +252,6 @@ async fn perform_connection(
     loop {
         // Check if we've reached the Connected state
         if let ClientConnectorState::Connected { .. } = &connector.state {
-            // Take the result out of the state by replacing with Consumed
             let state = mem::replace(&mut connector.state, ClientConnectorState::Consumed);
             if let ClientConnectorState::Connected { result } = state {
                 return Ok((result, framed, ws_write));
@@ -251,56 +259,62 @@ async fn perform_connection(
             unreachable!();
         }
 
-        let state_name = connector.state.name();
-        log(&format!("Connector state: {state_name}"));
-
-        // Check if the connector needs to send something first (no input required)
-        if connector.next_pdu_hint().is_none() {
-            let written = connector.step_no_input(&mut buf)
-                .context("Connector step_no_input failed")?;
-
-            if !written.is_nothing() {
-                let data = buf.filled().to_vec();
-                if !data.is_empty() {
-                    use gloo_net::websocket::Message;
-                    ws_write.send(Message::Bytes(data)).await
-                        .map_err(|e| anyhow::anyhow!("WebSocket send: {e}"))?;
-                }
-                buf.clear();
-            }
+        // Handle special transition states first
+        if connector.should_perform_security_upgrade() {
+            log("Security upgrade — skipping (proxy handles TLS)");
+            connector.mark_security_upgrade_as_done();
             continue;
         }
 
-        // Connector needs input — read from WebSocket
-        let incoming = framed.read_bytes().await?;
-
-        let written = connector.step(&incoming, &mut buf)
-            .context("Connector step failed")?;
-
-        if !written.is_nothing() {
-            let data = buf.filled().to_vec();
-            if !data.is_empty() {
-                use gloo_net::websocket::Message;
-                ws_write.send(Message::Bytes(data)).await
-                    .map_err(|e| anyhow::anyhow!("WebSocket send: {e}"))?;
-            }
-            buf.clear();
-        }
-
-        // Check for TLS upgrade state
-        if connector.should_perform_security_upgrade() {
-            log("Security upgrade required — skipping for localhost proxy");
-            // The proxy handles TLS to the RDP server. We tell the connector
-            // to skip the TLS upgrade since our WebSocket is already the transport.
-            connector.mark_security_upgrade_as_done();
-        }
-
-        // Check for CredSSP state
         if connector.should_perform_credssp() {
-            log("CredSSP required — skipping (not yet implemented)");
-            // For now, skip CredSSP. This means NLA won't work yet.
-            // TODO: Implement CredSSP through the WebSocket tunnel.
+            log("CredSSP — skipping (not yet implemented)");
             connector.mark_credssp_as_done();
+            continue;
+        }
+
+        let state_name = connector.state.name();
+        log(&format!("Connector state: {state_name}"));
+
+        match connector.next_pdu_hint() {
+            Some(hint) => {
+                // Connector needs input — read exactly one complete PDU
+                // using the hint to determine the PDU boundary
+                let pdu = framed.read_by_hint(hint).await
+                    .context("Failed to read PDU from server")?;
+
+                log(&format!("  Received {} bytes from server", pdu.len()));
+
+                let written = connector.step(&pdu, &mut buf)
+                    .context("Connector step failed")?;
+
+                // Send any response the connector produced
+                if !written.is_nothing() {
+                    let data = buf.filled().to_vec();
+                    if !data.is_empty() {
+                        log(&format!("  Sending {} bytes to server", data.len()));
+                        use gloo_net::websocket::Message;
+                        ws_write.send(Message::Bytes(data)).await
+                            .map_err(|e| anyhow::anyhow!("WebSocket send: {e}"))?;
+                    }
+                    buf.clear();
+                }
+            }
+            None => {
+                // Connector doesn't need input — it wants to produce output
+                let written = connector.step_no_input(&mut buf)
+                    .context("Connector step_no_input failed")?;
+
+                if !written.is_nothing() {
+                    let data = buf.filled().to_vec();
+                    if !data.is_empty() {
+                        log(&format!("  Sending {} bytes to server", data.len()));
+                        use gloo_net::websocket::Message;
+                        ws_write.send(Message::Bytes(data)).await
+                            .map_err(|e| anyhow::anyhow!("WebSocket send: {e}"))?;
+                    }
+                    buf.clear();
+                }
+            }
         }
     }
 }
@@ -329,6 +343,22 @@ async fn run_session(
                         active_stage.process_fastpath_input(&mut image, &events)
                             .context("process input")?
                     }
+                    Some(InputEvent::Resize { width: w, height: h }) => {
+                        log(&format!("Resize requested: {w}x{h}"));
+                        match active_stage.encode_resize(u32::from(w), u32::from(h), None, None) {
+                            Some(Ok(resize_frame)) => {
+                                vec![ActiveStageOutput::ResponseFrame(resize_frame)]
+                            }
+                            Some(Err(e)) => {
+                                log_error(&format!("Resize failed: {e}"));
+                                Vec::new()
+                            }
+                            None => {
+                                log("Resize: displaycontrol not available");
+                                Vec::new()
+                            }
+                        }
+                    }
                     Some(InputEvent::Terminate) => {
                         active_stage.graceful_shutdown()
                             .context("graceful shutdown")?
@@ -354,8 +384,14 @@ async fn run_session(
                 ActiveStageOutput::PointerHidden => {
                     canvas.set_cursor("none");
                 }
-                ActiveStageOutput::PointerBitmap(_pointer) => {
-                    // TODO: custom cursor rendering
+                ActiveStageOutput::PointerBitmap(pointer) => {
+                    canvas.set_custom_cursor(
+                        &pointer.bitmap_data,
+                        pointer.width as u32,
+                        pointer.height as u32,
+                        pointer.hotspot_x as u32,
+                        pointer.hotspot_y as u32,
+                    );
                 }
                 ActiveStageOutput::Terminate(_reason) => {
                     log("RDP session terminated by server");

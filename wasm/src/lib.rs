@@ -44,6 +44,12 @@ pub(crate) fn notify_frame() {
     }
 }
 
+/// Called from JS when the user pastes text (Local → Remote clipboard).
+#[wasm_bindgen]
+pub fn clipboard_paste(text: String) {
+    clipboard::set_pending_clipboard(text);
+}
+
 /// Log to browser console
 #[wasm_bindgen]
 extern "C" {

@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Step 1: Build WASM (platform-independent) ─────────────
+  build-wasm:
+    name: Build WASM Module
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM
+        run: wasm-pack build wasm/ --release --target web --out-dir ../web/pkg
+
+      - name: Upload WASM Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-pkg
+          path: web/pkg/
+
+  # ── Step 2: Build Server (Windows) ────────────────────────
+  build-windows:
+    name: Build Windows
+    needs: build-wasm
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download WASM Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg
+          path: web/pkg/
+
+      - name: Build Server
+        run: cargo build --release -p server
+
+      - name: Prepare Release
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path release
+          Copy-Item target\release\server.exe release\ironbridge.exe
+          Copy-Item scripts\install-service-windows.ps1 release\
+          Copy-Item scripts\ironbridge.service release\
+          Copy-Item README.md release\
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: release/
+
+  # ── Step 3: Build Server (Linux x86_64) ───────────────────
+  build-linux:
+    name: Build Linux
+    needs: build-wasm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download WASM Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg
+          path: web/pkg/
+
+      - name: Build Server
+        run: cargo build --release -p server
+
+      - name: Prepare Release
+        run: |
+          mkdir -p release
+          cp target/release/server release/ironbridge
+          cp scripts/ironbridge.service release/
+          cp README.md release/
+
+      - name: Upload Linux Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-build
+          path: release/
+
+  # ── Step 4: Create GitHub Release ─────────────────────────
+  create-release:
+    name: Create Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-build
+          path: windows/
+
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-build
+          path: linux/
+
+      - name: Package Archives
+        run: |
+          cd windows && zip -r ../ironbridge-windows-x86_64.zip . && cd ..
+          cd linux && tar czf ../ironbridge-linux-x86_64.tar.gz . && cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ironbridge-windows-x86_64.zip
+            ironbridge-linux-x86_64.tar.gz
+          generate_release_notes: true

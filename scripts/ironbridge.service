@@ -1,0 +1,21 @@
+[Unit]
+Description=IronBridge Web RDP Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ironbridge --port 8080 --rdp-target localhost:3389
+Restart=on-failure
+RestartSec=5
+User=ironbridge
+Group=ironbridge
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

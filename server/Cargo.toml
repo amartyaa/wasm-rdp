@@ -11,3 +11,10 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
+rust-embed = "8"
+mime_guess = "2"
+axum-extra = { version = "0.10", features = ["typed-header"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
