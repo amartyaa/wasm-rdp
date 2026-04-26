@@ -258,22 +258,11 @@ function onPaste(e) {
 }
 
 // ── Resize Handler ───────────────────────────────────────
+// Disabled: xrdp does not support the Display Control Virtual Channel,
+// so dynamic resize causes a black screen. Canvas stays fixed at the
+// negotiated RDP resolution.
 function setupResizeHandler() {
-    const onResize = () => {
-        if (!session) return;
-        clearTimeout(resizeTimeout);
-        resizeTimeout = setTimeout(() => {
-            const w = window.innerWidth;
-            const h = window.innerHeight;
-            canvas.width = w;
-            canvas.height = h;
-            session.resize(w, h);
-            resBadge.textContent = `${w}×${h}`;
-        }, RESIZE_DEBOUNCE_MS);
-    };
-
-    document.addEventListener('fullscreenchange', onResize);
-    window.addEventListener('resize', onResize);
+    // no-op: keep canvas at the server-negotiated size
 }
 
 // ── Special Keys ─────────────────────────────────────────

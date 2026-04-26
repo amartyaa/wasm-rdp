@@ -26,6 +26,7 @@ use crate::{log, log_error};
 #[wasm_bindgen]
 pub struct Session {
     input_tx: mpsc::UnboundedSender<InputEvent>,
+    input_db: ironrdp::input::Database,
     desktop_width: u16,
     desktop_height: u16,
 }
@@ -143,6 +144,7 @@ impl Session {
 
         Ok(Session {
             input_tx,
+            input_db: ironrdp::input::Database::new(),
             desktop_width,
             desktop_height,
         })
@@ -150,7 +152,7 @@ impl Session {
 
     /// Send a keyboard scancode event
     #[wasm_bindgen]
-    pub fn send_keyboard(&self, scancode: u8, is_pressed: bool, is_extended: bool) {
+    pub fn send_keyboard(&mut self, scancode: u8, is_pressed: bool, is_extended: bool) {
         let sc = ironrdp::input::Scancode::from_u8(is_extended, scancode);
         let op = if is_pressed {
             ironrdp::input::Operation::KeyPressed(sc)
@@ -158,23 +160,21 @@ impl Session {
             ironrdp::input::Operation::KeyReleased(sc)
         };
 
-        let mut db = ironrdp::input::Database::new();
-        let events = db.apply(std::iter::once(op));
+        let events = self.input_db.apply(std::iter::once(op));
         let _ = self.input_tx.unbounded_send(InputEvent::FastPath(events));
     }
 
     /// Send a mouse move event
     #[wasm_bindgen]
-    pub fn send_mouse_move(&self, x: u16, y: u16) {
+    pub fn send_mouse_move(&mut self, x: u16, y: u16) {
         let op = ironrdp::input::Operation::MouseMove(ironrdp::input::MousePosition { x, y });
-        let mut db = ironrdp::input::Database::new();
-        let events = db.apply(std::iter::once(op));
+        let events = self.input_db.apply(std::iter::once(op));
         let _ = self.input_tx.unbounded_send(InputEvent::FastPath(events));
     }
 
     /// Send a mouse button event
     #[wasm_bindgen]
-    pub fn send_mouse_button(&self, button: u8, is_pressed: bool, x: u16, y: u16) {
+    pub fn send_mouse_button(&mut self, button: u8, is_pressed: bool, x: u16, y: u16) {
         let btn = match button {
             0 => ironrdp::input::MouseButton::Left,
             1 => ironrdp::input::MouseButton::Middle,
@@ -190,21 +190,19 @@ impl Session {
         };
         let move_op = ironrdp::input::Operation::MouseMove(ironrdp::input::MousePosition { x, y });
 
-        let mut db = ironrdp::input::Database::new();
-        let events = db.apply([move_op, op].into_iter());
+        let events = self.input_db.apply([move_op, op].into_iter());
         let _ = self.input_tx.unbounded_send(InputEvent::FastPath(events));
     }
 
     /// Send a mouse wheel event
     #[wasm_bindgen]
-    pub fn send_mouse_wheel(&self, horizontal: bool, delta: i16) {
+    pub fn send_mouse_wheel(&mut self, horizontal: bool, delta: i16) {
         let rotations = ironrdp::input::WheelRotations {
             is_vertical: !horizontal,
             rotation_units: delta,
         };
         let op = ironrdp::input::Operation::WheelRotations(rotations);
-        let mut db = ironrdp::input::Database::new();
-        let events = db.apply(std::iter::once(op));
+        let events = self.input_db.apply(std::iter::once(op));
         let _ = self.input_tx.unbounded_send(InputEvent::FastPath(events));
     }
 
