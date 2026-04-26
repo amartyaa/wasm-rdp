@@ -322,6 +322,11 @@ async fn perform_connection(
 
             log("CredSSP: starting NTLM authentication...");
 
+            let hybrid_ex = format!("{:?}", connector.state).contains("HYBRID_EX");
+            if hybrid_ex {
+                log("CredSSP: HYBRID_EX negotiated");
+            }
+
             match perform_credssp(
                 &server_public_key,
                 username,
@@ -329,6 +334,7 @@ async fn perform_connection(
                 domain,
                 &mut framed,
                 &mut ws_write,
+                hybrid_ex,
             ).await {
                 Ok(()) => {
                     log("CredSSP: authentication successful!");
@@ -386,10 +392,6 @@ async fn perform_connection(
     }
 }
 
-/// Perform the CredSSP (NTLM) handshake over the TLS tunnel.
-///
-/// Uses `sspi::credssp::CredSspClient` with NTLM mode to exchange
-/// TSRequest PDUs with the RDP server.
 async fn perform_credssp(
     server_public_key: &[u8],
     username: &str,
@@ -397,6 +399,7 @@ async fn perform_credssp(
     domain: &str,
     framed: &mut WasmFramed,
     ws_write: &mut futures_util::stream::SplitSink<WebSocket, gloo_net::websocket::Message>,
+    hybrid_ex: bool,
 ) -> anyhow::Result<()> {
     use sspi::credssp::{CredSspClient, CredSspMode, ClientState, ClientMode};
     use sspi::credssp::TsRequest;
@@ -476,6 +479,15 @@ async fn perform_credssp(
                 use gloo_net::websocket::Message;
                 ws_write.send(Message::Bytes(encoded)).await
                     .map_err(|e| anyhow::anyhow!("WebSocket send: {e}"))?;
+
+                if hybrid_ex {
+                    log("CredSSP: waiting for EarlyUserAuthResult (HYBRID_EX)");
+                    let auth_result = framed.read_exact(4).await?;
+                    log(&format!("CredSSP EarlyUserAuthResult: {:02X?}", auth_result));
+                    if auth_result != [0, 0, 0, 0] {
+                        anyhow::bail!("CredSSP EarlyUserAuthResult denied/invalid: {:?}", auth_result);
+                    }
+                }
 
                 log("CredSSP: handshake complete");
                 return Ok(());

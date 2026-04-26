@@ -47,7 +47,7 @@ impl WasmFramed {
 
     /// Read exactly `n` bytes from the WebSocket, buffering as needed.
     /// Returns the bytes and leaves any excess in the internal buffer.
-    async fn read_exact(&mut self, n: usize) -> anyhow::Result<Vec<u8>> {
+    pub async fn read_exact(&mut self, n: usize) -> anyhow::Result<Vec<u8>> {
         while self.buf.len() < n {
             self.fill_buf().await?;
         }
