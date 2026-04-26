@@ -4,9 +4,12 @@ $ErrorActionPreference = "Stop"
 Write-Host "=== Building IronRDP WASM module ===" -ForegroundColor Cyan
 
 # Build WASM module (output to web/pkg/)
+$env:RUSTFLAGS = "--cfg getrandom_backend=""wasm_js"""
 wasm-pack build wasm/ --release --target web --out-dir ../web/pkg
+$wasmExitCode = $LASTEXITCODE
+Remove-Item Env:\RUSTFLAGS
 
-if ($LASTEXITCODE -ne 0) {
+if ($wasmExitCode -ne 0) {
     Write-Host "WASM build failed" -ForegroundColor Red
     exit 1
 }
