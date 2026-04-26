@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_call:
+    inputs:
+      tag_name:
+        description: "The tag to create the release for"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -135,6 +141,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
           files: |
             ironbridge-windows-x86_64.zip
             ironbridge-linux-x86_64.tar.gz
