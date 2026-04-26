@@ -561,7 +561,13 @@ async fn run_session(
         let outputs = select! {
             frame = framed.read_pdu().fuse() => {
                 let (action, payload) = frame.context("read RDP PDU")?;
-                active_stage.process(&mut image, action, &payload)?
+                match active_stage.process(&mut image, action, &payload) {
+                    Ok(outputs) => outputs,
+                    Err(e) => {
+                        log_error(&format!("Ignoring PDU processing error: {e:#}"));
+                        Vec::new()
+                    }
+                }
             }
             event = input_rx.next().fuse() => {
                 match event {
