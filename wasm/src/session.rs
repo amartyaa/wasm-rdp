@@ -284,21 +284,23 @@ async fn perform_connection(
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to send tls_upgrade: {e}"))?;
 
-            // Wait for the proxy's response (arrives as a text WS message)
-            // The framed reader only handles binary messages, so we need to
-            // read directly from the WebSocket for this one-time handshake.
-            // The proxy will send a text message with the server cert.
-            // We wait by polling the framed's internal fill_buf which stores
-            // text messages as errors — instead, let's use a different approach:
-            // we'll temporarily read from the raw framed buffer.
+            // Wait for the proxy's tls_ready response (arrives as a text WS message)
             let cert_hex = framed.read_text_message().await
                 .context("Failed to read tls_ready response")?;
 
-            // Parse the JSON response
+            // Parse the JSON response and extract SubjectPublicKeyInfo
             if let Some(cert_str) = parse_tls_ready(&cert_hex) {
-                server_public_key = hex_decode(&cert_str)?;
+                let cert_der = hex_decode(&cert_str)?;
                 log(&format!(
-                    "TLS upgrade complete — server cert: {} bytes",
+                    "TLS upgrade complete — cert DER: {} bytes",
+                    cert_der.len()
+                ));
+
+                // Extract the SubjectPublicKeyInfo from the X.509 certificate.
+                // CredSSP uses the SPKI (not the full cert) for channel binding.
+                server_public_key = extract_public_key(&cert_der)?;
+                log(&format!(
+                    "Extracted SubjectPublicKeyInfo: {} bytes",
                     server_public_key.len()
                 ));
             } else {
@@ -511,6 +513,26 @@ fn hex_decode(hex: &str) -> anyhow::Result<Vec<u8>> {
                 .map_err(|e| anyhow::anyhow!("Invalid hex: {e}"))
         })
         .collect()
+}
+
+/// Extract the raw public key bytes from an X.509 certificate.
+///
+/// CredSSP channel binding requires the raw key (content of the BIT STRING
+/// inside SubjectPublicKeyInfo), matching FreeRDP's `i2d_PublicKey()`.
+/// For RSA this is `SEQUENCE { modulus INTEGER, exponent INTEGER }`.
+fn extract_public_key(cert_der: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use x509_cert::Certificate;
+    use x509_cert::der::Decode;
+
+    let cert = Certificate::from_der(cert_der)
+        .map_err(|e| anyhow::anyhow!("Failed to parse X.509 certificate: {e}"))?;
+
+    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let raw_key = spki.subject_public_key
+        .as_bytes()
+        .ok_or_else(|| anyhow::anyhow!("SubjectPublicKey has unused bits"))?;
+
+    Ok(raw_key.to_vec())
 }
 
 async fn run_session(

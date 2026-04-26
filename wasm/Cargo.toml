@@ -36,7 +36,10 @@ futures-util = { version = "0.3", features = ["sink", "io"] }
 futures-channel = "0.3"
 
 # WASM compat for random/time
+# getrandom 0.3 (wasm_js) — used by our direct deps
 getrandom = { version = "0.3", features = ["wasm_js"] }
+# getrandom 0.2 (js) — required by sspi → rand → getrandom 0.2
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 chrono = { version = "0.4", features = ["wasmbind"] }
 time = { version = "0.3", features = ["wasm-bindgen"] }
 
