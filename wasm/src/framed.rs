@@ -68,7 +68,8 @@ impl WasmFramed {
             match hint.find_size(&self.buf) {
                 Ok(Some((_hint_matched, pdu_length))) => {
                     if pdu_length == 0 {
-                        anyhow::bail!("PduHint returned zero-length PDU");
+                        let hex_dump = self.buf.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                        anyhow::bail!("PduHint returned zero-length PDU. Buffer: {}", hex_dump);
                     }
                     // We know the size — ensure we have all the bytes
                     while self.buf.len() < pdu_length {
