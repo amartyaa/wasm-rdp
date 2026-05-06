@@ -34,6 +34,7 @@ pub struct Session {
 pub(crate) enum InputEvent {
     FastPath(smallvec::SmallVec<[FastPathInputEvent; 2]>),
     Resize { width: u16, height: u16 },
+    Cliprdr(ironrdp::cliprdr::backend::ClipboardMessage),
     Terminate,
 }
 
@@ -81,7 +82,10 @@ impl Session {
         // Create connector and perform RDP handshake
         let socket_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3389));
         
-        let cliprdr = ironrdp::cliprdr::Cliprdr::new(Box::new(crate::clipboard::WasmCliprdrBackend::new()));
+        // Create input channel (must be done before CliprdrBackend to pass tx)
+        let (input_tx, input_rx) = mpsc::unbounded();
+
+        let cliprdr = ironrdp::cliprdr::Cliprdr::new(Box::new(crate::clipboard::WasmCliprdrBackend::new(input_tx.clone())));
 
         let connector = ClientConnector::new(config, socket_addr)
             .with_static_channel(cliprdr);
@@ -103,9 +107,6 @@ impl Session {
         // Set up canvas for rendering
         let canvas = Canvas::new(&canvas_id, desktop_width, desktop_height)
             .context("Failed to initialize canvas")?;
-
-        // Create input channel
-        let (input_tx, input_rx) = mpsc::unbounded();
 
         // Create the writer channel
         let (writer_tx, mut writer_rx) = mpsc::unbounded::<Vec<u8>>();
@@ -591,6 +592,44 @@ async fn run_session(
                             }
                         }
                     }
+                    Some(InputEvent::Cliprdr(message)) => {
+                        if let Some(cliprdr) = active_stage.get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>() {
+                            if let Some(svc_messages) = match message {
+                                ironrdp::cliprdr::backend::ClipboardMessage::SendInitiateCopy(formats) => {
+                                    match cliprdr.initiate_copy(&formats) {
+                                        Ok(msgs) => Some(msgs),
+                                        Err(e) => { log_error(&format!("Cliprdr copy error: {e}")); None }
+                                    }
+                                }
+                                ironrdp::cliprdr::backend::ClipboardMessage::SendFormatData(response) => {
+                                    match cliprdr.submit_format_data(response) {
+                                        Ok(msgs) => Some(msgs),
+                                        Err(e) => { log_error(&format!("Cliprdr format data error: {e}")); None }
+                                    }
+                                }
+                                ironrdp::cliprdr::backend::ClipboardMessage::SendInitiatePaste(format) => {
+                                    match cliprdr.initiate_paste(format) {
+                                        Ok(msgs) => Some(msgs),
+                                        Err(e) => { log_error(&format!("Cliprdr paste error: {e}")); None }
+                                    }
+                                }
+                                ironrdp::cliprdr::backend::ClipboardMessage::Error(e) => {
+                                    log_error(&format!("Clipboard backend error: {e}"));
+                                    None
+                                }
+                                _ => None,
+                            } {
+                                let frame = active_stage.process_svc_processor_messages(svc_messages)
+                                    .context("encode cliprdr SVC messages")?;
+                                vec![ActiveStageOutput::ResponseFrame(frame)]
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            log_error("Clipboard event received but Cliprdr is not available");
+                            Vec::new()
+                        }
+                    }
                     Some(InputEvent::Terminate) => {
                         active_stage.graceful_shutdown()
                             .context("graceful shutdown")?
@@ -683,3 +722,11 @@ fn build_connector_config(
         multitransport_flags: None,
     }
 }
+
+impl Session {
+    /// Expose a way for the clipboard module to send cliprdr messages to the event loop.
+    pub(crate) fn send_cliprdr_message(&self, message: ironrdp::cliprdr::backend::ClipboardMessage) {
+        let _ = self.input_tx.unbounded_send(InputEvent::Cliprdr(message));
+    }
+}
+

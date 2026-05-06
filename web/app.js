@@ -189,7 +189,12 @@ function onKeyDown(e) {
         return;
     }
 
-    e.preventDefault();
+    // Allow Ctrl+V to pass through so the browser fires the native 'paste' event,
+    // which our onPaste handler uses to read clipboard text and send it to RDP.
+    // We still send the key scancode to RDP below.
+    if (!(e.ctrlKey && e.code === 'KeyV')) {
+        e.preventDefault();
+    }
     const mapping = SCANCODE_MAP[e.code];
     if (mapping) {
         session.send_keyboard(mapping[0], true, mapping[1]);
@@ -250,7 +255,7 @@ function onPaste(e) {
     const text = e.clipboardData?.getData('text/plain');
     if (text) {
         try {
-            wasm.clipboard_paste(text);
+            wasm.set_pending_clipboard(text, session);
         } catch (err) {
             console.warn('Clipboard paste to WASM failed:', err);
         }
