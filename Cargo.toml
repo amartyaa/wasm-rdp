@@ -1,3 +1,7 @@
 [workspace]
 members = ["server", "wasm"]
 resolver = "2"
+[patch."https://github.com/Devolutions/IronRDP.git"]
+ironrdp-session = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master" }
+ironrdp = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master" }
+ironrdp-core = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master" }
