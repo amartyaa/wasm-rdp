@@ -704,7 +704,7 @@ fn build_connector_config(
         platform: MajorPlatformType::UNSPECIFIED,
         enable_server_pointer: true,
         request_data: None,
-        autologon: false,
+        autologon: true,
         enable_audio_playback: false,
         pointer_software_rendering: true,
         performance_flags: PerformanceFlags::default()

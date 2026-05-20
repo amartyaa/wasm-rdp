@@ -11,6 +11,12 @@ async function loadWasm() {
         console.error('Failed to load WASM module:', e);
         showError('Failed to load RDP module. Check that WASM is built.');
     }
+
+    // Pre-fill cached credentials (domain + username only, not password)
+    const cachedDomain = localStorage.getItem('rdp_domain');
+    const cachedUsername = localStorage.getItem('rdp_username');
+    if (cachedDomain) document.getElementById('domain').value = cachedDomain;
+    if (cachedUsername) document.getElementById('username').value = cachedUsername;
 }
 
 // ── DOM Elements ─────────────────────────────────────────
@@ -119,6 +125,10 @@ loginForm.addEventListener('submit', async (e) => {
         canvasContainer.hidden = false;
         toolbar.hidden = false;
 
+        // Cache credentials for next session (not password)
+        localStorage.setItem('rdp_domain', domain);
+        localStorage.setItem('rdp_username', username);
+
         resBadge.textContent = `${session.width}×${session.height}`;
         setupInputHandlers();
         setupResizeHandler();
@@ -155,6 +165,7 @@ function setupInputHandlers() {
     // Keyboard
     document.addEventListener('keydown', onKeyDown, true);
     document.addEventListener('keyup', onKeyUp, true);
+    window.addEventListener('blur', releaseAllModifiers);
 
     // Mouse
     canvas.addEventListener('mousemove', onMouseMove);
@@ -167,24 +178,42 @@ function setupInputHandlers() {
     document.addEventListener('paste', onPaste);
 }
 
+// Release all modifier keys in the RDP session.
+// Called on blur to prevent stuck Ctrl/Alt/Shift when focus leaves the browser.
+function releaseAllModifiers() {
+    if (!session) return;
+    session.send_keyboard(0x1D, false, false);  // Ctrl left up
+    session.send_keyboard(0x1D, false, true);   // Ctrl right up
+    session.send_keyboard(0x2A, false, false);  // Shift left up
+    session.send_keyboard(0x36, false, false);  // Shift right up
+    session.send_keyboard(0x38, false, false);  // Alt left up
+    session.send_keyboard(0x38, false, true);   // Alt right up
+    session.send_keyboard(0x5B, false, true);   // Meta left up
+    session.send_keyboard(0x5C, false, true);   // Meta right up
+}
+
 function onKeyDown(e) {
     if (!session) return;
 
     // Intercept Ctrl+Shift+F → fullscreen toggle
     if (e.ctrlKey && e.shiftKey && e.code === 'KeyF') {
         e.preventDefault();
+        releaseAllModifiers();
         toggleFullscreen();
         return;
     }
     // Intercept Ctrl+Shift+D → disconnect
     if (e.ctrlKey && e.shiftKey && e.code === 'KeyD') {
         e.preventDefault();
+        releaseAllModifiers();
         disconnect();
         return;
     }
     // Remap Ctrl+Tab → Alt+Tab
+    // Release Ctrl first so the remote sees pure Alt+Tab, not Ctrl+Alt+Tab
     if (e.ctrlKey && e.code === 'Tab') {
         e.preventDefault();
+        session.send_keyboard(0x1D, false, false); // Ctrl up
         sendAltTab();
         return;
     }
@@ -342,6 +371,7 @@ function disconnect() {
     // Remove input handlers
     document.removeEventListener('keydown', onKeyDown, true);
     document.removeEventListener('keyup', onKeyUp, true);
+    window.removeEventListener('blur', releaseAllModifiers);
     document.removeEventListener('paste', onPaste);
 }
 

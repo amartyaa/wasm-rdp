@@ -659,23 +659,22 @@ dependencies = [
 
 [[package]]
 name = "cryptoki"
-version = "0.10.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "781357a7779a8e92ea985121bbf379a9adf0777f44ab6392efc6abd5aa9b67db"
+checksum = "ff765b99fc49f3116c9a908484486a2b92fd73c48da45c3a69716471c6cc56c6"
 dependencies = [
- "bitflags 1.3.2",
+ "bitflags 2.11.1",
  "cryptoki-sys",
  "libloading",
  "log",
- "paste",
  "secrecy",
 ]
 
 [[package]]
 name = "cryptoki-sys"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "753e27d860277930ae9f394c119c8c70303236aab0ffab1d51f3d207dbb2bc4b"
+checksum = "f1fd850498411e4057f1cba79e6e2bc7cbe960544c1046ab46d4685c403a1121"
 dependencies = [
  "libloading",
 ]
@@ -1505,7 +1504,7 @@ dependencies = [
 [[package]]
 name = "ironrdp"
 version = "0.14.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-cliprdr",
  "ironrdp-connector",
@@ -1522,12 +1521,12 @@ dependencies = [
 [[package]]
 name = "ironrdp-bulk"
 version = "0.1.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 
 [[package]]
 name = "ironrdp-cliprdr"
 version = "0.5.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
@@ -1539,7 +1538,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-connector"
 version = "0.8.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-core",
  "ironrdp-error",
@@ -1549,7 +1548,7 @@ dependencies = [
  "picky-asn1-der",
  "picky-asn1-x509",
  "rand 0.9.4",
- "sspi",
+ "sspi 0.20.0",
  "tracing",
  "url",
 ]
@@ -1557,7 +1556,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-core"
 version = "0.1.5"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-error",
 ]
@@ -1565,7 +1564,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-displaycontrol"
 version = "0.5.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-core",
  "ironrdp-dvc",
@@ -1577,7 +1576,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-dvc"
 version = "0.5.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-core",
  "ironrdp-pdu",
@@ -1589,12 +1588,12 @@ dependencies = [
 [[package]]
 name = "ironrdp-error"
 version = "0.1.3"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 
 [[package]]
 name = "ironrdp-graphics"
 version = "0.7.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "bit_field",
  "bitflags 2.11.1",
@@ -1610,7 +1609,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-input"
 version = "0.5.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "bitvec",
  "ironrdp-pdu",
@@ -1620,7 +1619,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-pdu"
 version = "0.7.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "bit_field",
  "bitflags 2.11.1",
@@ -1636,14 +1635,13 @@ dependencies = [
  "pkcs1 0.7.5",
  "sha1 0.10.6",
  "tap",
- "thiserror",
  "x509-cert",
 ]
 
 [[package]]
 name = "ironrdp-session"
 version = "0.8.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-bulk",
  "ironrdp-connector",
@@ -1660,7 +1658,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-svc"
 version = "0.6.0"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#3fe6d157e0b55bddfdac20af290a6cfa6e550576"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
@@ -2096,12 +2094,6 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
-
-[[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pbkdf2"
@@ -2719,9 +2711,9 @@ dependencies = [
 
 [[package]]
 name = "secrecy"
-version = "0.8.0"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bd1c54ea06cfd2f6b63219704de0b9b4f72dcc2b8fdef820be6cd799780e91e"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
 dependencies = [
  "zeroize",
 ]
@@ -3012,6 +3004,69 @@ name = "sspi"
 version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0484adc2dd72428a01644ddb55fd87c5518ff2c7c663544fb6b1ee39a65d897a"
+dependencies = [
+ "async-dnssd",
+ "async-recursion",
+ "bitflags 2.11.1",
+ "block-buffer 0.12.0",
+ "bytemuck",
+ "byteorder",
+ "cfg-if",
+ "crypto-bigint",
+ "crypto-common 0.2.0-rc.8",
+ "crypto-mac",
+ "crypto-primes",
+ "curve25519-dalek",
+ "der 0.8.0-rc.10",
+ "digest 0.11.0-rc.5",
+ "ed25519-dalek",
+ "ff",
+ "futures",
+ "getrandom 0.3.4",
+ "group",
+ "hmac",
+ "md-5 0.11.0-rc.2",
+ "md4",
+ "num-derive",
+ "num-traits",
+ "oid",
+ "p256",
+ "p384",
+ "p521",
+ "pem-rfc7468",
+ "picky",
+ "picky-asn1",
+ "picky-asn1-der",
+ "picky-asn1-x509",
+ "picky-krb",
+ "pkcs1 0.8.0-rc.4",
+ "pkcs8",
+ "primefield",
+ "primeorder",
+ "rand 0.10.0-rc.6",
+ "rsa",
+ "rustls",
+ "serde",
+ "sha1 0.11.0-rc.3",
+ "sha2 0.11.0-rc.3",
+ "signature",
+ "spki 0.8.0-rc.4",
+ "time",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "widestring",
+ "windows",
+ "windows-registry",
+ "zeroize",
+]
+
+[[package]]
+name = "sspi"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82d4e729e937757a093b8ebe84933747db961e2f20744f957f5e6fbf6e0e2610"
 dependencies = [
  "async-dnssd",
  "async-recursion",
@@ -3554,7 +3609,7 @@ dependencies = [
  "ironrdp-core",
  "js-sys",
  "smallvec",
- "sspi",
+ "sspi 0.19.2",
  "time",
  "tracing",
  "wasm-bindgen",
