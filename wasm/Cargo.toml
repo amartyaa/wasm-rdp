@@ -13,6 +13,7 @@ ironrdp = { git = "https://github.com/Devolutions/IronRDP.git", branch = "master
     "dvc", "cliprdr", "svc", "displaycontrol", "pdu"
 ] }
 ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", branch = "master" }
+ironrdp-cliprdr-format = { git = "https://github.com/Devolutions/IronRDP.git", branch = "master" }
 
 # Auth
 sspi = "0.19"

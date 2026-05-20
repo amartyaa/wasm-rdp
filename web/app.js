@@ -281,6 +281,29 @@ function onWheel(e) {
 
 function onPaste(e) {
     if (!session || !wasm) return;
+
+    // Check for image data first (screenshots, copied images)
+    const items = e.clipboardData?.items;
+    if (items) {
+        for (const item of items) {
+            if (item.type === 'image/png') {
+                const blob = item.getAsFile();
+                if (blob) {
+                    blob.arrayBuffer().then(buf => {
+                        try {
+                            const bytes = new Uint8Array(buf);
+                            wasm.set_pending_clipboard_image(bytes, session);
+                        } catch (err) {
+                            console.warn('Clipboard image paste to WASM failed:', err);
+                        }
+                    });
+                    return; // image takes priority
+                }
+            }
+        }
+    }
+
+    // Fall back to text
     const text = e.clipboardData?.getData('text/plain');
     if (text) {
         try {
