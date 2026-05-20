@@ -37,6 +37,9 @@ const btnAltTab = document.getElementById('btn-alttab');
 const btnFullscreen = document.getElementById('btn-fullscreen');
 const btnDisconnect = document.getElementById('btn-disconnect');
 const fullscreenCheckbox = document.getElementById('fullscreen-preconnect');
+const reconnectOverlay = document.getElementById('reconnect-overlay');
+const reconnectStatus = document.getElementById('reconnect-status');
+const btnCancelReconnect = document.getElementById('btn-cancel-reconnect');
 
 // ── State ────────────────────────────────────────────────
 let frameCount = 0;
@@ -46,6 +49,14 @@ let lastMouseTime = 0;
 let resizeTimeout = null;
 const MOUSE_THROTTLE_MS = 16; // ~60fps cap on mouse events
 const RESIZE_DEBOUNCE_MS = 250;
+
+// ── Reconnection State ───────────────────────────────────
+let savedCredentials = null;  // { username, password, domain }
+let isUserDisconnect = false; // true when user clicks disconnect
+let reconnectAttempt = 0;
+let reconnectTimer = null;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_DELAYS = [2000, 4000, 8000, 16000, 32000]; // exponential backoff
 
 // ── AT-101 Scancode Map ──────────────────────────────────
 // Maps KeyboardEvent.code → [scancode, isExtended]
@@ -110,30 +121,7 @@ loginForm.addEventListener('submit', async (e) => {
             try { await document.documentElement.requestFullscreen(); } catch (_) {}
         }
 
-        const width = window.innerWidth;
-        const height = window.innerHeight;
-
-        // Build WebSocket URL for the proxy
-        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const basePath = location.pathname.replace(/\/[^/]*$/, '');
-        const wsUrl = `${proto}://${location.host}${basePath}/ws`;
-
-        session = await wasm.connect(wsUrl, username, password, domain, width, height, 'rdp-canvas');
-
-        // Connected — switch to canvas view
-        loginScreen.hidden = true;
-        canvasContainer.hidden = false;
-        toolbar.hidden = false;
-
-        // Cache credentials for next session (not password)
-        localStorage.setItem('rdp_domain', domain);
-        localStorage.setItem('rdp_username', username);
-
-        resBadge.textContent = `${session.width}×${session.height}`;
-        setupInputHandlers();
-        setupResizeHandler();
-        startFpsCounter();
-        showToolbar();
+        await doConnect(username, password, domain);
 
     } catch (err) {
         showError(String(err));
@@ -144,6 +132,39 @@ loginForm.addEventListener('submit', async (e) => {
         }
     }
 });
+
+async function doConnect(username, password, domain) {
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+
+    // Build WebSocket URL for the proxy
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const basePath = location.pathname.replace(/\/[^/]*$/, '');
+    const wsUrl = `${proto}://${location.host}${basePath}/ws`;
+
+    session = await wasm.connect(wsUrl, username, password, domain, width, height, 'rdp-canvas');
+
+    // Store credentials in-memory for reconnection
+    savedCredentials = { username, password, domain };
+    isUserDisconnect = false;
+    reconnectAttempt = 0;
+
+    // Connected — switch to canvas view
+    loginScreen.hidden = true;
+    canvasContainer.hidden = false;
+    reconnectOverlay.hidden = true;
+    toolbar.hidden = false;
+
+    // Cache credentials for next session (not password)
+    localStorage.setItem('rdp_domain', domain);
+    localStorage.setItem('rdp_username', username);
+
+    resBadge.textContent = `${session.width}×${session.height}`;
+    setupInputHandlers();
+    setupResizeHandler();
+    startFpsCounter();
+    showToolbar();
+}
 
 function setConnecting(loading) {
     connectBtn.disabled = loading;
@@ -379,11 +400,19 @@ function toggleFullscreen() {
 }
 
 function disconnect() {
+    isUserDisconnect = true;
+    cancelReconnect();
     if (session) {
         session.shutdown();
         session = null;
     }
+    savedCredentials = null;
+    cleanupSession();
+}
+
+function cleanupSession() {
     canvasContainer.hidden = true;
+    reconnectOverlay.hidden = true;
     toolbar.hidden = true;
     toolbar.classList.remove('visible');
     loginScreen.hidden = false;
@@ -397,6 +426,77 @@ function disconnect() {
     window.removeEventListener('blur', releaseAllModifiers);
     document.removeEventListener('paste', onPaste);
 }
+
+// ── Auto-Reconnection ────────────────────────────────────
+
+function cancelReconnect() {
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+    reconnectAttempt = 0;
+}
+
+async function attemptReconnect() {
+    if (!savedCredentials || isUserDisconnect) return;
+    if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+        reconnectStatus.textContent = 'Could not reconnect. Please log in again.';
+        setTimeout(() => {
+            cancelReconnect();
+            savedCredentials = null;
+            cleanupSession();
+        }, 3000);
+        return;
+    }
+
+    const delay = RECONNECT_DELAYS[reconnectAttempt] || 32000;
+    reconnectAttempt++;
+    reconnectStatus.textContent = `Attempt ${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS} — retrying in ${delay / 1000}s...`;
+
+    reconnectTimer = setTimeout(async () => {
+        reconnectTimer = null;
+        if (!savedCredentials || isUserDisconnect) return;
+
+        reconnectStatus.textContent = `Attempt ${reconnectAttempt}/${MAX_RECONNECT_ATTEMPTS} — connecting...`;
+        try {
+            // Clean up old session
+            session = null;
+            document.removeEventListener('keydown', onKeyDown, true);
+            document.removeEventListener('keyup', onKeyUp, true);
+            window.removeEventListener('blur', releaseAllModifiers);
+            document.removeEventListener('paste', onPaste);
+
+            const { username, password, domain } = savedCredentials;
+            await doConnect(username, password, domain);
+            // Success — overlay hidden by doConnect
+        } catch (err) {
+            console.warn(`Reconnect attempt ${reconnectAttempt} failed:`, err);
+            attemptReconnect();
+        }
+    }, delay);
+}
+
+btnCancelReconnect.addEventListener('click', () => {
+    cancelReconnect();
+    savedCredentials = null;
+    cleanupSession();
+});
+
+// Called by WASM when the RDP session ends
+window.__rdp_session_ended = function(reason) {
+    console.log('Session ended, reason:', reason);
+    if (reason === 'connection_lost' && savedCredentials && !isUserDisconnect) {
+        // Unexpected disconnect — try to reconnect
+        session = null;
+        reconnectOverlay.hidden = false;
+        toolbar.hidden = true;
+        attemptReconnect();
+    } else {
+        // User-initiated or unrecoverable — go to login
+        session = null;
+        cleanupSession();
+    }
+};
 
 // ── FPS Counter ──────────────────────────────────────────
 function startFpsCounter() {

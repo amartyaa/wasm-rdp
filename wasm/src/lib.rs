@@ -44,6 +44,22 @@ pub(crate) fn notify_frame() {
     }
 }
 
+/// Called from session.rs when the RDP session ends (error or clean disconnect).
+/// Notifies JS so it can trigger reconnection or show the login screen.
+pub(crate) fn notify_session_ended(reason: &str) {
+    if let Ok(func) = js_sys::Reflect::get(
+        &wasm_bindgen::JsValue::from(web_sys::window().unwrap()),
+        &wasm_bindgen::JsValue::from_str("__rdp_session_ended"),
+    ) {
+        if let Some(func) = func.dyn_ref::<js_sys::Function>() {
+            let _ = func.call1(
+                &wasm_bindgen::JsValue::NULL,
+                &wasm_bindgen::JsValue::from_str(reason),
+            );
+        }
+    }
+}
+
 
 /// Log to browser console
 #[wasm_bindgen]

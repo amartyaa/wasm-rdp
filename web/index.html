@@ -53,6 +53,15 @@
     <!-- RDP Canvas (hidden until connected) -->
     <div id="canvas-container" class="canvas-container" hidden>
         <canvas id="rdp-canvas"></canvas>
+        <!-- Reconnection Overlay -->
+        <div id="reconnect-overlay" class="reconnect-overlay" hidden>
+            <div class="reconnect-card">
+                <span class="reconnect-spinner"></span>
+                <p class="reconnect-title">Connection Lost</p>
+                <p id="reconnect-status" class="reconnect-status">Reconnecting...</p>
+                <button id="btn-cancel-reconnect" class="btn-cancel-reconnect">Cancel</button>
+            </div>
+        </div>
     </div>
 
     <!-- Floating Toolbar -->

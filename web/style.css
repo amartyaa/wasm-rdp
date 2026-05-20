@@ -297,3 +297,73 @@ html, body {
     height: 8px;
     z-index: 999;
 }
+
+/* ── Reconnection Overlay ──────────────────────────────── */
+.reconnect-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(10, 14, 26, 0.85);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    z-index: 100;
+}
+
+.reconnect-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    padding: 40px 48px;
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+    text-align: center;
+}
+
+.reconnect-spinner {
+    width: 36px;
+    height: 36px;
+    border: 3px solid var(--glass-border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.reconnect-title {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.reconnect-status {
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.btn-cancel-reconnect {
+    margin-top: 4px;
+    padding: 8px 24px;
+    font-family: var(--font);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-cancel-reconnect:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: rgba(255, 79, 109, 0.1);
+}

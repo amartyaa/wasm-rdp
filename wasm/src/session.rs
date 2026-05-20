@@ -128,7 +128,7 @@ impl Session {
         spawn_local({
             let writer_tx = writer_tx.clone();
             async move {
-                if let Err(e) = run_session(
+                let reason = match run_session(
                     connection_result,
                     framed,
                     writer_tx,
@@ -137,9 +137,16 @@ impl Session {
                     desktop_width,
                     desktop_height,
                 ).await {
-                    log_error(&format!("RDP session error: {e:#}"));
-                }
-                log("RDP session ended");
+                    Ok(()) => {
+                        log("RDP session ended");
+                        "user_disconnect"
+                    }
+                    Err(e) => {
+                        log_error(&format!("RDP session error: {e:#}"));
+                        "connection_lost"
+                    }
+                };
+                crate::notify_session_ended(reason);
             }
         });
 
