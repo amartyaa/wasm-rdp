@@ -1,6 +1,6 @@
 # install-service-windows.ps1 — Install IronBridge as a Windows Service
 param(
-    [string]$BinaryPath = ".\server.exe",
+    [string]$BinaryPath = "C:\Users\amart\Downloads\web-rdp-rust\target\release\server.exe",
     [int]$Port = 8080,
     [string]$RdpTarget = "localhost:3389"
 )
@@ -29,7 +29,7 @@ sc.exe create $ServiceName `
     DisplayName= "$DisplayName"
 
 sc.exe description $ServiceName "$Description"
-
+sc.exe start $ServiceName
 Write-Host ""
 Write-Host "Service installed successfully!" -ForegroundColor Green
 Write-Host "  Name:   $ServiceName"
