@@ -367,3 +367,97 @@ html, body {
     border-color: var(--danger);
     background: rgba(255, 79, 109, 0.1);
 }
+
+/* ── Performance HUD ──────────────────────────────────── */
+.perf-hud {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    z-index: 100;
+    min-width: 200px;
+    padding: 14px 18px;
+    background: rgba(10, 14, 26, 0.75);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: var(--radius);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    font-family: 'Inter', monospace;
+    animation: hudFadeIn 0.25s ease-out;
+}
+
+@keyframes hudFadeIn {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.perf-hud-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.perf-hud-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--accent);
+}
+
+.perf-hud-close {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    font-size: 14px;
+    line-height: 1;
+    color: var(--text-secondary);
+    background: none;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.perf-hud-close:hover {
+    color: var(--danger);
+    background: rgba(255, 79, 109, 0.15);
+}
+
+.perf-hud-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 12px;
+    align-items: baseline;
+}
+
+.perf-hud-label {
+    font-size: 0.65rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.perf-hud-value {
+    font-size: 0.72rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
+    text-align: right;
+}
+
+.badge-clickable {
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+
+.badge-clickable:hover {
+    background: var(--accent-glow);
+    color: #c4bfff;
+}

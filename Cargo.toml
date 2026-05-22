@@ -5,3 +5,4 @@ resolver = "2"
 ironrdp-session = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master" }
 ironrdp = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master" }
 ironrdp-core = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master" }
+ironrdp-rdpsnd = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master" }

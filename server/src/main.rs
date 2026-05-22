@@ -83,11 +83,13 @@ async fn run_server(args: Args) {
         if base.is_empty() {
             Router::new()
                 .route("/ws", axum::routing::get(ws_handler))
+                .route("/ping", axum::routing::get(ping_handler))
                 .fallback_service(serve_dir)
                 .with_state(config)
         } else {
             let nested = Router::new()
                 .route("/ws", axum::routing::get(ws_handler))
+                .route("/ping", axum::routing::get(ping_handler))
                 .fallback_service(serve_dir)
                 .with_state(config);
             Router::new().nest(&base, nested)
@@ -98,11 +100,13 @@ async fn run_server(args: Args) {
         if base.is_empty() {
             Router::new()
                 .route("/ws", axum::routing::get(ws_handler))
+                .route("/ping", axum::routing::get(ping_handler))
                 .fallback(embedded_handler)
                 .with_state(config)
         } else {
             let nested = Router::new()
                 .route("/ws", axum::routing::get(ws_handler))
+                .route("/ping", axum::routing::get(ping_handler))
                 .fallback(embedded_handler)
                 .with_state(config);
             Router::new().nest(&base, nested)
@@ -138,6 +142,10 @@ async fn embedded_handler(uri: Uri) -> impl IntoResponse {
             .body(Body::from("404 Not Found"))
             .unwrap(),
     }
+}
+
+async fn ping_handler() -> &'static str {
+    "pong"
 }
 
 async fn ws_handler(

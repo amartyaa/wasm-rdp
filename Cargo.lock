@@ -1523,6 +1523,7 @@ dependencies = [
  "ironrdp-graphics",
  "ironrdp-input",
  "ironrdp-pdu",
+ "ironrdp-rdpsnd",
  "ironrdp-session",
  "ironrdp-svc",
 ]
@@ -1654,6 +1655,18 @@ dependencies = [
  "sha1 0.10.6",
  "tap",
  "x509-cert",
+]
+
+[[package]]
+name = "ironrdp-rdpsnd"
+version = "0.7.0"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
+dependencies = [
+ "bitflags 2.11.1",
+ "ironrdp-core",
+ "ironrdp-pdu",
+ "ironrdp-svc",
+ "tracing",
 ]
 
 [[package]]

@@ -40,6 +40,16 @@ const fullscreenCheckbox = document.getElementById('fullscreen-preconnect');
 const reconnectOverlay = document.getElementById('reconnect-overlay');
 const reconnectStatus = document.getElementById('reconnect-status');
 const btnCancelReconnect = document.getElementById('btn-cancel-reconnect');
+const perfHud = document.getElementById('perf-hud');
+const btnCloseHud = document.getElementById('btn-close-hud');
+const hudLatency = document.getElementById('hud-latency');
+const hudFps = document.getElementById('hud-fps');
+const hudDlSpeed = document.getElementById('hud-dl-speed');
+const hudUlSpeed = document.getElementById('hud-ul-speed');
+const hudTotalRx = document.getElementById('hud-total-rx');
+const hudTotalTx = document.getElementById('hud-total-tx');
+const hudResolution = document.getElementById('hud-resolution');
+const hudCodec = document.getElementById('hud-codec');
 
 // ── State ────────────────────────────────────────────────
 let frameCount = 0;
@@ -49,6 +59,14 @@ let lastMouseTime = 0;
 let resizeTimeout = null;
 const MOUSE_THROTTLE_MS = 16; // ~60fps cap on mouse events
 const RESIZE_DEBOUNCE_MS = 250;
+let statsInterval = null;
+let prevRxBytes = 0;
+let prevTxBytes = 0;
+let hudVisible = false;
+
+// ── Audio State ──────────────────────────────────────────
+let audioContext = null;
+let nextPlayTime = 0;
 
 // ── Reconnection State ───────────────────────────────────
 let savedCredentials = null;  // { username, password, domain }
@@ -162,7 +180,8 @@ async function doConnect(username, password, domain) {
     resBadge.textContent = `${session.width}×${session.height}`;
     setupInputHandlers();
     setupResizeHandler();
-    startFpsCounter();
+    startStatsInterval();
+    initAudioContext();
     showToolbar();
 }
 
@@ -413,6 +432,8 @@ function disconnect() {
 function cleanupSession() {
     canvasContainer.hidden = true;
     reconnectOverlay.hidden = true;
+    perfHud.hidden = true;
+    hudVisible = false;
     toolbar.hidden = true;
     toolbar.classList.remove('visible');
     loginScreen.hidden = false;
@@ -425,6 +446,16 @@ function cleanupSession() {
     document.removeEventListener('keyup', onKeyUp, true);
     window.removeEventListener('blur', releaseAllModifiers);
     document.removeEventListener('paste', onPaste);
+    // Stop stats interval
+    if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
+    prevRxBytes = 0;
+    prevTxBytes = 0;
+    // Close audio context
+    if (audioContext) {
+        audioContext.close().catch(() => {});
+        audioContext = null;
+        nextPlayTime = 0;
+    }
 }
 
 // ── Auto-Reconnection ────────────────────────────────────
@@ -498,19 +529,125 @@ window.__rdp_session_ended = function(reason) {
     }
 };
 
-// ── FPS Counter ──────────────────────────────────────────
-function startFpsCounter() {
-    // The WASM module calls back on each graphics update; we count those
-    // For now, use a simple timer-based approach
-    setInterval(() => {
+// ── Stats Interval (FPS + HUD) ───────────────────────────
+function startStatsInterval() {
+    if (statsInterval) clearInterval(statsInterval);
+    prevRxBytes = session ? session.rx_bytes : 0;
+    prevTxBytes = session ? session.tx_bytes : 0;
+
+    statsInterval = setInterval(() => {
+        // Update FPS badge (always visible in toolbar)
         fpsBadge.textContent = `${frameCount} FPS`;
+        const currentFps = frameCount;
         frameCount = 0;
+
+        // Update HUD if visible
+        if (!hudVisible || !session) return;
+
+        const rxBytes = session.rx_bytes;
+        const txBytes = session.tx_bytes;
+        const dlSpeed = rxBytes - prevRxBytes;
+        const ulSpeed = txBytes - prevTxBytes;
+        prevRxBytes = rxBytes;
+        prevTxBytes = txBytes;
+
+        hudFps.textContent = currentFps;
+        hudDlSpeed.textContent = formatSpeed(dlSpeed);
+        hudUlSpeed.textContent = formatSpeed(ulSpeed);
+        hudTotalRx.textContent = formatSize(rxBytes);
+        hudTotalTx.textContent = formatSize(txBytes);
+        hudResolution.textContent = `${session.width}×${session.height}`;
+        hudCodec.textContent = 'RFX';
+
+        // Latency ping
+        const pingStart = performance.now();
+        fetch('/ping').then(() => {
+            hudLatency.textContent = `${Math.round(performance.now() - pingStart)} ms`;
+        }).catch(() => {
+            hudLatency.textContent = '-- ms';
+        });
     }, 1000);
+}
+
+function formatSpeed(bytesPerSec) {
+    if (bytesPerSec >= 1048576) return `${(bytesPerSec / 1048576).toFixed(1)} MB/s`;
+    if (bytesPerSec >= 1024) return `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
+    return `${bytesPerSec} B/s`;
+}
+
+function formatSize(bytes) {
+    if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(2)} GB`;
+    if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
+    if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+    return `${bytes} B`;
 }
 
 // Called from WASM on each graphics update
 window.__rdp_frame = function() {
     frameCount++;
+};
+
+// ── Performance HUD Toggle ───────────────────────────────
+fpsBadge.addEventListener('click', () => {
+    hudVisible = !hudVisible;
+    perfHud.hidden = !hudVisible;
+});
+btnCloseHud.addEventListener('click', () => {
+    hudVisible = false;
+    perfHud.hidden = true;
+});
+
+// ── Audio Playback (RDPSND) ──────────────────────────────
+function initAudioContext() {
+    if (!audioContext) {
+        try {
+            audioContext = new AudioContext();
+            nextPlayTime = 0;
+            console.log('[RDPSND] AudioContext created, sampleRate:', audioContext.sampleRate);
+        } catch (e) {
+            console.warn('[RDPSND] Failed to create AudioContext:', e);
+        }
+    }
+}
+
+window.__rdp_audio_data = function(channels, sampleRate, bitsPerSample, uint8Array) {
+    if (!audioContext) return;
+
+    // Resume if suspended (autoplay policy)
+    if (audioContext.state === 'suspended') {
+        audioContext.resume();
+    }
+
+    const bytesPerSample = bitsPerSample / 8;
+    const numFrames = Math.floor(uint8Array.length / (channels * bytesPerSample));
+    if (numFrames === 0) return;
+
+    // Create audio buffer
+    const audioBuffer = audioContext.createBuffer(channels, numFrames, sampleRate);
+
+    // Convert signed 16-bit PCM (little-endian) to Float32
+    const view = new DataView(uint8Array.buffer, uint8Array.byteOffset, uint8Array.byteLength);
+    for (let ch = 0; ch < channels; ch++) {
+        const channelData = audioBuffer.getChannelData(ch);
+        for (let i = 0; i < numFrames; i++) {
+            // Interleaved: sample[i * channels + ch]
+            const byteOffset = (i * channels + ch) * bytesPerSample;
+            const sample = view.getInt16(byteOffset, true); // little-endian
+            channelData[i] = sample / 32768.0;
+        }
+    }
+
+    // Schedule back-to-back playback
+    const source = audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(audioContext.destination);
+
+    const now = audioContext.currentTime;
+    if (nextPlayTime < now) {
+        nextPlayTime = now + 0.05; // 50ms pre-buffer to absorb jitter
+    }
+    source.start(nextPlayTime);
+    nextPlayTime += audioBuffer.duration;
 };
 
 // ── Init ─────────────────────────────────────────────────

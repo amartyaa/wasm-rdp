@@ -62,13 +62,38 @@
                 <button id="btn-cancel-reconnect" class="btn-cancel-reconnect">Cancel</button>
             </div>
         </div>
+        <!-- Performance HUD -->
+        <div id="perf-hud" class="perf-hud" hidden>
+            <div class="perf-hud-header">
+                <span class="perf-hud-title">Performance</span>
+                <button id="btn-close-hud" class="perf-hud-close">&times;</button>
+            </div>
+            <div class="perf-hud-grid">
+                <span class="perf-hud-label">Latency</span>
+                <span id="hud-latency" class="perf-hud-value">-- ms</span>
+                <span class="perf-hud-label">FPS</span>
+                <span id="hud-fps" class="perf-hud-value">--</span>
+                <span class="perf-hud-label">Download</span>
+                <span id="hud-dl-speed" class="perf-hud-value">-- KB/s</span>
+                <span class="perf-hud-label">Upload</span>
+                <span id="hud-ul-speed" class="perf-hud-value">-- KB/s</span>
+                <span class="perf-hud-label">Total RX</span>
+                <span id="hud-total-rx" class="perf-hud-value">0 MB</span>
+                <span class="perf-hud-label">Total TX</span>
+                <span id="hud-total-tx" class="perf-hud-value">0 MB</span>
+                <span class="perf-hud-label">Resolution</span>
+                <span id="hud-resolution" class="perf-hud-value">--</span>
+                <span class="perf-hud-label">Codec</span>
+                <span id="hud-codec" class="perf-hud-value">RFX</span>
+            </div>
+        </div>
     </div>
 
     <!-- Floating Toolbar -->
     <div id="toolbar" class="toolbar" hidden>
         <div class="toolbar-inner">
             <div class="toolbar-group">
-                <span id="fps-badge" class="badge" title="Frames per second">0 FPS</span>
+                <span id="fps-badge" class="badge badge-clickable" title="Toggle Performance HUD">0 FPS</span>
                 <span id="resolution-badge" class="badge" title="Desktop resolution">--</span>
                 <span id="codec-badge" class="badge badge-accent" title="Active codec">RFX</span>
             </div>

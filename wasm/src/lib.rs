@@ -5,6 +5,7 @@ mod canvas;
 mod input;
 mod framed;
 mod clipboard;
+mod audio;
 
 /// Initialize the WASM module. Call this once before anything else.
 #[wasm_bindgen(start)]
@@ -60,6 +61,25 @@ pub(crate) fn notify_session_ended(reason: &str) {
     }
 }
 
+/// Called from audio.rs to forward PCM audio data to JavaScript for playback.
+pub(crate) fn notify_audio_data(channels: u16, sample_rate: u32, bits_per_sample: u16, data: &[u8]) {
+    let window = web_sys::window().unwrap();
+    if let Ok(func) = js_sys::Reflect::get(
+        &wasm_bindgen::JsValue::from(&window),
+        &wasm_bindgen::JsValue::from_str("__rdp_audio_data"),
+    ) {
+        if let Some(func) = func.dyn_ref::<js_sys::Function>() {
+            let arr = js_sys::Uint8Array::from(data);
+            let _ = func.call4(
+                &wasm_bindgen::JsValue::NULL,
+                &wasm_bindgen::JsValue::from(channels),
+                &wasm_bindgen::JsValue::from(sample_rate),
+                &wasm_bindgen::JsValue::from(bits_per_sample),
+                &arr.into(),
+            );
+        }
+    }
+}
 
 /// Log to browser console
 #[wasm_bindgen]

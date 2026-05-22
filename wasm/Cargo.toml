@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 # IronRDP
 ironrdp = { git = "https://github.com/Devolutions/IronRDP.git", branch = "master", features = [
     "connector", "session", "input", "graphics",
-    "dvc", "cliprdr", "svc", "displaycontrol", "pdu"
+    "dvc", "cliprdr", "svc", "displaycontrol", "pdu", "rdpsnd"
 ] }
 ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", branch = "master" }
 ironrdp-cliprdr-format = { git = "https://github.com/Devolutions/IronRDP.git", branch = "master" }

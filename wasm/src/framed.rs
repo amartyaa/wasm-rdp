@@ -1,9 +1,14 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use bytes::BytesMut;
 use futures_util::stream::SplitStream;
 use futures_util::StreamExt;
 use gloo_net::websocket::futures::WebSocket;
 use gloo_net::websocket::Message;
 use ironrdp::pdu::Action;
+
+use crate::session::SessionStats;
 
 /// Async framed reader for WASM WebSocket transport.
 ///
@@ -15,13 +20,15 @@ use ironrdp::pdu::Action;
 pub(crate) struct WasmFramed {
     ws_read: SplitStream<WebSocket>,
     buf: BytesMut,
+    stats: Rc<RefCell<SessionStats>>,
 }
 
 impl WasmFramed {
-    pub fn new(ws_read: SplitStream<WebSocket>) -> Self {
+    pub fn new(ws_read: SplitStream<WebSocket>, stats: Rc<RefCell<SessionStats>>) -> Self {
         Self {
             ws_read,
             buf: BytesMut::with_capacity(16384),
+            stats,
         }
     }
 
@@ -29,6 +36,7 @@ impl WasmFramed {
     async fn fill_buf(&mut self) -> anyhow::Result<()> {
         match self.ws_read.next().await {
             Some(Ok(Message::Bytes(data))) => {
+                self.stats.borrow_mut().rx_bytes += data.len() as u64;
                 self.buf.extend_from_slice(&data);
                 Ok(())
             }

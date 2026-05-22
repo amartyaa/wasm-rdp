@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::mem;
+use std::rc::Rc;
 
 use anyhow::Context as _;
 use futures_channel::mpsc;
@@ -29,6 +31,14 @@ pub struct Session {
     input_db: ironrdp::input::Database,
     desktop_width: u16,
     desktop_height: u16,
+    stats: Rc<RefCell<SessionStats>>,
+}
+
+/// Bandwidth statistics shared between the session, framed reader, and writer.
+#[derive(Default)]
+pub(crate) struct SessionStats {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
 }
 
 pub(crate) enum InputEvent {
@@ -76,8 +86,11 @@ impl Session {
         // Split WebSocket for bidirectional I/O
         let (ws_write, ws_read) = ws.split();
 
+        // Create shared stats for bandwidth tracking
+        let stats = Rc::new(RefCell::new(SessionStats::default()));
+
         // Create the framed reader for RDP PDU parsing
-        let framed = WasmFramed::new(ws_read);
+        let framed = WasmFramed::new(ws_read, stats.clone());
 
         // Create connector and perform RDP handshake
         let socket_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3389));
@@ -87,8 +100,13 @@ impl Session {
 
         let cliprdr = ironrdp::cliprdr::Cliprdr::new(Box::new(crate::clipboard::WasmCliprdrBackend::new(input_tx.clone())));
 
+        let rdpsnd = ironrdp::rdpsnd::client::Rdpsnd::new(
+            Box::new(crate::audio::WasmRdpsndHandler::new())
+        );
+
         let connector = ClientConnector::new(config, socket_addr)
-            .with_static_channel(cliprdr);
+            .with_static_channel(cliprdr)
+            .with_static_channel(rdpsnd);
 
         log("Starting RDP connection sequence...");
 
@@ -114,9 +132,11 @@ impl Session {
         // Spawn writer task
         spawn_local({
             let mut ws_write = ws_write;
+            let stats = stats.clone();
             async move {
                 while let Some(frame) = writer_rx.next().await {
                     use gloo_net::websocket::Message;
+                    stats.borrow_mut().tx_bytes += frame.len() as u64;
                     if ws_write.send(Message::Bytes(frame)).await.is_err() {
                         break;
                     }
@@ -155,6 +175,7 @@ impl Session {
             input_db: ironrdp::input::Database::new(),
             desktop_width,
             desktop_height,
+            stats,
         })
     }
 
@@ -226,6 +247,17 @@ impl Session {
         self.desktop_height
     }
 
+    /// Get total bytes received from the RDP server
+    #[wasm_bindgen(getter)]
+    pub fn rx_bytes(&self) -> f64 {
+        self.stats.borrow().rx_bytes as f64
+    }
+
+    /// Get total bytes sent to the RDP server
+    #[wasm_bindgen(getter)]
+    pub fn tx_bytes(&self) -> f64 {
+        self.stats.borrow().tx_bytes as f64
+    }
     /// Request desktop resize (e.g. on fullscreen change)
     #[wasm_bindgen]
     pub fn resize(&mut self, width: u16, height: u16) {
@@ -712,7 +744,7 @@ fn build_connector_config(
         enable_server_pointer: true,
         request_data: None,
         autologon: true,
-        enable_audio_playback: false,
+        enable_audio_playback: true,
         pointer_software_rendering: true,
         performance_flags: PerformanceFlags::default()
             | PerformanceFlags::DISABLE_WALLPAPER
