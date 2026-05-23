@@ -1660,7 +1660,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-rdpsnd"
 version = "0.7.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
