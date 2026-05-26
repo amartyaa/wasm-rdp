@@ -182,7 +182,7 @@ async fn handle_ws(ws: WebSocket, config: AppConfig) {
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
 
     loop {
-        let mut buf = vec![0u8; 16384];
+        let mut buf = vec![0u8; 65536];
 
         tokio::select! {
             // WS → TCP
@@ -302,7 +302,7 @@ async fn run_tls_relay(
     };
 
     let tls_to_ws = async {
-        let mut buf = vec![0u8; 16384];
+        let mut buf = vec![0u8; 65536];
         loop {
             match tls_read.read(&mut buf).await {
                 Ok(0) | Err(_) => break,

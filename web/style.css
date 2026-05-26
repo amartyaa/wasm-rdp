@@ -72,6 +72,75 @@ html, body {
     margin-top: 4px;
 }
 
+/* ── Settings Gear ───────────────────────────────────── */
+.btn-settings {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: none;
+    border: 1px solid transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 6px;
+    border-radius: var(--radius-sm);
+    transition: color 0.2s, border-color 0.2s, background 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.btn-settings:hover {
+    color: var(--text-primary);
+    border-color: var(--glass-border);
+    background: var(--glass-bg);
+}
+.btn-settings.active {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: rgba(108, 99, 255, 0.1);
+}
+.login-header {
+    position: relative;
+}
+
+.settings-panel {
+    margin-bottom: 20px;
+    padding: 14px 16px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    animation: fadeSlideIn 0.2s ease;
+}
+@keyframes fadeSlideIn {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+.settings-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.settings-row label {
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+.settings-row select {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    color: var(--text-primary);
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-family: var(--font);
+    font-size: 0.8rem;
+    cursor: pointer;
+    outline: none;
+    transition: border-color 0.2s;
+}
+.settings-row select:hover,
+.settings-row select:focus {
+    border-color: var(--accent);
+}
+
 .form-group {
     margin-bottom: 16px;
 }

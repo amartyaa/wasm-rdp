@@ -17,6 +17,23 @@ async function loadWasm() {
     const cachedUsername = localStorage.getItem('rdp_username');
     if (cachedDomain) document.getElementById('domain').value = cachedDomain;
     if (cachedUsername) document.getElementById('username').value = cachedUsername;
+
+    // Restore FPS cap setting
+    const fpsSelect = document.getElementById('fps-cap');
+    fpsSelect.value = String(fpsCap);
+    fpsSelect.addEventListener('change', () => {
+        fpsCap = parseInt(fpsSelect.value, 10);
+        localStorage.setItem('rdp_fps_cap', String(fpsCap));
+    });
+
+    // Settings gear toggle
+    const btnSettings = document.getElementById('btn-settings');
+    const settingsPanel = document.getElementById('settings-panel');
+    btnSettings.addEventListener('click', () => {
+        const open = settingsPanel.hidden;
+        settingsPanel.hidden = !open;
+        btnSettings.classList.toggle('active', open);
+    });
 }
 
 // ── DOM Elements ─────────────────────────────────────────
@@ -57,6 +74,7 @@ let lastFpsUpdate = performance.now();
 let toolbarTimeout = null;
 let lastMouseTime = 0;
 let resizeTimeout = null;
+let fpsCap = parseInt(localStorage.getItem('rdp_fps_cap') || '30', 10);
 const MOUSE_THROTTLE_MS = 16; // ~60fps cap on mouse events
 const RESIZE_DEBOUNCE_MS = 250;
 let statsInterval = null;
@@ -160,6 +178,8 @@ async function doConnect(username, password, domain) {
     const basePath = location.pathname.replace(/\/[^/]*$/, '');
     const wsUrl = `${proto}://${location.host}${basePath}/ws`;
 
+    // Expose FPS cap for WASM to read
+    window.__rdp_fps_cap = fpsCap;
     session = await wasm.connect(wsUrl, username, password, domain, width, height, 'rdp-canvas');
 
     // Store credentials in-memory for reconnection
@@ -619,21 +639,21 @@ window.__rdp_audio_data = function(channels, sampleRate, bitsPerSample, uint8Arr
     }
 
     const bytesPerSample = bitsPerSample / 8;
-    const numFrames = Math.floor(uint8Array.length / (channels * bytesPerSample));
+    const totalSamples = Math.floor(uint8Array.length / bytesPerSample);
+    const numFrames = Math.floor(totalSamples / channels);
     if (numFrames === 0) return;
 
     // Create audio buffer
     const audioBuffer = audioContext.createBuffer(channels, numFrames, sampleRate);
 
-    // Convert signed 16-bit PCM (little-endian) to Float32
-    const view = new DataView(uint8Array.buffer, uint8Array.byteOffset, uint8Array.byteLength);
+    // Use Int16Array view for bulk access (avoids per-sample DataView.getInt16 overhead)
+    const samples = new Int16Array(uint8Array.buffer, uint8Array.byteOffset, totalSamples);
+    const scale = 1.0 / 32768.0;
+
     for (let ch = 0; ch < channels; ch++) {
         const channelData = audioBuffer.getChannelData(ch);
         for (let i = 0; i < numFrames; i++) {
-            // Interleaved: sample[i * channels + ch]
-            const byteOffset = (i * channels + ch) * bytesPerSample;
-            const sample = view.getInt16(byteOffset, true); // little-endian
-            channelData[i] = sample / 32768.0;
+            channelData[i] = samples[i * channels + ch] * scale;
         }
     }
 

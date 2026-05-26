@@ -148,6 +148,47 @@ impl WasmFramed {
         Ok((action, payload))
     }
 
+    /// Try to read a complete PDU from the already-buffered data without blocking.
+    /// Returns None if there isn't enough data buffered for a complete PDU.
+    pub fn try_read_pdu(&mut self) -> Option<anyhow::Result<(Action, Vec<u8>)>> {
+        if self.buf.len() < 2 {
+            return None;
+        }
+
+        let first_byte = self.buf[0];
+        let action = match Action::from_fp_output_header(first_byte) {
+            Ok(a) => a,
+            Err(b) => return Some(Err(anyhow::anyhow!("Unknown action byte: 0x{b:02x}"))),
+        };
+
+        let pdu_length = match action {
+            Action::X224 => {
+                if self.buf.len() < 4 { return None; }
+                u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize
+            }
+            Action::FastPath => {
+                let len_byte = self.buf[1];
+                if len_byte & 0x80 != 0 {
+                    if self.buf.len() < 3 { return None; }
+                    (((len_byte & 0x7F) as usize) << 8) | (self.buf[2] as usize)
+                } else {
+                    len_byte as usize
+                }
+            }
+        };
+
+        if pdu_length == 0 {
+            return Some(Err(anyhow::anyhow!("Invalid PDU length: 0")));
+        }
+
+        if self.buf.len() < pdu_length {
+            return None; // Not enough data yet
+        }
+
+        let payload = self.buf.split_to(pdu_length).to_vec();
+        Some(Ok((action, payload)))
+    }
+
     /// Read a text message from the WebSocket (used for proxy commands).
     /// Skips any binary messages that may arrive and buffers them.
     pub async fn read_text_message(&mut self) -> anyhow::Result<String> {

@@ -1,7 +1,7 @@
 # install-service-windows.ps1 — Install IronBridge as a Windows Service
 param(
     [string]$BinaryPath = "C:\Users\amart\Downloads\web-rdp-rust\target\release\server.exe",
-    [int]$Port = 8080,
+    [int]$Port = 6081,
     [string]$RdpTarget = "localhost:3389"
 )
 

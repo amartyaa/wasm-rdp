@@ -8,6 +8,8 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
 pub(crate) struct Canvas {
     ctx: CanvasRenderingContext2d,
     canvas: HtmlCanvasElement,
+    /// Persistent scratch buffer for dirty-region extraction, reused across frames.
+    rgba_buf: Vec<u8>,
 }
 
 impl Canvas {
@@ -34,7 +36,11 @@ impl Canvas {
         // Disable image smoothing for crisp pixel rendering
         ctx.set_image_smoothing_enabled(false);
 
-        Ok(Self { ctx, canvas })
+        Ok(Self {
+            ctx,
+            canvas,
+            rgba_buf: Vec::new(),
+        })
     }
 
     /// Draw a dirty region from the DecodedImage onto the canvas.
@@ -53,11 +59,34 @@ impl Canvas {
             return Ok(());
         }
 
-        // Extract the dirty rectangle's pixel data from the full framebuffer
         let stride = usize::from(image.width()) * 4; // RGBA = 4 bytes per pixel
         let src = image.data();
+        let region_bytes = usize::from(w) * usize::from(h) * 4;
 
-        let mut rgba_buf = vec![0u8; usize::from(w) * usize::from(h) * 4];
+        // Full-screen fast path: if the dirty region spans the full width,
+        // we can slice the framebuffer directly without copying row-by-row.
+        if w == image.width() {
+            let src_start = usize::from(y) * stride;
+            let src_end = src_start + region_bytes;
+            if src_end <= src.len() {
+                let slice = &src[src_start..src_end];
+                let image_data = ImageData::new_with_u8_clamped_array_and_sh(
+                    Clamped(slice),
+                    u32::from(w),
+                    u32::from(h),
+                )
+                .map_err(|_| anyhow::anyhow!("ImageData creation failed"))?;
+
+                self.ctx
+                    .put_image_data(&image_data, f64::from(x), f64::from(y))
+                    .map_err(|_| anyhow::anyhow!("putImageData failed"))?;
+
+                return Ok(());
+            }
+        }
+
+        // Partial region: reuse the persistent buffer
+        self.rgba_buf.resize(region_bytes, 0);
 
         for row in 0..usize::from(h) {
             let src_offset = (usize::from(y) + row) * stride + usize::from(x) * 4;
@@ -65,13 +94,13 @@ impl Canvas {
             let row_bytes = usize::from(w) * 4;
 
             if src_offset + row_bytes <= src.len() {
-                rgba_buf[dst_offset..dst_offset + row_bytes]
+                self.rgba_buf[dst_offset..dst_offset + row_bytes]
                     .copy_from_slice(&src[src_offset..src_offset + row_bytes]);
             }
         }
 
         let image_data = ImageData::new_with_u8_clamped_array_and_sh(
-            Clamped(&rgba_buf),
+            Clamped(&self.rgba_buf),
             u32::from(w),
             u32::from(h),
         )
