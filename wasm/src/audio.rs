@@ -7,55 +7,29 @@ use crate::log;
 
 /// WASM-compatible RDPSND handler that forwards PCM audio data to JavaScript.
 ///
-/// Stores only Send-safe types (Vec<AudioFormat>). All JS interop is done
-/// via temporary js_sys calls in wave(), never stored on the struct.
+/// Accepts any PCM format the server offers. The actual sample rate, channel
+/// count, and bit depth come from the negotiated AudioFormat passed to wave().
 #[derive(Debug)]
 pub struct WasmRdpsndHandler {
-    formats: Vec<AudioFormat>,
+    supported_tags: Vec<WaveFormat>,
 }
 
 impl WasmRdpsndHandler {
     pub fn new() -> Self {
-        let formats = vec![
-            // PCM 16-bit, stereo, 44100 Hz
-            AudioFormat {
-                format: WaveFormat::PCM,
-                n_channels: 2,
-                n_samples_per_sec: 44100,
-                n_avg_bytes_per_sec: 44100 * 2 * 2, // sampleRate * channels * bytesPerSample
-                n_block_align: 4,                    // channels * bytesPerSample
-                bits_per_sample: 16,
-                data: None,
-            },
-            // PCM 16-bit, stereo, 48000 Hz
-            AudioFormat {
-                format: WaveFormat::PCM,
-                n_channels: 2,
-                n_samples_per_sec: 48000,
-                n_avg_bytes_per_sec: 48000 * 2 * 2,
-                n_block_align: 4,
-                bits_per_sample: 16,
-                data: None,
-            },
-        ];
-        Self { formats }
+        Self {
+            // We support raw PCM — the browser's Web Audio API handles resampling.
+            supported_tags: vec![WaveFormat::PCM],
+        }
     }
 }
 
 impl RdpsndClientHandler for WasmRdpsndHandler {
-    fn get_formats(&self) -> &[AudioFormat] {
-        &self.formats
+    fn supported_formats(&self) -> &[WaveFormat] {
+        &self.supported_tags
     }
 
-    fn wave(&mut self, format_no: usize, _ts: u32, data: Cow<'_, [u8]>) {
-        let (channels, sample_rate, bits_per_sample) = if let Some(fmt) = self.formats.get(format_no) {
-            (fmt.n_channels, fmt.n_samples_per_sec, fmt.bits_per_sample)
-        } else {
-            // Fallback: assume first format
-            (2, 44100, 16)
-        };
-
-        crate::notify_audio_data(channels, sample_rate, bits_per_sample, &data);
+    fn wave(&mut self, format: &AudioFormat, _ts: u32, data: Cow<'_, [u8]>) {
+        crate::notify_audio_data(format.n_channels, format.n_samples_per_sec, format.bits_per_sample, &data);
     }
 
     fn set_volume(&mut self, _volume: VolumePdu) {

@@ -23,8 +23,34 @@ thread_local! {
 /// Write text to the browser clipboard (Remote → Local).
 #[wasm_bindgen(inline_js = "
 export function write_clipboard_text(text) {
+    // Cache for the copy-event fallback (used by app.js onCopy handler)
+    window.__rdp_remote_clipboard_text = text;
+    window.__rdp_remote_clipboard_image = null;
+
+    // Try the async Clipboard API first (works on HTTPS + user gesture)
     if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).catch(e => console.warn('Clipboard write failed:', e));
+        navigator.clipboard.writeText(text).catch(() => {
+            // Fallback: execCommand('copy') via hidden textarea
+            _fallbackCopyText(text);
+        });
+    } else {
+        _fallbackCopyText(text);
+    }
+}
+
+function _fallbackCopyText(text) {
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+    } catch (e) {
+        // Last resort: user must press Ctrl+C manually; data is cached
+        console.warn('Clipboard write failed, data cached for Ctrl+C:', e);
     }
 }
 ")]
@@ -35,12 +61,16 @@ extern "C" {
 /// Write a PNG image to the browser clipboard (Remote → Local).
 #[wasm_bindgen(inline_js = "
 export function write_clipboard_image(pngBytes) {
+    // Cache for the copy-event fallback
+    window.__rdp_remote_clipboard_image = new Uint8Array(pngBytes);
+    window.__rdp_remote_clipboard_text = null;
+
     try {
         const blob = new Blob([pngBytes], { type: 'image/png' });
         const item = new ClipboardItem({ 'image/png': blob });
         navigator.clipboard.write([item]).catch(e => console.warn('Clipboard image write failed:', e));
     } catch (e) {
-        console.warn('ClipboardItem not supported:', e);
+        console.warn('ClipboardItem not supported, image cached for Ctrl+C:', e);
     }
 }
 ")]
