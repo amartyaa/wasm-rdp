@@ -13,6 +13,7 @@ pub fn init() {
     std::panic::set_hook(Box::new(|info| {
         log_error(&format!("PANIC: {info}"));
     }));
+    log(&format!("WASM module version {} loaded", env!("APP_VERSION")));
     log("IronRDP WASM module initialized");
 }
 

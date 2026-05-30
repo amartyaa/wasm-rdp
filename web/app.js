@@ -236,6 +236,8 @@ function setupInputHandlers() {
 
     // Clipboard paste (local → remote)
     document.addEventListener('paste', onPaste);
+    // Clipboard copy (remote → local fallback for HTTP)
+    document.addEventListener('copy', onCopy);
 }
 
 // Release all modifier keys in the RDP session.
@@ -278,10 +280,9 @@ function onKeyDown(e) {
         return;
     }
 
-    // Allow Ctrl+V to pass through so the browser fires the native 'paste' event,
-    // which our onPaste handler uses to read clipboard text and send it to RDP.
-    // We still send the key scancode to RDP below.
-    if (!(e.ctrlKey && e.code === 'KeyV')) {
+    // Allow Ctrl+V and Ctrl+C to pass through so the browser fires native
+    // 'paste' and 'copy' events for clipboard sync between local and remote.
+    if (!(e.ctrlKey && (e.code === 'KeyV' || e.code === 'KeyC'))) {
         e.preventDefault();
     }
     const mapping = SCANCODE_MAP[e.code];
@@ -371,6 +372,24 @@ function onPaste(e) {
         } catch (err) {
             console.warn('Clipboard paste to WASM failed:', err);
         }
+    }
+}
+
+function onCopy(e) {
+    // Remote → Local clipboard sync.
+    // When the user presses Ctrl+C in the web client, write cached remote
+    // clipboard data to the local clipboard via the copy event's clipboardData.
+    // This works on HTTP (no secure context needed).
+    const text = window.__rdp_remote_clipboard_text;
+    const image = window.__rdp_remote_clipboard_image;
+
+    if (text) {
+        e.preventDefault();
+        e.clipboardData.setData('text/plain', text);
+    } else if (image) {
+        // Note: clipboardData.setData only supports text types.
+        // Image copy via copy event is not universally supported.
+        // The WASM inline JS already attempts navigator.clipboard.write().
     }
 }
 
@@ -466,6 +485,7 @@ function cleanupSession() {
     document.removeEventListener('keyup', onKeyUp, true);
     window.removeEventListener('blur', releaseAllModifiers);
     document.removeEventListener('paste', onPaste);
+    document.removeEventListener('copy', onCopy);
     // Stop stats interval
     if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
     prevRxBytes = 0;
@@ -516,6 +536,7 @@ async function attemptReconnect() {
             document.removeEventListener('keyup', onKeyUp, true);
             window.removeEventListener('blur', releaseAllModifiers);
             document.removeEventListener('paste', onPaste);
+            document.removeEventListener('copy', onCopy);
 
             const { username, password, domain } = savedCredentials;
             await doConnect(username, password, domain);

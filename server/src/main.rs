@@ -21,7 +21,7 @@ use tracing::{error, info};
 struct WebAssets;
 
 #[derive(Parser, Clone)]
-#[command(name = "ironbridge", about = "IronBridge — Browser-Native RDP Client")]
+#[command(name = "ironbridge", version = env!("APP_VERSION"), disable_version_flag = true, about = "IronBridge — Browser-Native RDP Client")]
 struct Args {
     /// Port to listen on
     #[arg(long, default_value = "8080")]
@@ -42,6 +42,10 @@ struct Args {
     /// Run as a Windows service / Linux daemon
     #[arg(long)]
     service: bool,
+
+    /// Print version
+    #[arg(short = 'v', short_alias = 'V', long = "version", action = clap::ArgAction::Version)]
+    version: (),
 }
 
 #[derive(Clone)]

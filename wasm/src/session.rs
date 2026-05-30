@@ -597,26 +597,8 @@ async fn run_session(
     let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
     let mut active_stage = ActiveStage::new(connection_result);
 
-    // Read FPS cap from JS (set via the settings panel before connect).
-    // Default to 30fps if not set.
-    let fps_cap: f64 = web_sys::window()
-        .and_then(|w| js_sys::Reflect::get(&w, &wasm_bindgen::JsValue::from_str("__rdp_fps_cap")).ok())
-        .and_then(|v| v.as_f64())
-        .unwrap_or(30.0);
-    let min_render_interval_ms: f64 = 1000.0 / fps_cap;
-    log(&format!("Render throttle: {fps_cap} FPS ({min_render_interval_ms:.1}ms interval)"));
-    let mut last_render_time: f64 = 0.0;
-    // Persistent dirty region that survives across iterations when renders are skipped.
-    let mut pending_dirty: Option<ironrdp::pdu::geometry::InclusiveRectangle> = None;
-
     loop {
-        let mut all_outputs: Vec<ActiveStageOutput> = Vec::new();
-
-        // Wait for at least one PDU or input event.
-        // This is the natural yield point — read_pdu awaits the WS stream,
-        // giving the browser event loop a chance to deliver new messages,
-        // process mouse/keyboard events, and repaint.
-        let initial_outputs = select! {
+        let outputs = select! {
             frame = framed.read_pdu().fuse() => {
                 let (action, payload) = frame.context("read RDP PDU")?;
                 match active_stage.process(&mut image, action, &payload) {
@@ -633,9 +615,9 @@ async fn run_session(
                         active_stage.process_fastpath_input(&mut image, &events)
                             .context("process input")?
                     }
-                    Some(InputEvent::Resize { width: w, height: h }) => {
-                        log(&format!("Resize requested: {w}x{h}"));
-                        match active_stage.encode_resize(u32::from(w), u32::from(h), None, None) {
+                    Some(InputEvent::Resize { width: new_w, height: new_h }) => {
+                        log(&format!("Resize requested: {new_w}x{new_h}"));
+                        match active_stage.encode_resize(u32::from(new_w), u32::from(new_h), None, None) {
                             Some(Ok(resize_frame)) => {
                                 vec![ActiveStageOutput::ResponseFrame(resize_frame)]
                             }
@@ -695,42 +677,16 @@ async fn run_session(
                 }
             }
         };
-        all_outputs.extend(initial_outputs);
 
-        // Drain ALL buffered PDUs without blocking.
-        // No batch limit — the loop self-regulates because read_pdu yields
-        // naturally when the WS stream buffer is empty.
-        loop {
-            match framed.try_read_pdu() {
-                Some(Ok((action, payload))) => {
-                    match active_stage.process(&mut image, action, &payload) {
-                        Ok(outputs) => all_outputs.extend(outputs),
-                        Err(e) => {
-                            log_error(&format!("Ignoring PDU processing error: {e:#}"));
-                        }
-                    }
-                }
-                _ => break,
-            }
-        }
-
-        // Process outputs: send response frames immediately, merge dirty regions.
-        for out in all_outputs {
+        for out in outputs {
             match out {
                 ActiveStageOutput::ResponseFrame(frame) => {
                     writer_tx.unbounded_send(frame)
                         .context("send response frame")?;
                 }
                 ActiveStageOutput::GraphicsUpdate(region) => {
-                    pending_dirty = Some(match pending_dirty {
-                        Some(d) => ironrdp::pdu::geometry::InclusiveRectangle {
-                            left: d.left.min(region.left),
-                            top: d.top.min(region.top),
-                            right: d.right.max(region.right),
-                            bottom: d.bottom.max(region.bottom),
-                        },
-                        None => region,
-                    });
+                    canvas.draw(&image, region)?;
+                    crate::notify_frame();
                 }
                 ActiveStageOutput::PointerDefault => {
                     canvas.set_cursor("default");
@@ -752,20 +708,6 @@ async fn run_session(
                     return Ok(());
                 }
                 _ => {}
-            }
-        }
-
-        // Render at most ~120fps. The DecodedImage framebuffer is always current;
-        // we just avoid calling putImageData more often than the display can show.
-        if let Some(region) = pending_dirty.take() {
-            let now = js_sys::Date::now();
-            if now - last_render_time >= min_render_interval_ms {
-                canvas.draw(&image, region)?;
-                crate::notify_frame();
-                last_render_time = now;
-            } else {
-                // Render skipped — put the dirty region back for next iteration
-                pending_dirty = Some(region);
             }
         }
     }
@@ -794,11 +736,7 @@ fn build_connector_config(
         ime_file_name: String::new(),
         dig_product_id: String::new(),
         desktop_size: connector::DesktopSize { width, height },
-        bitmap: Some(connector::BitmapConfig {
-            lossy_compression: true,
-            color_depth: 32,
-            codecs: ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities(&[]).unwrap(),
-        }),
+        bitmap: None,
         client_build: 0,
         client_name: "web-rdp-rust".to_owned(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),

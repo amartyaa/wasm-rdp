@@ -4,7 +4,7 @@
 
 # WASM build artifacts (rebuilt from source)
 /web/pkg/
-
+/scratch/
 # IDE
 .idea/
 *.swp
