@@ -1,6 +1,16 @@
 [workspace]
 members = ["server", "wasm"]
 resolver = "2"
+
+# Optimized release builds for both the server and the WASM decoder.
+# LTO + a single codegen unit give the biggest win for the decode-heavy
+# WASM hot loop; panic=abort also shrinks the WASM binary (faster first load).
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
 [patch."https://github.com/Devolutions/IronRDP.git"]
 ironrdp-session = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master" }
 ironrdp = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master" }

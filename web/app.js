@@ -67,6 +67,7 @@ const hudTotalRx = document.getElementById('hud-total-rx');
 const hudTotalTx = document.getElementById('hud-total-tx');
 const hudResolution = document.getElementById('hud-resolution');
 const hudCodec = document.getElementById('hud-codec');
+const hudAudioCodec = document.getElementById('hud-audio-codec');
 
 // ── State ────────────────────────────────────────────────
 let frameCount = 0;
@@ -84,7 +85,17 @@ let hudVisible = false;
 
 // ── Audio State ──────────────────────────────────────────
 let audioContext = null;
-let nextPlayTime = 0;
+let audioGain = null;            // volume control (honors RDPSND Volume PDU)
+let audioWorkletNode = null;     // pull-based playback node
+let audioWorkletReady = false;   // module loaded
+let audioFormat = null;          // { channels, sourceRate } of the active node
+// WebCodecs decode state (Opus/AAC -> PCM -> worklet)
+let audioDecoder = null;
+let audioDecoderCodec = null;    // 'opus' | 'mp4a.40.2'
+let audioDecoderRate = 0;
+let audioDecoderChannels = 0;
+let audioPts = 0;                // monotonic timestamp for EncodedAudioChunk
+let currentAudioCodec = '--';    // negotiated codec, shown in the HUD
 
 // ── Reconnection State ───────────────────────────────────
 let savedCredentials = null;  // { username, password, domain }
@@ -180,7 +191,17 @@ async function doConnect(username, password, domain) {
 
     // Expose FPS cap for WASM to read
     window.__rdp_fps_cap = fpsCap;
-    session = await wasm.connect(wsUrl, username, password, domain, width, height, 'rdp-canvas');
+
+    // Detect which compressed audio codecs the browser can decode. We only
+    // advertise these to the RDP server if WebCodecs can actually handle them;
+    // otherwise negotiation stays on PCM.
+    const codecs = await detectAudioCodecs();
+    console.log('[RDPSND] WebCodecs support — opus:', codecs.opus, 'aac:', codecs.aac);
+
+    session = await wasm.connect(
+        wsUrl, username, password, domain, width, height, 'rdp-canvas',
+        codecs.opus, codecs.aac,
+    );
 
     // Store credentials in-memory for reconnection
     savedCredentials = { username, password, domain };
@@ -490,11 +511,27 @@ function cleanupSession() {
     if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
     prevRxBytes = 0;
     prevTxBytes = 0;
-    // Close audio context
+    // Close audio context and tear down the worklet graph
+    if (audioDecoder) {
+        try { audioDecoder.close(); } catch (_) {}
+        audioDecoder = null;
+        audioDecoderCodec = null;
+        audioDecoderRate = 0;
+        audioDecoderChannels = 0;
+        audioPts = 0;
+    }
+    if (audioWorkletNode) {
+        try { audioWorkletNode.disconnect(); } catch (_) {}
+        audioWorkletNode = null;
+    }
+    currentAudioCodec = '--';
+    if (hudAudioCodec) hudAudioCodec.textContent = '--';
     if (audioContext) {
         audioContext.close().catch(() => {});
         audioContext = null;
-        nextPlayTime = 0;
+        audioGain = null;
+        audioWorkletReady = false;
+        audioFormat = null;
     }
 }
 
@@ -639,56 +676,205 @@ btnCloseHud.addEventListener('click', () => {
 });
 
 // ── Audio Playback (RDPSND) ──────────────────────────────
+// Pull-based playback via an AudioWorklet ring buffer (see audio-worklet.js).
+// The audio device clock drives consumption, so there is no playback cursor to
+// drift — fixing the lag-and-never-recover behavior of the old scheduler.
 function initAudioContext() {
-    if (!audioContext) {
-        try {
-            audioContext = new AudioContext();
-            nextPlayTime = 0;
-            console.log('[RDPSND] AudioContext created, sampleRate:', audioContext.sampleRate);
-        } catch (e) {
-            console.warn('[RDPSND] Failed to create AudioContext:', e);
-        }
+    if (audioContext) return;
+    try {
+        audioContext = new AudioContext();
+        audioGain = audioContext.createGain();
+        audioGain.gain.value = 1.0;
+        audioGain.connect(audioContext.destination);
+        console.log('[RDPSND] AudioContext created, sampleRate:', audioContext.sampleRate);
+
+        audioContext.audioWorklet.addModule('./audio-worklet.js')
+            .then(() => {
+                audioWorkletReady = true;
+                console.log('[RDPSND] Audio worklet loaded');
+            })
+            .catch((e) => console.warn('[RDPSND] Failed to load audio worklet:', e));
+    } catch (e) {
+        console.warn('[RDPSND] Failed to create AudioContext:', e);
     }
 }
 
-window.__rdp_audio_data = function(channels, sampleRate, bitsPerSample, uint8Array) {
-    if (!audioContext) return;
+// Probe WebCodecs for Opus/AAC decode support. Returns { opus, aac }.
+async function detectAudioCodecs() {
+    const result = { opus: false, aac: false };
+    if (typeof AudioDecoder === 'undefined' || !AudioDecoder.isConfigSupported) {
+        return result;
+    }
+    try {
+        const o = await AudioDecoder.isConfigSupported({ codec: 'opus', sampleRate: 48000, numberOfChannels: 2 });
+        result.opus = !!o.supported;
+    } catch (_) {}
+    try {
+        const a = await AudioDecoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2 });
+        result.aac = !!a.supported;
+    } catch (_) {}
+    return result;
+}
 
-    // Resume if suspended (autoplay policy)
+// Ensure the worklet node matches the given format, then hand it per-channel PCM.
+function postPcmToWorklet(channelData, channels, sourceRate) {
+    if (!audioWorkletNode || audioFormat.channels !== channels || audioFormat.sourceRate !== sourceRate) {
+        if (audioWorkletNode) {
+            try { audioWorkletNode.disconnect(); } catch (_) {}
+        }
+        audioFormat = { channels, sourceRate };
+        audioWorkletNode = new AudioWorkletNode(audioContext, 'rdp-audio', {
+            numberOfInputs: 0,
+            numberOfOutputs: 1,
+            outputChannelCount: [Math.max(1, channels)],
+            processorOptions: { channels, sourceRate },
+        });
+        audioWorkletNode.connect(audioGain);
+    }
+    audioWorkletNode.port.postMessage(
+        { type: 'pcm', channelData },
+        channelData.map((a) => a.buffer),
+    );
+}
+
+// Synthesize an OpusHead identification header for raw Opus packets (RDP does
+// not Ogg-encapsulate, and WebCodecs' Opus decoder needs it as `description`).
+function makeOpusHead(channels, sampleRate) {
+    const h = new Uint8Array(19);
+    h.set([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64], 0); // "OpusHead"
+    h[8] = 1;            // version
+    h[9] = channels;     // channel count
+    // preSkip (LE16) = 0 at [10..12]
+    h[12] = sampleRate & 0xff;          // inputSampleRate LE32
+    h[13] = (sampleRate >>> 8) & 0xff;
+    h[14] = (sampleRate >>> 16) & 0xff;
+    h[15] = (sampleRate >>> 24) & 0xff;
+    // outputGain (LE16)=0 at [16..18], mapping family=0 at [18]
+    return h;
+}
+
+function onDecodedAudio(audioData) {
+    try {
+        const channels = audioData.numberOfChannels;
+        const frames = audioData.numberOfFrames;
+        const rate = audioData.sampleRate;
+        const channelData = [];
+        for (let ch = 0; ch < channels; ch++) {
+            const arr = new Float32Array(frames);
+            audioData.copyTo(arr, { planeIndex: ch, format: 'f32-planar' });
+            channelData.push(arr);
+        }
+        postPcmToWorklet(channelData, channels, rate);
+    } catch (e) {
+        console.warn('[RDPSND] decoded frame handling failed:', e);
+    } finally {
+        audioData.close();
+    }
+}
+
+function ensureDecoder(codecStr, sampleRate, channels, description) {
+    if (audioDecoder && audioDecoderCodec === codecStr &&
+        audioDecoderRate === sampleRate && audioDecoderChannels === channels) {
+        return audioDecoder;
+    }
+    if (audioDecoder) {
+        try { audioDecoder.close(); } catch (_) {}
+        audioDecoder = null;
+    }
+    try {
+        audioDecoder = new AudioDecoder({
+            output: onDecodedAudio,
+            error: (e) => console.warn('[RDPSND] AudioDecoder error:', e),
+        });
+        const config = { codec: codecStr, sampleRate, numberOfChannels: channels };
+        if (description && description.length) config.description = description;
+        audioDecoder.configure(config);
+        audioDecoderCodec = codecStr;
+        audioDecoderRate = sampleRate;
+        audioDecoderChannels = channels;
+    } catch (e) {
+        console.warn('[RDPSND] AudioDecoder configure failed:', e);
+        audioDecoder = null;
+    }
+    return audioDecoder;
+}
+
+// codec: 0x0001 PCM, 0x704F Opus, 0xA106 AAC. extradata = codec config (AAC ASC).
+window.__rdp_audio_data = function(codec, channels, sampleRate, bitsPerSample, uint8Array, extradata) {
+    if (!audioContext || !audioWorkletReady) return; // drop packets before the worklet is ready
+
     if (audioContext.state === 'suspended') {
         audioContext.resume();
     }
 
-    const bytesPerSample = bitsPerSample / 8;
-    const totalSamples = Math.floor(uint8Array.length / bytesPerSample);
-    const numFrames = Math.floor(totalSamples / channels);
-    if (numFrames === 0) return;
+    // Track the negotiated codec for the HUD.
+    const codecName = codec === 0x704F ? 'Opus' : codec === 0xA106 ? 'AAC' : codec === 0x0001 ? 'PCM' : '?';
+    if (codecName !== currentAudioCodec) {
+        currentAudioCodec = codecName;
+        if (hudAudioCodec) hudAudioCodec.textContent = codecName;
+    }
 
-    // Create audio buffer
-    const audioBuffer = audioContext.createBuffer(channels, numFrames, sampleRate);
+    if (codec === 0x0001) {
+        // PCM: deinterleave to per-channel Float32, then hand to the worklet.
+        const bytesPerSample = bitsPerSample / 8;
+        const totalSamples = Math.floor(uint8Array.length / bytesPerSample);
+        const numFrames = Math.floor(totalSamples / channels);
+        if (numFrames === 0) return;
 
-    // Use Int16Array view for bulk access (avoids per-sample DataView.getInt16 overhead)
-    const samples = new Int16Array(uint8Array.buffer, uint8Array.byteOffset, totalSamples);
-    const scale = 1.0 / 32768.0;
-
-    for (let ch = 0; ch < channels; ch++) {
-        const channelData = audioBuffer.getChannelData(ch);
-        for (let i = 0; i < numFrames; i++) {
-            channelData[i] = samples[i * channels + ch] * scale;
+        const channelData = [];
+        if (bitsPerSample === 16) {
+            const samples = new Int16Array(uint8Array.buffer, uint8Array.byteOffset, totalSamples);
+            const scale = 1.0 / 32768.0;
+            for (let ch = 0; ch < channels; ch++) {
+                const arr = new Float32Array(numFrames);
+                for (let i = 0; i < numFrames; i++) arr[i] = samples[i * channels + ch] * scale;
+                channelData.push(arr);
+            }
+        } else if (bitsPerSample === 8) {
+            for (let ch = 0; ch < channels; ch++) {
+                const arr = new Float32Array(numFrames);
+                for (let i = 0; i < numFrames; i++) arr[i] = (uint8Array[i * channels + ch] - 128) / 128.0;
+                channelData.push(arr);
+            }
+        } else {
+            return;
         }
+        postPcmToWorklet(channelData, channels, sampleRate);
+        return;
     }
 
-    // Schedule back-to-back playback
-    const source = audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(audioContext.destination);
-
-    const now = audioContext.currentTime;
-    if (nextPlayTime < now) {
-        nextPlayTime = now + 0.05; // 50ms pre-buffer to absorb jitter
+    // Compressed codecs: decode via WebCodecs, output handler feeds the worklet.
+    let codecStr, description;
+    if (codec === 0x704F) {
+        codecStr = 'opus';
+        description = (extradata && extradata.length) ? extradata : makeOpusHead(channels, sampleRate);
+    } else if (codec === 0xA106) {
+        codecStr = 'mp4a.40.2';
+        description = (extradata && extradata.length) ? extradata : null;
+    } else {
+        return;
     }
-    source.start(nextPlayTime);
-    nextPlayTime += audioBuffer.duration;
+
+    const dec = ensureDecoder(codecStr, sampleRate, channels, description);
+    if (!dec) return;
+    try {
+        dec.decode(new EncodedAudioChunk({
+            type: 'key',
+            timestamp: audioPts,
+            duration: 0,
+            data: uint8Array,
+        }));
+        audioPts += 20000; // ~20 ms; only needs to be monotonic
+    } catch (e) {
+        console.warn('[RDPSND] decode() failed:', e);
+    }
+};
+
+// Called from WASM on a RDPSND Volume PDU. left/right are 0..0xFFFF per channel.
+window.__rdp_audio_volume = function(left, right) {
+    if (!audioGain) return;
+    const g = Math.max(left, right) / 0xFFFF;
+    audioGain.gain.value = Math.max(0, Math.min(1, g));
 };
 
 // ── Init ─────────────────────────────────────────────────

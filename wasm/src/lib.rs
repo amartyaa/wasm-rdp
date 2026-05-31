@@ -28,10 +28,15 @@ pub async fn connect(
     width: u16,
     height: u16,
     canvas_id: String,
+    enable_opus: bool,
+    enable_aac: bool,
 ) -> Result<session::Session, JsValue> {
-    session::Session::connect(ws_url, username, password, domain, width, height, canvas_id)
-        .await
-        .map_err(|e| JsValue::from_str(&format!("{e:#}")))
+    session::Session::connect(
+        ws_url, username, password, domain, width, height, canvas_id,
+        enable_opus, enable_aac,
+    )
+    .await
+    .map_err(|e| JsValue::from_str(&format!("{e:#}")))
 }
 
 /// Called from session.rs on each graphics update to notify JS FPS counter.
@@ -83,7 +88,14 @@ pub(crate) fn notify_session_ended(reason: &str) {
 
 /// Called from audio.rs to forward PCM audio data to JavaScript for playback.
 /// Caches the JS function reference to avoid per-call Reflect::get lookups.
-pub(crate) fn notify_audio_data(channels: u16, sample_rate: u32, bits_per_sample: u16, data: &[u8]) {
+pub(crate) fn notify_audio_data(
+    codec: u16,
+    channels: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    data: &[u8],
+    extradata: &[u8],
+) {
     use std::cell::RefCell;
     thread_local! {
         static CACHED_FN: RefCell<Option<js_sys::Function>> = RefCell::new(None);
@@ -107,16 +119,36 @@ pub(crate) fn notify_audio_data(channels: u16, sample_rate: u32, bits_per_sample
             });
         }
         if let Some(func) = cached.as_ref() {
-            let arr = js_sys::Uint8Array::from(data);
-            let _ = func.call4(
-                &wasm_bindgen::JsValue::NULL,
-                &wasm_bindgen::JsValue::from(channels),
-                &wasm_bindgen::JsValue::from(sample_rate),
-                &wasm_bindgen::JsValue::from(bits_per_sample),
-                &arr.into(),
-            );
+            // 6 args — use apply() with an argument array (call4 only takes 4).
+            let args = js_sys::Array::new();
+            args.push(&wasm_bindgen::JsValue::from(codec));
+            args.push(&wasm_bindgen::JsValue::from(channels));
+            args.push(&wasm_bindgen::JsValue::from(sample_rate));
+            args.push(&wasm_bindgen::JsValue::from(bits_per_sample));
+            args.push(&js_sys::Uint8Array::from(data).into());
+            args.push(&js_sys::Uint8Array::from(extradata).into());
+            let _ = func.apply(&wasm_bindgen::JsValue::NULL, &args);
         }
     });
+}
+
+/// Called from audio.rs on a RDPSND Volume PDU. Forwards per-channel volume
+/// (0..0xFFFF) to the JS GainNode.
+pub(crate) fn notify_audio_volume(left: u16, right: u16) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(func) = js_sys::Reflect::get(
+            &wasm_bindgen::JsValue::from(window),
+            &wasm_bindgen::JsValue::from_str("__rdp_audio_volume"),
+        ) {
+            if let Some(func) = func.dyn_ref::<js_sys::Function>() {
+                let _ = func.call2(
+                    &wasm_bindgen::JsValue::NULL,
+                    &wasm_bindgen::JsValue::from(left),
+                    &wasm_bindgen::JsValue::from(right),
+                );
+            }
+        }
+    }
 }
 
 /// Log to browser console

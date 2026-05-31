@@ -6,6 +6,11 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Tune wasm-opt for runtime speed (this is a real-time decoder, not a landing
+# page). Runs on `wasm-pack build --release`.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O3", "--enable-bulk-memory"]
+
 [dependencies]
 # IronRDP
 ironrdp = { git = "https://github.com/Devolutions/IronRDP.git", branch = "master", features = [

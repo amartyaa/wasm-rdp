@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures_util::stream::SplitStream;
 use futures_util::StreamExt;
 use gloo_net::websocket::futures::WebSocket;
@@ -101,7 +101,7 @@ impl WasmFramed {
     ///
     /// Determines Action (FastPath vs X224) from the first byte and
     /// reads the full PDU length from the wire format header.
-    pub async fn read_pdu(&mut self) -> anyhow::Result<(Action, Vec<u8>)> {
+    pub async fn read_pdu(&mut self) -> anyhow::Result<(Action, Bytes)> {
         // Ensure we have at least 2 bytes for the header
         while self.buf.len() < 2 {
             self.fill_buf().await?;
@@ -144,7 +144,9 @@ impl WasmFramed {
             self.fill_buf().await?;
         }
 
-        let payload = self.buf.split_to(pdu_length).to_vec();
+        // `split_to` is O(1) on BytesMut and `freeze` is a zero-copy handoff to
+        // Bytes — no per-PDU heap copy on the hot graphics path.
+        let payload = self.buf.split_to(pdu_length).freeze();
         Ok((action, payload))
     }
 

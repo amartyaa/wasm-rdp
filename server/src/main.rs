@@ -180,14 +180,22 @@ async fn handle_ws(ws: WebSocket, config: AppConfig) {
         }
     };
 
+    // Disable Nagle's algorithm: RDP is latency-sensitive and interactive,
+    // so small input/graphics PDUs must not be delayed waiting to coalesce.
+    if let Err(e) = tcp.set_nodelay(true) {
+        error!("Failed to set TCP_NODELAY: {e}");
+    }
+
     let (mut ws_write, mut ws_read) = ws.split();
 
     // Phase 1: Raw TCP relay until TLS upgrade command
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
 
-    loop {
-        let mut buf = vec![0u8; 65536];
+    // Reusable read buffer — hoisted out of the loop to avoid a 64 KB
+    // allocation + zero-fill on every select! iteration.
+    let mut buf = vec![0u8; 65536];
 
+    loop {
         tokio::select! {
             // WS → TCP
             msg = ws_read.next() => {

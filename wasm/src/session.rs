@@ -58,6 +58,8 @@ impl Session {
         width: u16,
         height: u16,
         canvas_id: String,
+        enable_opus: bool,
+        enable_aac: bool,
     ) -> anyhow::Result<Session> {
         log(&format!("Connecting to proxy: {ws_url}"));
 
@@ -101,7 +103,7 @@ impl Session {
         let cliprdr = ironrdp::cliprdr::Cliprdr::new(Box::new(crate::clipboard::WasmCliprdrBackend::new(input_tx.clone())));
 
         let rdpsnd = ironrdp::rdpsnd::client::Rdpsnd::new(
-            Box::new(crate::audio::WasmRdpsndHandler::new())
+            Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac))
         );
 
         let connector = ClientConnector::new(config, socket_addr)
@@ -585,23 +587,84 @@ fn extract_public_key(cert_der: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(raw_key.to_vec())
 }
 
+/// Union two inclusive rectangles into their bounding box.
+fn union_rect(
+    a: ironrdp::pdu::geometry::InclusiveRectangle,
+    b: ironrdp::pdu::geometry::InclusiveRectangle,
+) -> ironrdp::pdu::geometry::InclusiveRectangle {
+    ironrdp::pdu::geometry::InclusiveRectangle {
+        left: a.left.min(b.left),
+        top: a.top.min(b.top),
+        right: a.right.max(b.right),
+        bottom: a.bottom.max(b.bottom),
+    }
+}
+
 async fn run_session(
     connection_result: ConnectionResult,
     mut framed: WasmFramed,
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
     mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
-    mut canvas: Canvas,
+    canvas: Canvas,
     width: u16,
     height: u16,
 ) -> anyhow::Result<()> {
-    let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
+    let image = Rc::new(RefCell::new(DecodedImage::new(PixelFormat::RgbA32, width, height)));
+    let canvas = Rc::new(RefCell::new(canvas));
     let mut active_stage = ActiveStage::new(connection_result);
+
+    // Dirty-region coalescing. Instead of painting synchronously on every
+    // GraphicsUpdate (which causes many putImageData boundary crossings and
+    // overdraw the monitor never shows), we accumulate the dirty region and
+    // flush exactly once per animation frame, aligned to the display refresh.
+    let pending: Rc<RefCell<Option<ironrdp::pdu::geometry::InclusiveRectangle>>> =
+        Rc::new(RefCell::new(None));
+    let raf_scheduled = Rc::new(RefCell::new(false));
+    let raf_closure: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+
+    let schedule_repaint = {
+        let pending = pending.clone();
+        let raf_scheduled = raf_scheduled.clone();
+        let raf_closure = raf_closure.clone();
+        let image = image.clone();
+        let canvas = canvas.clone();
+        move || {
+            if *raf_scheduled.borrow() {
+                return;
+            }
+            let window = match web_sys::window() {
+                Some(w) => w,
+                None => return,
+            };
+            *raf_scheduled.borrow_mut() = true;
+
+            let pending_cb = pending.clone();
+            let scheduled_cb = raf_scheduled.clone();
+            let image_cb = image.clone();
+            let canvas_cb = canvas.clone();
+
+            let cb = Closure::wrap(Box::new(move || {
+                *scheduled_cb.borrow_mut() = false;
+                if let Some(region) = pending_cb.borrow_mut().take() {
+                    let img = image_cb.borrow();
+                    if canvas_cb.borrow_mut().draw(&img, region).is_ok() {
+                        crate::notify_frame();
+                    }
+                }
+            }) as Box<dyn FnMut()>);
+
+            let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
+            // Keep the closure alive until it fires. The previously stored
+            // closure has already executed by the time we schedule again.
+            *raf_closure.borrow_mut() = Some(cb);
+        }
+    };
 
     loop {
         let outputs = select! {
             frame = framed.read_pdu().fuse() => {
                 let (action, payload) = frame.context("read RDP PDU")?;
-                match active_stage.process(&mut image, action, &payload) {
+                match active_stage.process(&mut image.borrow_mut(), action, payload.as_ref()) {
                     Ok(outputs) => outputs,
                     Err(e) => {
                         log_error(&format!("Ignoring PDU processing error: {e:#}"));
@@ -612,7 +675,7 @@ async fn run_session(
             event = input_rx.next().fuse() => {
                 match event {
                     Some(InputEvent::FastPath(events)) => {
-                        active_stage.process_fastpath_input(&mut image, &events)
+                        active_stage.process_fastpath_input(&mut image.borrow_mut(), &events)
                             .context("process input")?
                     }
                     Some(InputEvent::Resize { width: new_w, height: new_h }) => {
@@ -685,17 +748,24 @@ async fn run_session(
                         .context("send response frame")?;
                 }
                 ActiveStageOutput::GraphicsUpdate(region) => {
-                    canvas.draw(&image, region)?;
-                    crate::notify_frame();
+                    // Coalesce into the pending dirty region; the actual paint
+                    // happens on the next animation frame.
+                    let mut p = pending.borrow_mut();
+                    *p = Some(match p.take() {
+                        Some(prev) => union_rect(prev, region),
+                        None => region,
+                    });
+                    drop(p);
+                    schedule_repaint();
                 }
                 ActiveStageOutput::PointerDefault => {
-                    canvas.set_cursor("default");
+                    canvas.borrow().set_cursor("default");
                 }
                 ActiveStageOutput::PointerHidden => {
-                    canvas.set_cursor("none");
+                    canvas.borrow().set_cursor("none");
                 }
                 ActiveStageOutput::PointerBitmap(pointer) => {
-                    canvas.set_custom_cursor(
+                    canvas.borrow().set_custom_cursor(
                         &pointer.bitmap_data,
                         pointer.width as u32,
                         pointer.height as u32,
