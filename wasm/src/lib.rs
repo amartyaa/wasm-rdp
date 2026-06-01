@@ -30,10 +30,11 @@ pub async fn connect(
     canvas_id: String,
     enable_opus: bool,
     enable_aac: bool,
+    monitors: Vec<i32>,
 ) -> Result<session::Session, JsValue> {
     session::Session::connect(
         ws_url, username, password, domain, width, height, canvas_id,
-        enable_opus, enable_aac,
+        enable_opus, enable_aac, monitors,
     )
     .await
     .map_err(|e| JsValue::from_str(&format!("{e:#}")))

@@ -4,16 +4,34 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::Clamped;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
 
-/// Canvas renderer: writes RGBA pixels directly via putImageData (no re-encoding).
+/// Canvas renderer for one monitor: writes RGBA pixels directly via putImageData
+/// (no re-encoding).
+///
+/// Each `Canvas` covers a rectangle `[origin_x, origin_x+width) × [origin_y,
+/// origin_y+height)` of the **combined** desktop framebuffer. For a single
+/// monitor this is the whole framebuffer at origin (0,0); for multi-monitor each
+/// surface maps to one physical monitor's sub-rectangle.
 pub(crate) struct Canvas {
     ctx: CanvasRenderingContext2d,
     canvas: HtmlCanvasElement,
+    /// This surface's position within the combined desktop.
+    origin_x: u16,
+    origin_y: u16,
+    width: u16,
+    height: u16,
     /// Persistent scratch buffer for dirty-region extraction, reused across frames.
     rgba_buf: Vec<u8>,
 }
 
 impl Canvas {
-    pub fn new(canvas_id: &str, width: u16, height: u16) -> anyhow::Result<Self> {
+    /// Build a surface from a canvas element id (used for the main page canvas).
+    pub fn new(
+        canvas_id: &str,
+        origin_x: u16,
+        origin_y: u16,
+        width: u16,
+        height: u16,
+    ) -> anyhow::Result<Self> {
         let window = web_sys::window().context("no window")?;
         let document = window.document().context("no document")?;
         let element = document
@@ -22,16 +40,31 @@ impl Canvas {
         let canvas: HtmlCanvasElement = element
             .dyn_into()
             .map_err(|_| anyhow::anyhow!("element is not a canvas"))?;
+        Self::from_element(canvas, origin_x, origin_y, width, height)
+    }
 
+    /// Build a surface from a canvas element directly (used for popup-window
+    /// canvases that live in another document and can't be looked up by id here).
+    pub fn from_element(
+        canvas: HtmlCanvasElement,
+        origin_x: u16,
+        origin_y: u16,
+        width: u16,
+        height: u16,
+    ) -> anyhow::Result<Self> {
         canvas.set_width(u32::from(width));
         canvas.set_height(u32::from(height));
 
+        // `unchecked_into` (not `dyn_into`): a popup-window canvas belongs to a
+        // different JS realm, so an `instanceof CanvasRenderingContext2d` check
+        // against the main realm's constructor fails. getContext("2d") is
+        // guaranteed to return a 2D context; the method calls on it work across
+        // same-origin realms.
         let ctx: CanvasRenderingContext2d = canvas
             .get_context("2d")
             .map_err(|_| anyhow::anyhow!("get_context failed"))?
             .context("no 2d context")?
-            .dyn_into()
-            .map_err(|_| anyhow::anyhow!("not CanvasRenderingContext2d"))?;
+            .unchecked_into();
 
         // Disable image smoothing for crisp pixel rendering
         ctx.set_image_smoothing_enabled(false);
@@ -39,59 +72,79 @@ impl Canvas {
         Ok(Self {
             ctx,
             canvas,
+            origin_x,
+            origin_y,
+            width,
+            height,
             rgba_buf: Vec::new(),
         })
     }
 
-    /// Draw a dirty region from the DecodedImage onto the canvas.
-    /// Uses putImageData for zero-copy RGBA pixel transfer.
+    /// Draw the part of a combined-desktop dirty region that falls on this
+    /// surface. `region` is in combined-desktop coordinates (inclusive edges);
+    /// pixels are clipped to this surface and blitted at surface-local offsets.
     pub fn draw(
         &mut self,
         image: &DecodedImage,
         region: ironrdp::pdu::geometry::InclusiveRectangle,
     ) -> anyhow::Result<()> {
-        let x = region.left;
-        let y = region.top;
-        let w = region.right.saturating_sub(region.left).saturating_add(1);
-        let h = region.bottom.saturating_sub(region.top).saturating_add(1);
+        // Clip the incoming region to this surface's rect (all in combined,
+        // inclusive coords). Work in u32 to avoid u16 overflow at the edges.
+        let surf_left = u32::from(self.origin_x);
+        let surf_top = u32::from(self.origin_y);
+        let surf_right = surf_left + u32::from(self.width) - 1;
+        let surf_bottom = surf_top + u32::from(self.height) - 1;
 
-        if w == 0 || h == 0 {
-            return Ok(());
+        let sx0 = u32::from(region.left).max(surf_left);
+        let sy0 = u32::from(region.top).max(surf_top);
+        let sx1 = u32::from(region.right).min(surf_right);
+        let sy1 = u32::from(region.bottom).min(surf_bottom);
+
+        if sx0 > sx1 || sy0 > sy1 {
+            return Ok(()); // region doesn't touch this monitor
         }
+
+        let w = (sx1 - sx0 + 1) as usize;
+        let h = (sy1 - sy0 + 1) as usize;
+        // Destination on this canvas = combined coord minus this surface's origin.
+        let dx = (sx0 - surf_left) as f64;
+        let dy = (sy0 - surf_top) as f64;
 
         let stride = usize::from(image.width()) * 4; // RGBA = 4 bytes per pixel
         let src = image.data();
-        let region_bytes = usize::from(w) * usize::from(h) * 4;
+        let region_bytes = w * h * 4;
 
-        // Full-screen fast path: if the dirty region spans the full width,
-        // we can slice the framebuffer directly without copying row-by-row.
-        if w == image.width() {
-            let src_start = usize::from(y) * stride;
+        // Fast path: the clipped slice spans this surface's full source width and
+        // starts at the framebuffer's left edge, so the rows are contiguous in
+        // `src` — slice directly, no row-by-row copy. (This is the single-monitor
+        // common case: surface == whole framebuffer.)
+        if w == usize::from(image.width()) && sx0 == 0 {
+            let src_start = sy0 as usize * stride;
             let src_end = src_start + region_bytes;
             if src_end <= src.len() {
                 let slice = &src[src_start..src_end];
                 let image_data = ImageData::new_with_u8_clamped_array_and_sh(
                     Clamped(slice),
-                    u32::from(w),
-                    u32::from(h),
+                    w as u32,
+                    h as u32,
                 )
                 .map_err(|_| anyhow::anyhow!("ImageData creation failed"))?;
 
                 self.ctx
-                    .put_image_data(&image_data, f64::from(x), f64::from(y))
+                    .put_image_data(&image_data, dx, dy)
                     .map_err(|_| anyhow::anyhow!("putImageData failed"))?;
 
                 return Ok(());
             }
         }
 
-        // Partial region: reuse the persistent buffer
+        // Partial region: copy the overlapping rows into the persistent buffer.
         self.rgba_buf.resize(region_bytes, 0);
 
-        for row in 0..usize::from(h) {
-            let src_offset = (usize::from(y) + row) * stride + usize::from(x) * 4;
-            let dst_offset = row * usize::from(w) * 4;
-            let row_bytes = usize::from(w) * 4;
+        let row_bytes = w * 4;
+        for row in 0..h {
+            let src_offset = (sy0 as usize + row) * stride + sx0 as usize * 4;
+            let dst_offset = row * row_bytes;
 
             if src_offset + row_bytes <= src.len() {
                 self.rgba_buf[dst_offset..dst_offset + row_bytes]
@@ -101,13 +154,13 @@ impl Canvas {
 
         let image_data = ImageData::new_with_u8_clamped_array_and_sh(
             Clamped(&self.rgba_buf),
-            u32::from(w),
-            u32::from(h),
+            w as u32,
+            h as u32,
         )
         .map_err(|_| anyhow::anyhow!("ImageData creation failed"))?;
 
         self.ctx
-            .put_image_data(&image_data, f64::from(x), f64::from(y))
+            .put_image_data(&image_data, dx, dy)
             .map_err(|_| anyhow::anyhow!("putImageData failed"))?;
 
         Ok(())

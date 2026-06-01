@@ -1513,7 +1513,6 @@ dependencies = [
 [[package]]
 name = "ironrdp"
 version = "0.14.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-cliprdr",
  "ironrdp-connector",
@@ -1531,12 +1530,10 @@ dependencies = [
 [[package]]
 name = "ironrdp-bulk"
 version = "0.1.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 
 [[package]]
 name = "ironrdp-cliprdr"
 version = "0.5.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
@@ -1548,7 +1545,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-cliprdr-format"
 version = "0.1.4"
-source = "git+https://github.com/Devolutions/IronRDP.git?branch=master#eedd61f3da61c9dfbd925a69293d87601e01960c"
 dependencies = [
  "ironrdp-core",
  "png",
@@ -1557,7 +1553,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-connector"
 version = "0.8.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-core",
  "ironrdp-error",
@@ -1575,7 +1570,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-core"
 version = "0.1.5"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-error",
 ]
@@ -1583,7 +1577,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-displaycontrol"
 version = "0.5.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-core",
  "ironrdp-dvc",
@@ -1595,7 +1588,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-dvc"
 version = "0.5.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-core",
  "ironrdp-pdu",
@@ -1607,12 +1599,10 @@ dependencies = [
 [[package]]
 name = "ironrdp-error"
 version = "0.1.3"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 
 [[package]]
 name = "ironrdp-graphics"
 version = "0.7.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "bit_field",
  "bitflags 2.11.1",
@@ -1628,7 +1618,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-input"
 version = "0.5.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "bitvec",
  "ironrdp-pdu",
@@ -1638,7 +1627,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-pdu"
 version = "0.7.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "bit_field",
  "bitflags 2.11.1",
@@ -1671,7 +1659,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-session"
 version = "0.8.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "ironrdp-bulk",
  "ironrdp-connector",
@@ -1688,7 +1675,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-svc"
 version = "0.6.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=master#b7fdb8e37b84f899d9db45b82e6a4a843d3a13d4"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
@@ -4175,3 +4161,11 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[patch.unused]]
+name = "ironrdp-rdpsnd"
+version = "0.7.0"
+
+[[patch.unused]]
+name = "ironrdp-rdpsnd"
+version = "0.7.0"

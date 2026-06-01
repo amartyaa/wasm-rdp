@@ -9,6 +9,7 @@ use futures_util::FutureExt;
 use gloo_net::websocket::futures::WebSocket;
 use gloo_net::websocket;
 use ironrdp::connector::{self, ClientConnector, ClientConnectorState, ConnectionResult, Credentials, Sequence as _, State as _};
+use ironrdp::pdu::gcc;
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
@@ -32,6 +33,9 @@ pub struct Session {
     desktop_width: u16,
     desktop_height: u16,
     stats: Rc<RefCell<SessionStats>>,
+    /// Render surfaces, one per monitor, shared with the session loop. JS adds
+    /// popup-window surfaces here for multi-monitor; the rAF paint iterates them.
+    surfaces: Rc<RefCell<Vec<Canvas>>>,
 }
 
 /// Bandwidth statistics shared between the session, framed reader, and writer.
@@ -44,6 +48,9 @@ pub(crate) struct SessionStats {
 pub(crate) enum InputEvent {
     FastPath(smallvec::SmallVec<[FastPathInputEvent; 2]>),
     Resize { width: u16, height: u16 },
+    /// Apply a new multi-monitor layout to a live session via DisplayControl.
+    /// Flat `[left, top, width, height, primary]` per monitor.
+    MonitorLayout { monitors: Vec<i32> },
     Cliprdr(ironrdp::cliprdr::backend::ClipboardMessage),
     Terminate,
 }
@@ -60,8 +67,29 @@ impl Session {
         canvas_id: String,
         enable_opus: bool,
         enable_aac: bool,
+        monitors: Vec<i32>,
     ) -> anyhow::Result<Session> {
         log(&format!("Connecting to proxy: {ws_url}"));
+
+        // Multi-monitor: parse the flat layout from JS into GCC monitor rects.
+        // Empty ⇒ single-monitor (unchanged legacy behavior). When present, the
+        // requested desktop becomes the bounding box of all monitors.
+        let monitor_layout = parse_monitor_layout(&monitors);
+        let (width, height) = if monitor_layout.is_empty() {
+            (width, height)
+        } else {
+            let (cw, ch) = combined_desktop_size(&monitor_layout);
+            log(&format!(
+                "Multi-monitor: {} monitors, combined desktop {cw}x{ch}",
+                monitor_layout.len()
+            ));
+            (cw, ch)
+        };
+
+        // Rect of the surface backed by the main page canvas. Single-monitor:
+        // the whole desktop. Multi-monitor: the primary monitor (JS adds the
+        // secondary popup surfaces after connect via `add_surface`).
+        let primary_rect = primary_surface_rect(&monitor_layout, width, height);
 
         // Open WebSocket to the proxy
         let ws = WebSocket::open(&ws_url).context("Failed to open WebSocket")?;
@@ -83,6 +111,7 @@ impl Session {
         // Build IronRDP connector config
         let config = build_connector_config(
             username.clone(), password.clone(), domain.clone(), width, height,
+            monitor_layout,
         );
 
         // Split WebSocket for bidirectional I/O
@@ -124,9 +153,12 @@ impl Session {
             "RDP connected! Desktop: {desktop_width}x{desktop_height}"
         ));
 
-        // Set up canvas for rendering
-        let canvas = Canvas::new(&canvas_id, desktop_width, desktop_height)
+        // Set up the initial render surface (the main page canvas). Additional
+        // monitor surfaces are added by JS via `add_surface` for multi-monitor.
+        let (px, py, pw, ph) = primary_rect;
+        let canvas = Canvas::new(&canvas_id, px, py, pw, ph)
             .context("Failed to initialize canvas")?;
+        let surfaces: Rc<RefCell<Vec<Canvas>>> = Rc::new(RefCell::new(vec![canvas]));
 
         // Create the writer channel
         let (writer_tx, mut writer_rx) = mpsc::unbounded::<Vec<u8>>();
@@ -149,13 +181,14 @@ impl Session {
         // Spawn the main RDP session loop
         spawn_local({
             let writer_tx = writer_tx.clone();
+            let surfaces = surfaces.clone();
             async move {
                 let reason = match run_session(
                     connection_result,
                     framed,
                     writer_tx,
                     input_rx,
-                    canvas,
+                    surfaces,
                     desktop_width,
                     desktop_height,
                 ).await {
@@ -178,6 +211,7 @@ impl Session {
             desktop_width,
             desktop_height,
             stats,
+            surfaces,
         })
     }
 
@@ -268,10 +302,52 @@ impl Session {
         let _ = self.input_tx.unbounded_send(InputEvent::Resize { width, height });
     }
 
+    /// Apply a new multi-monitor layout to the live session over DisplayControl
+    /// (Windows hosts only). `monitors` is the same flat
+    /// `[left, top, width, height, primary]` layout passed to `connect`. After
+    /// calling this, JS should rebuild the render surfaces (`clear_surfaces` +
+    /// `add_surface`) to match the new combined desktop.
+    #[wasm_bindgen]
+    pub fn apply_monitor_layout(&mut self, monitors: Vec<i32>) {
+        if monitors.is_empty() {
+            return;
+        }
+        let (cw, ch) = combined_desktop_size(&parse_monitor_layout(&monitors));
+        self.desktop_width = cw;
+        self.desktop_height = ch;
+        let _ = self.input_tx.unbounded_send(InputEvent::MonitorLayout { monitors });
+    }
+
     /// Terminate the session
     #[wasm_bindgen]
     pub fn shutdown(&self) {
         let _ = self.input_tx.unbounded_send(InputEvent::Terminate);
+    }
+
+    /// Remove all render surfaces. Used before re-declaring the full set on a
+    /// multi-monitor (re)layout. The next painted frame is skipped until at
+    /// least one surface is added again.
+    #[wasm_bindgen]
+    pub fn clear_surfaces(&self) {
+        self.surfaces.borrow_mut().clear();
+    }
+
+    /// Add a render surface backed by `canvas`, covering the combined-desktop
+    /// rectangle `[origin_x, origin_x+width) × [origin_y, origin_y+height)`.
+    /// For multi-monitor, JS calls this once per monitor (main + popups).
+    #[wasm_bindgen]
+    pub fn add_surface(
+        &self,
+        canvas: web_sys::HtmlCanvasElement,
+        origin_x: u16,
+        origin_y: u16,
+        width: u16,
+        height: u16,
+    ) {
+        match crate::canvas::Canvas::from_element(canvas, origin_x, origin_y, width, height) {
+            Ok(surface) => self.surfaces.borrow_mut().push(surface),
+            Err(e) => log_error(&format!("add_surface failed: {e:#}")),
+        }
     }
 }
 
@@ -605,12 +681,11 @@ async fn run_session(
     mut framed: WasmFramed,
     writer_tx: mpsc::UnboundedSender<Vec<u8>>,
     mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
-    canvas: Canvas,
+    surfaces: Rc<RefCell<Vec<Canvas>>>,
     width: u16,
     height: u16,
 ) -> anyhow::Result<()> {
     let image = Rc::new(RefCell::new(DecodedImage::new(PixelFormat::RgbA32, width, height)));
-    let canvas = Rc::new(RefCell::new(canvas));
     let mut active_stage = ActiveStage::new(connection_result);
 
     // Dirty-region coalescing. Instead of painting synchronously on every
@@ -627,7 +702,7 @@ async fn run_session(
         let raf_scheduled = raf_scheduled.clone();
         let raf_closure = raf_closure.clone();
         let image = image.clone();
-        let canvas = canvas.clone();
+        let surfaces = surfaces.clone();
         move || {
             if *raf_scheduled.borrow() {
                 return;
@@ -641,13 +716,22 @@ async fn run_session(
             let pending_cb = pending.clone();
             let scheduled_cb = raf_scheduled.clone();
             let image_cb = image.clone();
-            let canvas_cb = canvas.clone();
+            let surfaces_cb = surfaces.clone();
 
             let cb = Closure::wrap(Box::new(move || {
                 *scheduled_cb.borrow_mut() = false;
                 if let Some(region) = pending_cb.borrow_mut().take() {
                     let img = image_cb.borrow();
-                    if canvas_cb.borrow_mut().draw(&img, region).is_ok() {
+                    // Paint the dirty region onto every monitor surface it
+                    // overlaps. Each surface clips to its own rect, so this is
+                    // one putImageData per affected monitor.
+                    let mut painted = false;
+                    for surface in surfaces_cb.borrow_mut().iter_mut() {
+                        if surface.draw(&img, region.clone()).is_ok() {
+                            painted = true;
+                        }
+                    }
+                    if painted {
                         crate::notify_frame();
                     }
                 }
@@ -691,6 +775,30 @@ async fn run_session(
                             None => {
                                 log("Resize: displaycontrol not available");
                                 Vec::new()
+                            }
+                        }
+                    }
+                    Some(InputEvent::MonitorLayout { monitors }) => {
+                        let entries = parse_dc_monitor_layout(&monitors);
+                        if entries.is_empty() {
+                            log_error("MonitorLayout: no valid monitors after validation");
+                            Vec::new()
+                        } else {
+                            // Resize our framebuffer to the new combined desktop
+                            // before the server starts sending updates for it.
+                            let (nw, nh) = combined_desktop_size(&parse_monitor_layout(&monitors));
+                            log(&format!("MonitorLayout: {} monitors, combined {nw}x{nh}", entries.len()));
+                            *image.borrow_mut() = DecodedImage::new(PixelFormat::RgbA32, nw, nh);
+                            match active_stage.encode_monitor_layout(&entries) {
+                                Some(Ok(frame)) => vec![ActiveStageOutput::ResponseFrame(frame)],
+                                Some(Err(e)) => {
+                                    log_error(&format!("MonitorLayout encode failed: {e}"));
+                                    Vec::new()
+                                }
+                                None => {
+                                    log("MonitorLayout: displaycontrol not available");
+                                    Vec::new()
+                                }
                             }
                         }
                     }
@@ -759,19 +867,25 @@ async fn run_session(
                     schedule_repaint();
                 }
                 ActiveStageOutput::PointerDefault => {
-                    canvas.borrow().set_cursor("default");
+                    for surface in surfaces.borrow().iter() {
+                        surface.set_cursor("default");
+                    }
                 }
                 ActiveStageOutput::PointerHidden => {
-                    canvas.borrow().set_cursor("none");
+                    for surface in surfaces.borrow().iter() {
+                        surface.set_cursor("none");
+                    }
                 }
                 ActiveStageOutput::PointerBitmap(pointer) => {
-                    canvas.borrow().set_custom_cursor(
-                        &pointer.bitmap_data,
-                        pointer.width as u32,
-                        pointer.height as u32,
-                        pointer.hotspot_x as u32,
-                        pointer.hotspot_y as u32,
-                    );
+                    for surface in surfaces.borrow().iter() {
+                        surface.set_custom_cursor(
+                            &pointer.bitmap_data,
+                            pointer.width as u32,
+                            pointer.height as u32,
+                            pointer.hotspot_x as u32,
+                            pointer.hotspot_y as u32,
+                        );
+                    }
                 }
                 ActiveStageOutput::Terminate(_reason) => {
                     log("RDP session terminated by server");
@@ -785,12 +899,87 @@ async fn run_session(
     Ok(())
 }
 
+/// Parse the flat monitor array from JS (`[left, top, width, height, primary]`
+/// per monitor, in combined-desktop pixels, primary at the origin) into GCC
+/// monitor rects. RDP monitor edges are **inclusive**, so a 1920-wide monitor at
+/// x=0 spans `left=0..=right=1919`. An empty input yields an empty layout
+/// (single-monitor / legacy path).
+fn parse_monitor_layout(flat: &[i32]) -> Vec<gcc::Monitor> {
+    flat.chunks_exact(5)
+        .map(|c| {
+            let (left, top, w, h, primary) = (c[0], c[1], c[2], c[3], c[4]);
+            gcc::Monitor {
+                left,
+                top,
+                right: left + w - 1,
+                bottom: top + h - 1,
+                flags: if primary != 0 {
+                    gcc::MonitorFlags::PRIMARY
+                } else {
+                    gcc::MonitorFlags::empty()
+                },
+            }
+        })
+        .collect()
+}
+
+/// Combined desktop size = bounding box of all monitors. Edges are inclusive, so
+/// the size is `max(right) + 1` by `max(bottom) + 1`. Assumes a normalized,
+/// non-negative layout (origin at 0,0) as produced by the JS side.
+fn combined_desktop_size(monitors: &[gcc::Monitor]) -> (u16, u16) {
+    let right = monitors.iter().map(|m| m.right).max().unwrap_or(0);
+    let bottom = monitors.iter().map(|m| m.bottom).max().unwrap_or(0);
+    let w = (right + 1).clamp(1, u16::MAX as i32) as u16;
+    let h = (bottom + 1).clamp(1, u16::MAX as i32) as u16;
+    (w, h)
+}
+
+/// Parse the flat monitor array into DisplayControl `MonitorLayoutEntry` values
+/// for a live (re)layout. Widths are adjusted to the protocol's constraints
+/// (even, 200..=8192); the primary must be at (0,0) (the JS side normalizes it
+/// so). Invalid monitors are skipped.
+fn parse_dc_monitor_layout(flat: &[i32]) -> Vec<ironrdp::displaycontrol::pdu::MonitorLayoutEntry> {
+    use ironrdp::displaycontrol::pdu::MonitorLayoutEntry;
+    flat.chunks_exact(5)
+        .filter_map(|c| {
+            let (left, top, w, h, primary) = (c[0], c[1], c[2], c[3], c[4]);
+            let (w, h) = MonitorLayoutEntry::adjust_display_size(w.max(0) as u32, h.max(0) as u32);
+            let entry = if primary != 0 {
+                MonitorLayoutEntry::new_primary(w, h)
+            } else {
+                MonitorLayoutEntry::new_secondary(w, h)
+            }
+            .ok()?;
+            entry.with_position(left, top).ok()
+        })
+        .collect()
+}
+
+/// Rect `(origin_x, origin_y, width, height)` of the surface backed by the main
+/// page canvas. Single-monitor (empty layout): the whole desktop. Multi-monitor:
+/// the primary monitor (the one flagged PRIMARY, else the first).
+fn primary_surface_rect(monitors: &[gcc::Monitor], combined_w: u16, combined_h: u16) -> (u16, u16, u16, u16) {
+    let Some(m) = monitors
+        .iter()
+        .find(|m| m.flags.contains(gcc::MonitorFlags::PRIMARY))
+        .or_else(|| monitors.first())
+    else {
+        return (0, 0, combined_w, combined_h);
+    };
+    let ox = m.left.max(0).min(i32::from(u16::MAX)) as u16;
+    let oy = m.top.max(0).min(i32::from(u16::MAX)) as u16;
+    let w = (m.right - m.left + 1).clamp(1, i32::from(u16::MAX)) as u16;
+    let h = (m.bottom - m.top + 1).clamp(1, i32::from(u16::MAX)) as u16;
+    (ox, oy, w, h)
+}
+
 fn build_connector_config(
     username: String,
     password: String,
     domain: String,
     width: u16,
     height: u16,
+    monitors: Vec<gcc::Monitor>,
 ) -> connector::Config {
     let domain = if domain.is_empty() { None } else { Some(domain) };
 
@@ -829,6 +1018,8 @@ fn build_connector_config(
         work_dir: String::new(),
         compression_type: None,
         multitransport_flags: None,
+        monitors,
+        monitors_extended: Vec::new(),
     }
 }
 

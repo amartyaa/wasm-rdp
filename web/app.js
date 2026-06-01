@@ -34,6 +34,25 @@ async function loadWasm() {
         settingsPanel.hidden = !open;
         btnSettings.classList.toggle('active', open);
     });
+
+    // Multi-monitor toggle. Only selectable on Chromium + secure context; the
+    // note explains the requirement when it can't be enabled.
+    const multimonToggle = document.getElementById('multimon-toggle');
+    const multimonNote = document.getElementById('multimon-note');
+    if (multimonSupported()) {
+        multimonToggle.checked = multimonEnabled;
+        multimonToggle.addEventListener('change', () => {
+            multimonEnabled = multimonToggle.checked;
+            localStorage.setItem('rdp_multimon', multimonEnabled ? '1' : '0');
+        });
+    } else {
+        multimonEnabled = false;
+        multimonToggle.checked = false;
+        multimonToggle.disabled = true;
+        multimonNote.textContent = window.isSecureContext
+            ? 'Unavailable: your browser lacks the Window Management API (use Chrome/Edge).'
+            : 'Unavailable: requires a secure context (HTTPS). Windows hosts only.';
+    }
 }
 
 // ── DOM Elements ─────────────────────────────────────────
@@ -96,6 +115,15 @@ let audioDecoderRate = 0;
 let audioDecoderChannels = 0;
 let audioPts = 0;                // monotonic timestamp for EncodedAudioChunk
 let currentAudioCodec = '--';    // negotiated codec, shown in the HUD
+
+// ── Multi-Monitor State ──────────────────────────────────
+// Multi-monitor uses the Window Management API (Chromium + secure context only)
+// and opens one browser window per physical display, all driven by the single
+// WASM session. Off by default; the layout is empty unless explicitly enabled.
+let multimonEnabled = localStorage.getItem('rdp_multimon') === '1';
+let monitorPopups = [];      // secondary displays: [{ win, canvas, monitor }]
+let screenDetailsObj = null; // ScreenDetails handle (source of 'screenschange')
+let multimonInUse = false;   // true while a multi-monitor session is active
 
 // ── Reconnection State ───────────────────────────────────
 let savedCredentials = null;  // { username, password, domain }
@@ -173,6 +201,8 @@ loginForm.addEventListener('submit', async (e) => {
     } catch (err) {
         showError(String(err));
         setConnecting(false);
+        // Close any secondary windows opened before the connect failed.
+        teardownMonitorWindows();
         // Exit fullscreen on error
         if (document.fullscreenElement) {
             document.exitFullscreen().catch(() => {});
@@ -198,10 +228,37 @@ async function doConnect(username, password, domain) {
     const codecs = await detectAudioCodecs();
     console.log('[RDPSND] WebCodecs support — opus:', codecs.opus, 'aac:', codecs.aac);
 
+    // Multi-monitor: build the physical-screen layout when enabled & supported,
+    // and open the secondary-display popups now (close to the connect gesture, to
+    // avoid popup blocking). Falls back to single-monitor otherwise.
+    let monitorBuild = null;
+    if (multimonEnabled && multimonSupported()) {
+        try {
+            monitorBuild = await buildMonitorLayout();
+        } catch (e) {
+            console.warn('[multimon] getScreenDetails failed, using single monitor:', e);
+        }
+        if (monitorBuild && monitorBuild.layout.length > 1) {
+            openSecondaryPopups(monitorBuild.layout);
+        } else {
+            monitorBuild = null; // only one screen, or an unusable arrangement
+        }
+    }
+
+    // Flat [left,top,width,height,primary] per monitor (combined-desktop pixels,
+    // primary at 0,0). Empty ⇒ single monitor. A layout can also be injected for
+    // single-window testing via window.__rdp_monitors.
+    const monitors = monitorBuild
+        ? monitorBuild.flat
+        : (Array.isArray(window.__rdp_monitors)
+            ? Int32Array.from(window.__rdp_monitors.flat())
+            : new Int32Array(0));
+
     session = await wasm.connect(
         wsUrl, username, password, domain, width, height, 'rdp-canvas',
-        codecs.opus, codecs.aac,
+        codecs.opus, codecs.aac, monitors,
     );
+    multimonInUse = !!monitorBuild;
 
     // Store credentials in-memory for reconnection
     savedCredentials = { username, password, domain };
@@ -220,6 +277,9 @@ async function doConnect(username, password, domain) {
 
     resBadge.textContent = `${session.width}×${session.height}`;
     setupInputHandlers();
+    if (multimonInUse) {
+        setupMonitorSurfaces(monitorBuild.layout);
+    }
     setupResizeHandler();
     startStatsInterval();
     initAudioContext();
@@ -243,22 +303,31 @@ function hideError() {
 
 // ── Input Handlers ───────────────────────────────────────
 function setupInputHandlers() {
-    // Keyboard
-    document.addEventListener('keydown', onKeyDown, true);
-    document.addEventListener('keyup', onKeyUp, true);
-    window.addEventListener('blur', releaseAllModifiers);
+    // Keyboard + clipboard on the main document.
+    setupDocInput(document, window);
+    // Mouse on the main canvas. Single-monitor and the multi-monitor primary
+    // both map at offset (0,0); secondary popups get their own offsets.
+    attachCanvasMouse(canvas, 0, 0);
+}
 
-    // Mouse
-    canvas.addEventListener('mousemove', onMouseMove);
-    canvas.addEventListener('mousedown', onMouseDown);
-    canvas.addEventListener('mouseup', onMouseUp);
-    canvas.addEventListener('wheel', onWheel, { passive: false });
-    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+// Attach keyboard + clipboard handlers to a document (main window or a popup).
+function setupDocInput(doc, win) {
+    doc.addEventListener('keydown', onKeyDown, true);
+    doc.addEventListener('keyup', onKeyUp, true);
+    win.addEventListener('blur', releaseAllModifiers);
+    doc.addEventListener('paste', onPaste);
+    doc.addEventListener('copy', onCopy);
+}
 
-    // Clipboard paste (local → remote)
-    document.addEventListener('paste', onPaste);
-    // Clipboard copy (remote → local fallback for HTTP)
-    document.addEventListener('copy', onCopy);
+// Attach mouse handlers to a canvas, tagging it with the combined-desktop offset
+// (the monitor's top-left) so input maps into the shared session coordinate space.
+function attachCanvasMouse(canvasEl, offsetX, offsetY) {
+    canvasEl.__rdpOffset = { x: offsetX, y: offsetY };
+    canvasEl.addEventListener('mousemove', onMouseMove);
+    canvasEl.addEventListener('mousedown', onMouseDown);
+    canvasEl.addEventListener('mouseup', onMouseUp);
+    canvasEl.addEventListener('wheel', onWheel, { passive: false });
+    canvasEl.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
 // Release all modifier keys in the RDP session.
@@ -322,12 +391,14 @@ function onKeyUp(e) {
 }
 
 function getCanvasCoords(e) {
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
+    const el = e.currentTarget;
+    const rect = el.getBoundingClientRect();
+    const scaleX = el.width / rect.width;
+    const scaleY = el.height / rect.height;
+    const off = el.__rdpOffset || { x: 0, y: 0 };
     return {
-        x: Math.round((e.clientX - rect.left) * scaleX),
-        y: Math.round((e.clientY - rect.top) * scaleY),
+        x: Math.round((e.clientX - rect.left) * scaleX) + off.x,
+        y: Math.round((e.clientY - rect.top) * scaleY) + off.y,
     };
 }
 
@@ -422,6 +493,129 @@ function setupResizeHandler() {
     // no-op: keep canvas at the server-negotiated size
 }
 
+// ── Multi-Monitor (Window Management API) ────────────────
+// One WASM session drives N same-origin windows: the main page shows the primary
+// monitor, one popup per secondary display. The session paints each window's
+// canvas (same-origin → in-process) and each window forwards input back, offset
+// into the combined-desktop coordinate space.
+
+function multimonSupported() {
+    return typeof window.getScreenDetails === 'function' && window.isSecureContext;
+}
+
+// Enumerate physical screens and build a normalized layout. Primary is placed at
+// (0,0) and the others translated relative to it. v1 supports only non-negative
+// arrangements (secondaries to the right/below); negative offsets (a screen left
+// of / above the primary) fall back to single-monitor — RDP needs the primary at
+// the origin and our framebuffer is 0-based. Uses CSS pixels (scale factor 100).
+async function buildMonitorLayout() {
+    if (!screenDetailsObj) {
+        screenDetailsObj = await window.getScreenDetails();
+        screenDetailsObj.addEventListener('screenschange', onScreensChange);
+    }
+    const screens = screenDetailsObj.screens;
+    const primary = screens.find((s) => s.isPrimary) || screenDetailsObj.currentScreen || screens[0];
+
+    const layout = screens.map((s) => ({
+        screen: s,
+        left: s.left - primary.left,
+        top: s.top - primary.top,
+        width: s.width,
+        height: s.height,
+        primary: s === primary,
+    }));
+
+    if (layout.some((m) => m.left < 0 || m.top < 0)) {
+        console.warn('[multimon] arrangement has a screen left of / above the primary; ' +
+            'this v1 supports right/below only — falling back to single monitor.');
+        return null;
+    }
+
+    const flat = [];
+    for (const m of layout) flat.push(m.left, m.top, m.width, m.height, m.primary ? 1 : 0);
+    console.log('[multimon] layout', layout.map((m) => `${m.width}x${m.height}@(${m.left},${m.top})${m.primary ? '*' : ''}`).join('  '));
+    return { flat: Int32Array.from(flat), layout };
+}
+
+// Open one popup window per secondary monitor, placed over that screen.
+function openSecondaryPopups(layout) {
+    teardownMonitorWindows();
+    for (const m of layout) {
+        if (m.primary) continue;
+        const s = m.screen;
+        const features = `popup,left=${s.availLeft},top=${s.availTop},width=${s.availWidth},height=${s.availHeight}`;
+        const win = window.open('', `rdp-monitor-${m.left}-${m.top}`, features);
+        if (!win) {
+            console.warn('[multimon] popup blocked for a secondary display; allow popups for this site.');
+            continue;
+        }
+        win.document.title = 'Remote Display';
+        const style = win.document.createElement('style');
+        style.textContent = 'html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:none}canvas{display:block;width:100vw;height:100vh}';
+        win.document.head.appendChild(style);
+        const c = win.document.createElement('canvas');
+        win.document.body.appendChild(c);
+        monitorPopups.push({ win, canvas: c, monitor: m });
+    }
+}
+
+// Declare the full surface set to the session (primary = main canvas, secondaries
+// = popup canvases) and wire each window's input + fullscreen.
+function setupMonitorSurfaces(layout) {
+    if (!session) return;
+    const primary = layout.find((m) => m.primary) || layout[0];
+
+    session.clear_surfaces();
+    // Primary → main page canvas. Mouse already attached by setupInputHandlers.
+    canvas.__rdpOffset = { x: 0, y: 0 };
+    session.add_surface(canvas, 0, 0, primary.width, primary.height);
+
+    for (const p of monitorPopups) {
+        const m = p.monitor;
+        session.add_surface(p.canvas, m.left, m.top, m.width, m.height);
+        attachCanvasMouse(p.canvas, m.left, m.top);
+        setupDocInput(p.win.document, p.win);
+        enableClickFullscreen(p.win, m.screen);
+    }
+}
+
+// Fullscreen a popup on its screen on first interaction. requestFullscreen needs
+// a user gesture, which we don't have after the async connect — so defer it to
+// the first click inside the popup. Until then the window is just sized to the
+// screen's work area (with browser chrome).
+function enableClickFullscreen(win, screen) {
+    const go = () => {
+        try {
+            const el = win.document.documentElement;
+            const p = el.requestFullscreen ? el.requestFullscreen({ screen }) : null;
+            if (p && p.catch) p.catch(() => {});
+        } catch (_) {}
+    };
+    win.document.addEventListener('mousedown', go, { once: true });
+}
+
+// Close all secondary popups (e.g. on disconnect or before a relayout).
+function teardownMonitorWindows() {
+    for (const p of monitorPopups) {
+        try { p.win.close(); } catch (_) {}
+    }
+    monitorPopups = [];
+}
+
+// React to a physical-arrangement change on a live multi-monitor session:
+// rebuild the layout, re-open popups, push the new layout over DisplayControl,
+// and re-declare surfaces.
+async function onScreensChange() {
+    if (!multimonInUse || !session) return;
+    let build;
+    try { build = await buildMonitorLayout(); } catch (_) { return; }
+    if (!build || build.layout.length < 2) return;
+    console.log('[multimon] screens changed — applying new layout');
+    openSecondaryPopups(build.layout);
+    session.apply_monitor_layout(build.flat);
+    setupMonitorSurfaces(build.layout);
+}
+
 // ── Special Keys ─────────────────────────────────────────
 function sendCtrlAltDel() {
     if (!session) return;
@@ -500,6 +694,13 @@ function cleanupSession() {
     setConnecting(false);
     if (document.fullscreenElement) {
         document.exitFullscreen().catch(() => {});
+    }
+    // Multi-monitor: close secondary windows and stop tracking screen changes.
+    teardownMonitorWindows();
+    multimonInUse = false;
+    if (screenDetailsObj) {
+        try { screenDetailsObj.removeEventListener('screenschange', onScreensChange); } catch (_) {}
+        screenDetailsObj = null;
     }
     // Remove input handlers
     document.removeEventListener('keydown', onKeyDown, true);
@@ -597,6 +798,9 @@ window.__rdp_session_ended = function(reason) {
     if (reason === 'connection_lost' && savedCredentials && !isUserDisconnect) {
         // Unexpected disconnect — try to reconnect
         session = null;
+        // Close frozen secondary windows during the backoff; they're re-opened
+        // by the reconnect's doConnect if multi-monitor is still in use.
+        teardownMonitorWindows();
         reconnectOverlay.hidden = false;
         toolbar.hidden = true;
         attemptReconnect();
@@ -634,7 +838,9 @@ function startStatsInterval() {
         hudUlSpeed.textContent = formatSpeed(ulSpeed);
         hudTotalRx.textContent = formatSize(rxBytes);
         hudTotalTx.textContent = formatSize(txBytes);
-        hudResolution.textContent = `${session.width}×${session.height}`;
+        hudResolution.textContent = multimonInUse
+            ? `${session.width}×${session.height} (${monitorPopups.length + 1} mon)`
+            : `${session.width}×${session.height}`;
         hudCodec.textContent = 'RFX';
 
         // Latency ping
