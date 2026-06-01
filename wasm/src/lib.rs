@@ -31,10 +31,13 @@ pub async fn connect(
     enable_opus: bool,
     enable_aac: bool,
     monitors: Vec<i32>,
+    enable_text_clipboard: bool,
+    enable_file_clipboard: bool,
 ) -> Result<session::Session, JsValue> {
     session::Session::connect(
         ws_url, username, password, domain, width, height, canvas_id,
         enable_opus, enable_aac, monitors,
+        enable_text_clipboard, enable_file_clipboard,
     )
     .await
     .map_err(|e| JsValue::from_str(&format!("{e:#}")))

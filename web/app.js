@@ -1,3 +1,7 @@
+// ── Feature flags (injected by server into window.* before this script loads) ─
+const textClipboardEnabled = window.__IB_TEXT_CLIPBOARD === true;
+const fileClipboardEnabled = window.__IB_FILE_CLIPBOARD === true;
+
 // ── WASM Module Loading ──────────────────────────────────
 let wasm = null;
 let session = null;
@@ -7,9 +11,44 @@ async function loadWasm() {
         wasm = await import('./pkg/wasm.js');
         await wasm.default(); // init the WASM module
         console.log('IronRDP WASM loaded');
+        console.log(`[IronBridge] Text clipboard sync: ${textClipboardEnabled ? 'enabled' : 'disabled'}`);
+        console.log(`[IronBridge] File clipboard sync: ${fileClipboardEnabled ? 'enabled' : 'disabled'}`);
     } catch (e) {
         console.error('Failed to load WASM module:', e);
         showError('Failed to load RDP module. Check that WASM is built.');
+    }
+
+    // Easter egg: triple-click the monitor icon within 600 ms to reveal
+    // the GitHub source link. Fades out after 3.5 s. Invisible to normal users.
+    (() => {
+        let clicks = 0, timer = null, hideTimer = null;
+        const wrap = document.getElementById('login-icon-wrap');
+        const tip  = document.getElementById('easter-tip');
+        if (!wrap || !tip) return;
+        wrap.addEventListener('click', () => {
+            clicks++;
+            clearTimeout(timer);
+            timer = setTimeout(() => { clicks = 0; }, 600);
+            if (clicks >= 3) {
+                clicks = 0;
+                clearTimeout(hideTimer);
+                tip.classList.add('visible');
+                // Allow clicking the link before it disappears.
+                tip.style.pointerEvents = 'all';
+                hideTimer = setTimeout(() => {
+                    tip.classList.remove('visible');
+                    tip.style.pointerEvents = 'none';
+                }, 3500);
+            }
+        });
+    })();
+
+    // Apply custom branding injected by --app-name server flag.
+    const appName = window.__APP_NAME;
+    if (appName) {
+        document.title = appName;
+        const h1 = document.querySelector('.login-header h1');
+        if (h1) h1.textContent = appName;
     }
 
     // Pre-fill cached credentials (domain + username only, not password)
@@ -97,6 +136,12 @@ let resizeTimeout = null;
 let fpsCap = parseInt(localStorage.getItem('rdp_fps_cap') || '30', 10);
 const MOUSE_THROTTLE_MS = 16; // ~60fps cap on mouse events
 const RESIZE_DEBOUNCE_MS = 250;
+// Local→remote paste: delay before replaying the Ctrl+V keystroke so the remote
+// registers our clipboard Format List first (covers OS clipboard registration,
+// not network RTT — both PDUs share one ordered stream).
+const PASTE_KEYSTROKE_DELAY_MS = 100;
+let suppressVUp = false;       // swallow the keyup of a deferred paste
+let pasteReplayTimer = null;
 let statsInterval = null;
 let prevRxBytes = 0;
 let prevTxBytes = 0;
@@ -191,6 +236,18 @@ loginForm.addEventListener('submit', async (e) => {
     hideError();
 
     try {
+        // Multi-monitor: acquire screen details FIRST, while the click's
+        // transient activation is still valid — getScreenDetails() needs it to
+        // prompt for the window-management permission the first time. Doing this
+        // after an await (fullscreen/connect) throws NotAllowedError.
+        if (multimonEnabled && multimonSupported()) {
+            try {
+                await ensureScreenDetails();
+            } catch (err) {
+                console.warn('[multimon] window-management permission denied; single monitor:', err);
+            }
+        }
+
         // Pre-connect fullscreen
         if (fullscreenCheckbox.checked) {
             try { await document.documentElement.requestFullscreen(); } catch (_) {}
@@ -257,6 +314,7 @@ async function doConnect(username, password, domain) {
     session = await wasm.connect(
         wsUrl, username, password, domain, width, height, 'rdp-canvas',
         codecs.opus, codecs.aac, monitors,
+        textClipboardEnabled, fileClipboardEnabled,
     );
     multimonInUse = !!monitorBuild;
 
@@ -328,6 +386,31 @@ function attachCanvasMouse(canvasEl, offsetX, offsetY) {
     canvasEl.addEventListener('mouseup', onMouseUp);
     canvasEl.addEventListener('wheel', onWheel, { passive: false });
     canvasEl.addEventListener('contextmenu', (e) => e.preventDefault());
+    attachFileDrop(canvasEl);
+}
+
+// Allow files dragged from the host OS onto the RDP canvas to be sent to the remote.
+function attachFileDrop(el) {
+    if (!fileClipboardEnabled) return;
+    el.addEventListener('dragover', e => {
+        if (e.dataTransfer?.types?.includes('Files')) {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+        }
+    });
+    el.addEventListener('drop', e => {
+        if (!session || !wasm) return;
+        const file = e.dataTransfer?.files?.[0];
+        if (!file) return;
+        e.preventDefault();
+        file.arrayBuffer().then(buf => {
+            try {
+                wasm.set_pending_clipboard_file(file.name, new Uint8Array(buf), session);
+            } catch (err) {
+                console.warn('File drag-drop to WASM failed:', err);
+            }
+        });
+    });
 }
 
 // Release all modifier keys in the RDP session.
@@ -370,9 +453,21 @@ function onKeyDown(e) {
         return;
     }
 
-    // Allow Ctrl+V and Ctrl+C to pass through so the browser fires native
-    // 'paste' and 'copy' events for clipboard sync between local and remote.
-    if (!(e.ctrlKey && (e.code === 'KeyV' || e.code === 'KeyC'))) {
+    // Paste (Ctrl+V): let the browser fire the 'paste' event, but DON'T send the
+    // V keystroke yet. onPaste advertises the clipboard (Format List) first, then
+    // replays the keystroke after a short delay so the remote has registered our
+    // format before it processes the paste. Sending V first (the old behavior)
+    // made the remote paste stale data — needing a 2nd Ctrl+V on Windows and
+    // lagging on xrdp. The delay only needs to cover the remote's clipboard
+    // registration (tens of ms), not the network RTT, since both PDUs travel the
+    // same ordered stream.
+    if (e.ctrlKey && e.code === 'KeyV') {
+        suppressVUp = true; // also swallow the matching keyup
+        return;             // no preventDefault (paste fires), no keystroke yet
+    }
+
+    // Allow Ctrl+C to pass through so the browser fires the native 'copy' event.
+    if (!(e.ctrlKey && e.code === 'KeyC')) {
         e.preventDefault();
     }
     const mapping = SCANCODE_MAP[e.code];
@@ -384,10 +479,27 @@ function onKeyDown(e) {
 function onKeyUp(e) {
     if (!session) return;
     e.preventDefault();
+    // Swallow the V keyup that pairs with a deferred paste (see onKeyDown).
+    if (suppressVUp && e.code === 'KeyV') {
+        suppressVUp = false;
+        return;
+    }
     const mapping = SCANCODE_MAP[e.code];
     if (mapping) {
         session.send_keyboard(mapping[0], false, mapping[1]);
     }
+}
+
+// Replay a Ctrl+V to the remote after the clipboard Format List has been sent.
+// Ctrl is still physically held by the user, so we send only V down/up.
+function scheduleReplayPaste() {
+    if (pasteReplayTimer) clearTimeout(pasteReplayTimer);
+    pasteReplayTimer = setTimeout(() => {
+        pasteReplayTimer = null;
+        if (!session) return;
+        session.send_keyboard(0x2F, true, false);  // V down
+        session.send_keyboard(0x2F, false, false); // V up
+    }, PASTE_KEYSTROKE_DELAY_MS);
 }
 
 function getCanvasCoords(e) {
@@ -435,6 +547,27 @@ function onWheel(e) {
 function onPaste(e) {
     if (!session || !wasm) return;
 
+    // Files: Local→Remote file transfer via CLIPRDR.
+    if (fileClipboardEnabled) {
+        const files = e.clipboardData?.files;
+        if (files?.length > 0) {
+            const file = files[0];
+            if (!file.type.startsWith('image/')) {
+                file.arrayBuffer().then(buf => {
+                    try {
+                        wasm.set_pending_clipboard_file(file.name, new Uint8Array(buf), session);
+                        scheduleReplayPaste(); // Advertise then deliver the paste keystroke
+                    } catch (err) {
+                        console.warn('Clipboard file paste to WASM failed:', err);
+                    }
+                });
+                return;
+            }
+        }
+    }
+
+    if (!textClipboardEnabled) return;
+
     // Check for image data first (screenshots, copied images)
     const items = e.clipboardData?.items;
     if (items) {
@@ -446,6 +579,8 @@ function onPaste(e) {
                         try {
                             const bytes = new Uint8Array(buf);
                             wasm.set_pending_clipboard_image(bytes, session);
+                            // Advertise sent — now deliver the paste keystroke.
+                            scheduleReplayPaste();
                         } catch (err) {
                             console.warn('Clipboard image paste to WASM failed:', err);
                         }
@@ -461,6 +596,8 @@ function onPaste(e) {
     if (text) {
         try {
             wasm.set_pending_clipboard(text, session);
+            // Advertise sent — now deliver the paste keystroke.
+            scheduleReplayPaste();
         } catch (err) {
             console.warn('Clipboard paste to WASM failed:', err);
         }
@@ -468,6 +605,7 @@ function onPaste(e) {
 }
 
 function onCopy(e) {
+    if (!textClipboardEnabled) return;
     // Remote → Local clipboard sync.
     // When the user presses Ctrl+C in the web client, write cached remote
     // clipboard data to the local clipboard via the copy event's clipboardData.
@@ -503,16 +641,24 @@ function multimonSupported() {
     return typeof window.getScreenDetails === 'function' && window.isSecureContext;
 }
 
+// Acquire ScreenDetails once. getScreenDetails() needs transient user activation
+// to show the window-management permission prompt the first time, so this MUST be
+// called from within a user gesture (the connect click) before any await consumes
+// the activation — otherwise it throws NotAllowedError. Idempotent; once granted,
+// later calls resolve without a prompt.
+async function ensureScreenDetails() {
+    if (screenDetailsObj) return;
+    screenDetailsObj = await window.getScreenDetails();
+    screenDetailsObj.addEventListener('screenschange', onScreensChange);
+}
+
 // Enumerate physical screens and build a normalized layout. Primary is placed at
 // (0,0) and the others translated relative to it. v1 supports only non-negative
 // arrangements (secondaries to the right/below); negative offsets (a screen left
 // of / above the primary) fall back to single-monitor — RDP needs the primary at
 // the origin and our framebuffer is 0-based. Uses CSS pixels (scale factor 100).
 async function buildMonitorLayout() {
-    if (!screenDetailsObj) {
-        screenDetailsObj = await window.getScreenDetails();
-        screenDetailsObj.addEventListener('screenschange', onScreensChange);
-    }
+    await ensureScreenDetails();
     const screens = screenDetailsObj.screens;
     const primary = screens.find((s) => s.isPrimary) || screenDetailsObj.currentScreen || screens[0];
 
@@ -549,7 +695,7 @@ function openSecondaryPopups(layout) {
             console.warn('[multimon] popup blocked for a secondary display; allow popups for this site.');
             continue;
         }
-        win.document.title = 'Remote Display';
+        win.document.title = window.__APP_NAME || 'Remote Display';
         const style = win.document.createElement('style');
         style.textContent = 'html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:none}canvas{display:block;width:100vw;height:100vh}';
         win.document.head.appendChild(style);
@@ -712,6 +858,11 @@ function cleanupSession() {
     if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
     prevRxBytes = 0;
     prevTxBytes = 0;
+    // Reset deferred-paste state
+    if (pasteReplayTimer) { clearTimeout(pasteReplayTimer); pasteReplayTimer = null; }
+    suppressVUp = false;
+    const fileToast = document.getElementById('rdp-file-toast');
+    if (fileToast) fileToast.hidden = true;
     // Close audio context and tear down the worklet graph
     if (audioDecoder) {
         try { audioDecoder.close(); } catch (_) {}
@@ -1004,6 +1155,35 @@ function ensureDecoder(codecStr, sampleRate, channels, description) {
     }
     return audioDecoder;
 }
+
+// ── Remote-file download notification ────────────────────
+// Shown when the remote clipboard contains files. User must explicitly click
+// "Download" — we never auto-download to avoid disrupting internal RDP copy-paste.
+function showRemoteFilesNotification() {
+    let toast = document.getElementById('rdp-file-toast');
+    if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'rdp-file-toast';
+        toast.className = 'rdp-file-toast';
+        toast.innerHTML =
+            '<span>Remote clipboard has files</span>' +
+            '<button class="rdp-file-toast-dl">Download</button>' +
+            '<button class="rdp-file-toast-dismiss" aria-label="Dismiss">✕</button>';
+        document.body.appendChild(toast);
+        toast.querySelector('.rdp-file-toast-dl').addEventListener('click', () => {
+            if (session && wasm) {
+                try { wasm.trigger_remote_file_download(session); } catch (e) {}
+            }
+            toast.hidden = true;
+        });
+        toast.querySelector('.rdp-file-toast-dismiss').addEventListener('click', () => {
+            toast.hidden = true;
+        });
+    }
+    toast.hidden = false;
+}
+
+window.__rdp_remote_has_files = fileClipboardEnabled ? showRemoteFilesNotification : null;
 
 // codec: 0x0001 PCM, 0x704F Opus, 0xA106 AAC. extradata = codec config (AAC ASC).
 window.__rdp_audio_data = function(codec, channels, sampleRate, bitsPerSample, uint8Array, extradata) {

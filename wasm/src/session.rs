@@ -52,6 +52,8 @@ pub(crate) enum InputEvent {
     /// Flat `[left, top, width, height, primary]` per monitor.
     MonitorLayout { monitors: Vec<i32> },
     Cliprdr(ironrdp::cliprdr::backend::ClipboardMessage),
+    /// Advertise local files to the remote (Local→Remote file transfer).
+    FileCopy(Vec<ironrdp::cliprdr::pdu::FileDescriptor>),
     Terminate,
 }
 
@@ -68,6 +70,8 @@ impl Session {
         enable_opus: bool,
         enable_aac: bool,
         monitors: Vec<i32>,
+        enable_text_clipboard: bool,
+        enable_file_clipboard: bool,
     ) -> anyhow::Result<Session> {
         log(&format!("Connecting to proxy: {ws_url}"));
 
@@ -129,7 +133,9 @@ impl Session {
         // Create input channel (must be done before CliprdrBackend to pass tx)
         let (input_tx, input_rx) = mpsc::unbounded();
 
-        let cliprdr = ironrdp::cliprdr::Cliprdr::new(Box::new(crate::clipboard::WasmCliprdrBackend::new(input_tx.clone())));
+        let cliprdr = ironrdp::cliprdr::Cliprdr::new(Box::new(
+            crate::clipboard::WasmCliprdrBackend::new(input_tx.clone(), enable_text_clipboard, enable_file_clipboard)
+        ));
 
         let rdpsnd = ironrdp::rdpsnd::client::Rdpsnd::new(
             Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac))
@@ -823,11 +829,22 @@ async fn run_session(
                                         Err(e) => { log_error(&format!("Cliprdr paste error: {e}")); None }
                                     }
                                 }
+                                ironrdp::cliprdr::backend::ClipboardMessage::SendFileContentsRequest(req) => {
+                                    match cliprdr.request_file_contents(req) {
+                                        Ok(msgs) => Some(msgs),
+                                        Err(e) => { log_error(&format!("Cliprdr file contents request error: {e}")); None }
+                                    }
+                                }
+                                ironrdp::cliprdr::backend::ClipboardMessage::SendFileContentsResponse(resp) => {
+                                    match cliprdr.submit_file_contents(resp) {
+                                        Ok(msgs) => Some(msgs),
+                                        Err(e) => { log_error(&format!("Cliprdr file contents response error: {e}")); None }
+                                    }
+                                }
                                 ironrdp::cliprdr::backend::ClipboardMessage::Error(e) => {
                                     log_error(&format!("Clipboard backend error: {e}"));
                                     None
                                 }
-                                _ => None,
                             } {
                                 let frame = active_stage.process_svc_processor_messages(svc_messages)
                                     .context("encode cliprdr SVC messages")?;
@@ -837,6 +854,24 @@ async fn run_session(
                             }
                         } else {
                             log_error("Clipboard event received but Cliprdr is not available");
+                            Vec::new()
+                        }
+                    }
+                    Some(InputEvent::FileCopy(files)) => {
+                        if let Some(cliprdr) = active_stage.get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>() {
+                            match cliprdr.initiate_file_copy(files) {
+                                Ok(msgs) => {
+                                    let frame = active_stage.process_svc_processor_messages(msgs)
+                                        .context("encode cliprdr file copy messages")?;
+                                    vec![ActiveStageOutput::ResponseFrame(frame)]
+                                }
+                                Err(e) => {
+                                    log_error(&format!("Cliprdr initiate_file_copy error: {e}"));
+                                    Vec::new()
+                                }
+                            }
+                        } else {
+                            log_error("FileCopy event received but Cliprdr is not available");
                             Vec::new()
                         }
                     }
@@ -1027,6 +1062,11 @@ impl Session {
     /// Expose a way for the clipboard module to send cliprdr messages to the event loop.
     pub(crate) fn send_cliprdr_message(&self, message: ironrdp::cliprdr::backend::ClipboardMessage) {
         let _ = self.input_tx.unbounded_send(InputEvent::Cliprdr(message));
+    }
+
+    /// Advertise local files to the remote via CLIPRDR (Local→Remote file transfer).
+    pub(crate) fn send_file_copy(&self, files: Vec<ironrdp::cliprdr::pdu::FileDescriptor>) {
+        let _ = self.input_tx.unbounded_send(InputEvent::FileCopy(files));
     }
 }
 

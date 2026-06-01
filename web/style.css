@@ -53,11 +53,56 @@ html, body {
     margin-bottom: 28px;
 }
 
+.login-icon-wrap {
+    display: inline-block;
+    position: relative;
+    cursor: default;
+    margin-bottom: 0;
+}
 .login-icon {
     width: 40px;
     height: 40px;
     color: var(--accent);
     margin-bottom: 12px;
+    display: block;
+}
+
+/* Easter egg: triple-click the icon to reveal the GitHub link. */
+.easter-tip {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(10, 14, 26, 0.92);
+    border: 1px solid var(--glass-border);
+    border-radius: 6px;
+    padding: 5px 12px;
+    white-space: nowrap;
+    font-size: 0.70rem;
+    color: var(--text-secondary);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    z-index: 10;
+}
+.easter-tip a {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 500;
+    pointer-events: all;
+}
+.easter-tip.visible {
+    opacity: 1;
+}
+.easter-tip::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 5px solid transparent;
+    border-top-color: rgba(10, 14, 26, 0.92);
 }
 
 .login-header h1 {
@@ -545,3 +590,52 @@ html, body {
     background: var(--accent-glow);
     color: #c4bfff;
 }
+
+/* ── Remote file download notification ──────────────────── */
+.rdp-file-toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: rgba(10, 14, 26, 0.92);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+    color: var(--text-primary);
+    font-size: 13px;
+    z-index: 200;
+}
+
+.rdp-file-toast[hidden] { display: none; }
+
+.rdp-file-toast-dl {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-family: var(--font);
+    cursor: pointer;
+    transition: background 0.15s;
+}
+
+.rdp-file-toast-dl:hover { background: #5550d6; }
+
+.rdp-file-toast-dismiss {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 14px;
+    padding: 2px 4px;
+    cursor: pointer;
+    line-height: 1;
+    transition: color 0.15s;
+}
+
+.rdp-file-toast-dismiss:hover { color: var(--text-primary); }

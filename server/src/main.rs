@@ -43,6 +43,21 @@ struct Args {
     #[arg(long)]
     service: bool,
 
+    /// Application name shown on the login page and browser tab.
+    /// Defaults to "Remote Desktop" when omitted.
+    #[arg(long)]
+    app_name: Option<String>,
+
+    /// Enable bidirectional text/image clipboard sync between browser and remote.
+    /// Default: disabled. Also controlled via IB_TEXT_CLIPBOARD_SYNC env var (CLI takes priority).
+    #[arg(long, default_value_t = false, env = "IB_TEXT_CLIPBOARD_SYNC")]
+    enable_text_clipboard_sync: bool,
+
+    /// Enable bidirectional file clipboard transfer (CLIPRDR FileGroupDescriptorW).
+    /// Default: disabled. Also controlled via IB_FILE_CLIPBOARD_SYNC env var (CLI takes priority).
+    #[arg(long, default_value_t = false, env = "IB_FILE_CLIPBOARD_SYNC")]
+    enable_file_clipboard_sync: bool,
+
     /// Print version
     #[arg(short = 'v', short_alias = 'V', long = "version", action = clap::ArgAction::Version)]
     version: (),
@@ -51,6 +66,10 @@ struct Args {
 #[derive(Clone)]
 struct AppConfig {
     rdp_target: String,
+    /// Injected into index.html as window.__APP_NAME so JS can brand the UI.
+    app_name: Option<String>,
+    enable_text_clipboard: bool,
+    enable_file_clipboard: bool,
 }
 
 #[tokio::main]
@@ -76,7 +95,16 @@ async fn run_server(args: Args) {
 
     let config = AppConfig {
         rdp_target: args.rdp_target.clone(),
+        app_name: args.app_name.clone(),
+        enable_text_clipboard: args.enable_text_clipboard_sync,
+        enable_file_clipboard: args.enable_file_clipboard_sync,
     };
+
+    if let Some(name) = &config.app_name {
+        info!("App name: {name}");
+    }
+    info!("Text clipboard sync: {}", if config.enable_text_clipboard { "enabled" } else { "disabled" });
+    info!("File clipboard sync: {}", if config.enable_file_clipboard { "enabled" } else { "disabled" });
 
     let base = args.base_path.trim_end_matches('/').to_string();
 
@@ -126,7 +154,9 @@ async fn run_server(args: Args) {
 }
 
 /// Serve files from the embedded `WebAssets`.
-async fn embedded_handler(uri: Uri) -> impl IntoResponse {
+/// For `index.html`, injects `window.__APP_NAME` when `--app-name` was given so
+/// JS can brand the login page title, heading, and popup titles without a rebuild.
+async fn embedded_handler(uri: Uri, State(config): State<AppConfig>) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
@@ -135,10 +165,35 @@ async fn embedded_handler(uri: Uri) -> impl IntoResponse {
             let mime = mime_guess::from_path(path)
                 .first_or_octet_stream()
                 .to_string();
+
+            // Config injection: patch index.html with a <script> that sets
+            // feature-flag globals so JS can gate clipboard and branding at
+            // runtime without a rebuild. All other assets are served verbatim.
+            let body = if path == "index.html" {
+                if let Ok(html) = std::str::from_utf8(&content.data) {
+                    let mut vars = format!(
+                        "window.__IB_TEXT_CLIPBOARD={};window.__IB_FILE_CLIPBOARD={};",
+                        config.enable_text_clipboard,
+                        config.enable_file_clipboard,
+                    );
+                    if let Some(name) = &config.app_name {
+                        let safe = name.replace('\\', "\\\\").replace('"', "\\\"");
+                        vars.push_str(&format!(r#"window.__APP_NAME="{safe}";"#));
+                    }
+                    let script = format!("<script>{vars}</script>");
+                    let patched = html.replace("</head>", &format!("{script}</head>"));
+                    Body::from(patched.into_bytes())
+                } else {
+                    Body::from(content.data.to_vec())
+                }
+            } else {
+                Body::from(content.data.to_vec())
+            };
+
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, HeaderValue::from_str(&mime).unwrap())
-                .body(Body::from(content.data.to_vec()))
+                .body(body)
                 .unwrap()
         }
         None => Response::builder()

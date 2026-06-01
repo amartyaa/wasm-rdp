@@ -17,6 +17,6 @@ std = []
 [dependencies]
 bitflags = "2.11"
 tracing = { version = "0.1", features = ["log"] }
-ironrdp-svc = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master", version = "0.6" }
-ironrdp-core = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master", version = "0.1", features = ["alloc"] }
-ironrdp-pdu = { git = "https://github.com/amartyaa/IronRDP.git", branch = "master", version = "0.7", features = ["alloc"] }
+ironrdp-svc = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support", version = "0.6" }
+ironrdp-core = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support", version = "0.1", features = ["alloc"] }
+ironrdp-pdu = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support", version = "0.7", features = ["alloc"] }
