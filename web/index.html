@@ -46,14 +46,46 @@
                         <option value="15">15 FPS</option>
                         <option value="30" selected>30 FPS</option>
                         <option value="60">60 FPS</option>
+                        <option value="120">120 FPS</option>
                     </select>
                 </div>
+                <div class="settings-row">
+                    <label for="audio-toggle">Audio</label>
+                    <input type="checkbox" id="audio-toggle">
+                </div>
+                <p class="settings-note" id="audio-note">Opus codec. Disable for best video performance.</p>
                 <div class="settings-row">
                     <label for="multimon-toggle">Multi-monitor</label>
                     <input type="checkbox" id="multimon-toggle">
                 </div>
                 <p id="multimon-note" class="settings-note">Windows hosts only; requires Chrome/Edge. Opens one window
                     per display.</p>
+                <details class="settings-advanced">
+                    <summary>Advanced</summary>
+                    <div class="settings-row">
+                        <label for="adv-font-smoothing">Enable font smoothing</label>
+                        <input type="checkbox" id="adv-font-smoothing">
+                    </div>
+                    <p class="settings-note">ClearType text. Unchecked = better performance (default).</p>
+                    <div class="settings-row">
+                        <label for="adv-cursor-effects">Disable cursor effects</label>
+                        <input type="checkbox" id="adv-cursor-effects">
+                    </div>
+                    <p class="settings-note">Removes cursor shadow/blink. Minor bandwidth saving.</p>
+                    <div class="settings-row">
+                        <label for="adv-allow-wallpaper">Allow desktop wallpaper</label>
+                        <input type="checkbox" id="adv-allow-wallpaper">
+                    </div>
+                    <div class="settings-row">
+                        <label for="adv-allow-themes">Allow desktop themes</label>
+                        <input type="checkbox" id="adv-allow-themes">
+                    </div>
+                    <div class="settings-row">
+                        <label for="adv-allow-animations">Allow menu animations</label>
+                        <input type="checkbox" id="adv-allow-animations">
+                    </div>
+                    <p class="settings-note">Wallpaper/themes/animations increase bandwidth. Leave unchecked on slow connections.</p>
+                </details>
             </div>
             <form id="login-form" autocomplete="off">
                 <div class="form-group">
@@ -104,8 +136,10 @@
                 <button id="btn-close-hud" class="perf-hud-close">&times;</button>
             </div>
             <div class="perf-hud-grid">
-                <span class="perf-hud-label">Latency</span>
+                <span class="perf-hud-label">Proxy</span>
                 <span id="hud-latency" class="perf-hud-value">-- ms</span>
+                <span class="perf-hud-label">Frame Age</span>
+                <span id="hud-frame-age" class="perf-hud-value">-- ms</span>
                 <span class="perf-hud-label">FPS</span>
                 <span id="hud-fps" class="perf-hud-value">--</span>
                 <span class="perf-hud-label">Download</span>

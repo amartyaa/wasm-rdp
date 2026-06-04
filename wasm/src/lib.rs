@@ -33,11 +33,21 @@ pub async fn connect(
     monitors: Vec<i32>,
     enable_text_clipboard: bool,
     enable_file_clipboard: bool,
+    fps_cap: u32,
+    enable_audio: bool,
+    enable_font_smoothing: bool,
+    disable_cursor_effects: bool,
+    allow_wallpaper: bool,
+    allow_themes: bool,
+    allow_animations: bool,
 ) -> Result<session::Session, JsValue> {
     session::Session::connect(
         ws_url, username, password, domain, width, height, canvas_id,
         enable_opus, enable_aac, monitors,
         enable_text_clipboard, enable_file_clipboard,
+        fps_cap, enable_audio,
+        enable_font_smoothing, disable_cursor_effects,
+        allow_wallpaper, allow_themes, allow_animations,
     )
     .await
     .map_err(|e| JsValue::from_str(&format!("{e:#}")))

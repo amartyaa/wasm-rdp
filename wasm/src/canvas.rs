@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::Context as _;
 use ironrdp::session::image::DecodedImage;
 use wasm_bindgen::prelude::*;
@@ -21,6 +23,9 @@ pub(crate) struct Canvas {
     height: u16,
     /// Persistent scratch buffer for dirty-region extraction, reused across frames.
     rgba_buf: Vec<u8>,
+    /// Cursor shape cache: FNV-1a hash of (pixels, w, h, hotspot) → CSS data-url.
+    /// RDP sessions use ~5–15 distinct cursor shapes; a 32-entry bound is ample.
+    cursor_cache: HashMap<u64, String>,
 }
 
 impl Canvas {
@@ -77,6 +82,7 @@ impl Canvas {
             width,
             height,
             rgba_buf: Vec::new(),
+            cursor_cache: HashMap::new(),
         })
     }
 
@@ -166,23 +172,31 @@ impl Canvas {
         Ok(())
     }
 
-    /// Set the cursor style on the canvas element.
     pub fn set_cursor(&self, style: &str) {
         let element: &web_sys::HtmlElement = self.canvas.unchecked_ref();
         let _ = element.style().set_property("cursor", style);
     }
 
     /// Set a custom cursor from an RGBA bitmap.
-    /// Creates an offscreen canvas, renders the bitmap, converts to data URL,
-    /// and sets it as CSS cursor with the given hotspot.
+    /// The cursor shape is cached by a FNV-1a hash of the pixel data + geometry.
+    /// Repeated pointer events for the same shape skip the offscreen-canvas
+    /// encode and DOM string allocation entirely.
     pub fn set_custom_cursor(
-        &self,
+        &mut self,
         rgba_data: &[u8],
         width: u32,
         height: u32,
         hotspot_x: u32,
         hotspot_y: u32,
     ) {
+        let key = cursor_hash(rgba_data, width, height, hotspot_x, hotspot_y);
+
+        if let Some(cached) = self.cursor_cache.get(&key) {
+            let cursor_css = format!("url({cached}) {hotspot_x} {hotspot_y}, auto");
+            self.set_cursor(&cursor_css);
+            return;
+        }
+
         let window = match web_sys::window() {
             Some(w) => w,
             None => return,
@@ -192,7 +206,6 @@ impl Canvas {
             None => return,
         };
 
-        // Create an offscreen canvas to render the cursor bitmap
         let off_canvas = match document.create_element("canvas") {
             Ok(el) => el,
             Err(_) => return,
@@ -214,19 +227,41 @@ impl Canvas {
             None => return,
         };
 
-        // putImageData expects RGBA — pointer bitmaps from IronRDP are already RGBA
         if let Ok(img_data) = ImageData::new_with_u8_clamped_array_and_sh(
-            Clamped(&rgba_data[..]),
+            Clamped(rgba_data),
             width,
             height,
         ) {
             let _ = off_ctx.put_image_data(&img_data, 0.0, 0.0);
         }
 
-        // Convert to data URL and set as CSS cursor
         if let Ok(data_url) = off_canvas.to_data_url() {
             let cursor_css = format!("url({data_url}) {hotspot_x} {hotspot_y}, auto");
             self.set_cursor(&cursor_css);
+            // Cache, evicting one arbitrary entry when at capacity
+            if self.cursor_cache.len() >= 32 {
+                if let Some(&old_key) = self.cursor_cache.keys().next() {
+                    self.cursor_cache.remove(&old_key);
+                }
+            }
+            self.cursor_cache.insert(key, data_url);
         }
     }
+}
+
+/// FNV-1a 64-bit hash of cursor bitmap + geometry.
+/// Fast single-pass over the pixel data; no external dep needed.
+fn cursor_hash(data: &[u8], width: u32, height: u32, hx: u32, hy: u32) -> u64 {
+    const BASIS: u64 = 14695981039346656037;
+    const PRIME: u64 = 1099511628211;
+    let mut h = BASIS;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    for &b in &width.to_le_bytes()  { h ^= b as u64; h = h.wrapping_mul(PRIME); }
+    for &b in &height.to_le_bytes() { h ^= b as u64; h = h.wrapping_mul(PRIME); }
+    for &b in &hx.to_le_bytes()     { h ^= b as u64; h = h.wrapping_mul(PRIME); }
+    for &b in &hy.to_le_bytes()     { h ^= b as u64; h = h.wrapping_mul(PRIME); }
+    h
 }

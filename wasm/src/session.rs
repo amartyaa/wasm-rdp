@@ -72,6 +72,13 @@ impl Session {
         monitors: Vec<i32>,
         enable_text_clipboard: bool,
         enable_file_clipboard: bool,
+        fps_cap: u32,
+        enable_audio: bool,
+        enable_font_smoothing: bool,
+        disable_cursor_effects: bool,
+        allow_wallpaper: bool,
+        allow_themes: bool,
+        allow_animations: bool,
     ) -> anyhow::Result<Session> {
         log(&format!("Connecting to proxy: {ws_url}"));
 
@@ -105,7 +112,7 @@ impl Session {
                     anyhow::bail!("WebSocket connection failed");
                 }
                 websocket::State::Connecting => {
-                    gloo_timers::future::sleep(std::time::Duration::from_millis(50)).await;
+                    gloo_timers::future::sleep(std::time::Duration::from_millis(5)).await;
                 }
                 websocket::State::Open => break,
             }
@@ -115,7 +122,8 @@ impl Session {
         // Build IronRDP connector config
         let config = build_connector_config(
             username.clone(), password.clone(), domain.clone(), width, height,
-            monitor_layout,
+            monitor_layout, enable_audio, enable_font_smoothing, disable_cursor_effects,
+            allow_wallpaper, allow_themes, allow_animations,
         );
 
         // Split WebSocket for bidirectional I/O
@@ -137,13 +145,19 @@ impl Session {
             crate::clipboard::WasmCliprdrBackend::new(input_tx.clone(), enable_text_clipboard, enable_file_clipboard)
         ));
 
-        let rdpsnd = ironrdp::rdpsnd::client::Rdpsnd::new(
-            Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac))
-        );
-
+        // Only wire the RDPSND channel when the user enabled audio. With it
+        // absent, the server sends no audio PDUs and the main loop is free from
+        // audio-processing overhead — critical for smooth video playback.
         let connector = ClientConnector::new(config, socket_addr)
-            .with_static_channel(cliprdr)
-            .with_static_channel(rdpsnd);
+            .with_static_channel(cliprdr);
+        let connector = if enable_audio {
+            let rdpsnd = ironrdp::rdpsnd::client::Rdpsnd::new(
+                Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac))
+            );
+            connector.with_static_channel(rdpsnd)
+        } else {
+            connector
+        };
 
         log("Starting RDP connection sequence...");
 
@@ -197,6 +211,7 @@ impl Session {
                     surfaces,
                     desktop_width,
                     desktop_height,
+                    fps_cap,
                 ).await {
                     Ok(()) => {
                         log("RDP session ended");
@@ -682,6 +697,13 @@ fn union_rect(
     }
 }
 
+thread_local! {
+    // Monotonic paint timestamp (rAF DOMHighResTimeStamp) used for fps cap.
+    // Thread-local avoids capturing an Rc into the rAF closure and the Rc
+    // cycle that would prevent the framebuffer from being freed on session end.
+    static LAST_PAINT_MS: RefCell<f64> = RefCell::new(0.0);
+}
+
 async fn run_session(
     connection_result: ConnectionResult,
     mut framed: WasmFramed,
@@ -690,7 +712,17 @@ async fn run_session(
     surfaces: Rc<RefCell<Vec<Canvas>>>,
     width: u16,
     height: u16,
+    fps_cap: u32,
 ) -> anyhow::Result<()> {
+    // Minimum ms between canvas paints (0 = uncapped / display-rate).
+    // Reset the timer so a fresh session never incorrectly skips the first frame.
+    let frame_min_ms: f64 = if fps_cap > 0 && fps_cap < 300 {
+        1000.0 / fps_cap as f64
+    } else {
+        0.0
+    };
+    LAST_PAINT_MS.with(|t| *t.borrow_mut() = 0.0);
+
     let image = Rc::new(RefCell::new(DecodedImage::new(PixelFormat::RgbA32, width, height)));
     let mut active_stage = ActiveStage::new(connection_result);
 
@@ -701,7 +733,7 @@ async fn run_session(
     let pending: Rc<RefCell<Option<ironrdp::pdu::geometry::InclusiveRectangle>>> =
         Rc::new(RefCell::new(None));
     let raf_scheduled = Rc::new(RefCell::new(false));
-    let raf_closure: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+    let raf_closure: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
 
     let schedule_repaint = {
         let pending = pending.clone();
@@ -709,6 +741,7 @@ async fn run_session(
         let raf_closure = raf_closure.clone();
         let image = image.clone();
         let surfaces = surfaces.clone();
+        // frame_min_ms is f64 (Copy) — captured by value, no Rc needed.
         move || {
             if *raf_scheduled.borrow() {
                 return;
@@ -724,13 +757,25 @@ async fn run_session(
             let image_cb = image.clone();
             let surfaces_cb = surfaces.clone();
 
-            let cb = Closure::wrap(Box::new(move || {
+            // rAF passes a DOMHighResTimeStamp (f64 ms). Using it directly
+            // avoids an extra web_sys::Performance::now() call per frame.
+            let cb = Closure::wrap(Box::new(move |now: f64| {
                 *scheduled_cb.borrow_mut() = false;
+
+                // FPS cap: if the last paint was too recent, leave the dirty
+                // region pending. The next GraphicsUpdate will re-schedule.
+                // Using LAST_PAINT_MS (thread_local) avoids capturing raf_closure
+                // here, which would create an Rc cycle preventing cleanup.
+                if frame_min_ms > 0.0 {
+                    let elapsed = LAST_PAINT_MS.with(|t| now - *t.borrow());
+                    if elapsed < frame_min_ms {
+                        return;
+                    }
+                }
+
                 if let Some(region) = pending_cb.borrow_mut().take() {
+                    LAST_PAINT_MS.with(|t| *t.borrow_mut() = now);
                     let img = image_cb.borrow();
-                    // Paint the dirty region onto every monitor surface it
-                    // overlaps. Each surface clips to its own rect, so this is
-                    // one putImageData per affected monitor.
                     let mut painted = false;
                     for surface in surfaces_cb.borrow_mut().iter_mut() {
                         if surface.draw(&img, region.clone()).is_ok() {
@@ -741,11 +786,9 @@ async fn run_session(
                         crate::notify_frame();
                     }
                 }
-            }) as Box<dyn FnMut()>);
+            }) as Box<dyn FnMut(f64)>);
 
             let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
-            // Keep the closure alive until it fires. The previously stored
-            // closure has already executed by the time we schedule again.
             *raf_closure.borrow_mut() = Some(cb);
         }
     };
@@ -912,7 +955,7 @@ async fn run_session(
                     }
                 }
                 ActiveStageOutput::PointerBitmap(pointer) => {
-                    for surface in surfaces.borrow().iter() {
+                    for surface in surfaces.borrow_mut().iter_mut() {
                         surface.set_custom_cursor(
                             &pointer.bitmap_data,
                             pointer.width as u32,
@@ -1015,8 +1058,26 @@ fn build_connector_config(
     width: u16,
     height: u16,
     monitors: Vec<gcc::Monitor>,
+    enable_audio: bool,
+    enable_font_smoothing: bool,
+    disable_cursor_effects: bool,
+    allow_wallpaper: bool,
+    allow_themes: bool,
+    allow_animations: bool,
 ) -> connector::Config {
     let domain = if domain.is_empty() { None } else { Some(domain) };
+
+    // Full-window-drag always off (minor bandwidth, no UX value in a web client).
+    // Wallpaper/themes/animations are user-controlled; each adds significant bandwidth.
+    // ENABLE_FONT_SMOOTHING: opt-in ClearType.
+    // DISABLE_CURSORSETTINGS: removes cursor shadow/blink, minor bandwidth win.
+    let mut perf = PerformanceFlags::default()
+        | PerformanceFlags::DISABLE_FULLWINDOWDRAG;
+    if !allow_wallpaper  { perf |= PerformanceFlags::DISABLE_WALLPAPER; }
+    if !allow_themes     { perf |= PerformanceFlags::DISABLE_THEMING; }
+    if !allow_animations { perf |= PerformanceFlags::DISABLE_MENUANIMATIONS; }
+    if enable_font_smoothing  { perf |= PerformanceFlags::ENABLE_FONT_SMOOTHING; }
+    if disable_cursor_effects { perf |= PerformanceFlags::DISABLE_CURSORSETTINGS; }
 
     connector::Config {
         credentials: Credentials::UsernamePassword { username, password },
@@ -1038,13 +1099,9 @@ fn build_connector_config(
         enable_server_pointer: true,
         request_data: None,
         autologon: true,
-        enable_audio_playback: true,
+        enable_audio_playback: enable_audio,
         pointer_software_rendering: true,
-        performance_flags: PerformanceFlags::default()
-            | PerformanceFlags::DISABLE_WALLPAPER
-            | PerformanceFlags::DISABLE_FULLWINDOWDRAG
-            | PerformanceFlags::DISABLE_MENUANIMATIONS
-            | PerformanceFlags::DISABLE_THEMING,
+        performance_flags: perf,
         desktop_scale_factor: 0,
         hardware_id: None,
         license_cache: None,

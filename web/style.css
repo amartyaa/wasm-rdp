@@ -200,6 +200,24 @@ html, body {
     opacity: 0.4;
     cursor: not-allowed;
 }
+.settings-advanced {
+    margin-top: 12px;
+    border-top: 1px solid var(--glass-border);
+    padding-top: 10px;
+}
+.settings-advanced summary {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.settings-advanced summary:hover { color: var(--text-primary); }
+.settings-advanced .settings-row { margin-top: 10px; }
+select option:disabled {
+    color: rgba(255,255,255,0.25);
+}
 
 .form-group {
     margin-bottom: 16px;

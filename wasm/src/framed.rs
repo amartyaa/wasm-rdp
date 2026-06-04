@@ -27,7 +27,7 @@ impl WasmFramed {
     pub fn new(ws_read: SplitStream<WebSocket>, stats: Rc<RefCell<SessionStats>>) -> Self {
         Self {
             ws_read,
-            buf: BytesMut::with_capacity(16384),
+            buf: BytesMut::with_capacity(65536),
             stats,
         }
     }

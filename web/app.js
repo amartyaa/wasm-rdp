@@ -59,10 +59,67 @@ async function loadWasm() {
 
     // Restore FPS cap setting
     const fpsSelect = document.getElementById('fps-cap');
+
+    // Gate 60/120fps options: unavailable when audio is on (audio processing
+    // consumes too much of the 8-16ms frame budget at those rates).
+    function updateFpsOptions() {
+        const opt60  = fpsSelect.querySelector('option[value="60"]');
+        const opt120 = fpsSelect.querySelector('option[value="120"]');
+        if (opt60)  opt60.disabled  = audioEnabled;
+        if (opt120) opt120.disabled = audioEnabled;
+        if (audioEnabled && fpsCap > 30) {
+            fpsCap = 30;
+            fpsSelect.value = '30';
+            localStorage.setItem('rdp_fps_cap', '30');
+        }
+    }
+
     fpsSelect.value = String(fpsCap);
     fpsSelect.addEventListener('change', () => {
         fpsCap = parseInt(fpsSelect.value, 10);
         localStorage.setItem('rdp_fps_cap', String(fpsCap));
+    });
+
+    // Audio toggle
+    const audioToggle = document.getElementById('audio-toggle');
+    audioToggle.checked = audioEnabled;
+    audioToggle.addEventListener('change', () => {
+        audioEnabled = audioToggle.checked;
+        localStorage.setItem('rdp_audio', audioEnabled ? '1' : '0');
+        updateFpsOptions();
+    });
+    updateFpsOptions(); // apply gate on load
+
+    // Advanced settings
+    const advFontSmooth  = document.getElementById('adv-font-smoothing');
+    const advCursorFx    = document.getElementById('adv-cursor-effects');
+    advFontSmooth.checked = advEnableFontSmoothing;
+    advCursorFx.checked   = advDisableCursorEffects;
+    advFontSmooth.addEventListener('change', () => {
+        advEnableFontSmoothing = advFontSmooth.checked;
+        localStorage.setItem('rdp_adv_font_smooth', advEnableFontSmoothing ? '1' : '0');
+    });
+    advCursorFx.addEventListener('change', () => {
+        advDisableCursorEffects = advCursorFx.checked;
+        localStorage.setItem('rdp_adv_cursor_fx', advDisableCursorEffects ? '1' : '0');
+    });
+    const advWallpaper   = document.getElementById('adv-allow-wallpaper');
+    const advThemes      = document.getElementById('adv-allow-themes');
+    const advAnimations  = document.getElementById('adv-allow-animations');
+    advWallpaper.checked   = advAllowWallpaper;
+    advThemes.checked      = advAllowThemes;
+    advAnimations.checked  = advAllowAnimations;
+    advWallpaper.addEventListener('change', () => {
+        advAllowWallpaper = advWallpaper.checked;
+        localStorage.setItem('rdp_adv_wallpaper', advAllowWallpaper ? '1' : '0');
+    });
+    advThemes.addEventListener('change', () => {
+        advAllowThemes = advThemes.checked;
+        localStorage.setItem('rdp_adv_themes', advAllowThemes ? '1' : '0');
+    });
+    advAnimations.addEventListener('change', () => {
+        advAllowAnimations = advAnimations.checked;
+        localStorage.setItem('rdp_adv_animations', advAllowAnimations ? '1' : '0');
     });
 
     // Settings gear toggle
@@ -118,6 +175,7 @@ const btnCancelReconnect = document.getElementById('btn-cancel-reconnect');
 const perfHud = document.getElementById('perf-hud');
 const btnCloseHud = document.getElementById('btn-close-hud');
 const hudLatency = document.getElementById('hud-latency');
+const hudFrameAge = document.getElementById('hud-frame-age');
 const hudFps = document.getElementById('hud-fps');
 const hudDlSpeed = document.getElementById('hud-dl-speed');
 const hudUlSpeed = document.getElementById('hud-ul-speed');
@@ -137,10 +195,18 @@ if (hudVersion && _appVersion) hudVersion.textContent = _appVersion;
 // ── State ────────────────────────────────────────────────
 let frameCount = 0;
 let lastFpsUpdate = performance.now();
+let lastFrameTimestamp = 0;
 let toolbarTimeout = null;
 let lastMouseTime = 0;
 let resizeTimeout = null;
 let fpsCap = parseInt(localStorage.getItem('rdp_fps_cap') || '30', 10);
+let audioEnabled = localStorage.getItem('rdp_audio') === '1';
+// Advanced perf flags (applied at connect time)
+let advEnableFontSmoothing = localStorage.getItem('rdp_adv_font_smooth') === '1';
+let advDisableCursorEffects = localStorage.getItem('rdp_adv_cursor_fx') === '1';
+let advAllowWallpaper  = localStorage.getItem('rdp_adv_wallpaper') === '1';
+let advAllowThemes     = localStorage.getItem('rdp_adv_themes') === '1';
+let advAllowAnimations = localStorage.getItem('rdp_adv_animations') === '1';
 const MOUSE_THROTTLE_MS = 16; // ~60fps cap on mouse events
 const RESIZE_DEBOUNCE_MS = 250;
 // Local→remote paste: delay before replaying the Ctrl+V keystroke so the remote
@@ -150,6 +216,10 @@ const PASTE_KEYSTROKE_DELAY_MS = 100;
 let suppressVUp = false;       // swallow the keyup of a deferred paste
 let pasteReplayTimer = null;
 let lastSyncedClipboardText = '';
+// Wheel scroll state: accumulate delta between throttle ticks
+let lastWheelTime = 0;
+let accWheelDeltaY = 0;
+let accWheelDeltaX = 0;
 let statsInterval = null;
 let prevRxBytes = 0;
 let prevTxBytes = 0;
@@ -284,14 +354,12 @@ async function doConnect(username, password, domain) {
     const basePath = location.pathname.replace(/\/[^/]*$/, '');
     const wsUrl = `${proto}://${location.host}${basePath}/ws`;
 
-    // Expose FPS cap for WASM to read
-    window.__rdp_fps_cap = fpsCap;
-
-    // Detect which compressed audio codecs the browser can decode. We only
-    // advertise these to the RDP server if WebCodecs can actually handle them;
-    // otherwise negotiation stays on PCM.
-    const codecs = await detectAudioCodecs();
-    console.log('[RDPSND] WebCodecs support — opus:', codecs.opus, 'aac:', codecs.aac);
+    // Detect compressed audio codec support. Only probe when audio is enabled;
+    // if disabled, pass both as false so WASM skips the RDPSND channel entirely.
+    const codecs = audioEnabled ? await detectAudioCodecs() : { opus: false, aac: false };
+    if (audioEnabled) {
+        console.log('[RDPSND] WebCodecs support — opus:', codecs.opus, 'aac:', codecs.aac);
+    }
 
     // Multi-monitor: build the physical-screen layout when enabled & supported,
     // and open the secondary-display popups now (close to the connect gesture, to
@@ -323,6 +391,9 @@ async function doConnect(username, password, domain) {
         wsUrl, username, password, domain, width, height, 'rdp-canvas',
         codecs.opus, codecs.aac, monitors,
         textClipboardEnabled, fileClipboardEnabled,
+        fpsCap, audioEnabled,
+        advEnableFontSmoothing, advDisableCursorEffects,
+        advAllowWallpaper, advAllowThemes, advAllowAnimations,
     );
     multimonInUse = !!monitorBuild;
 
@@ -348,7 +419,8 @@ async function doConnect(username, password, domain) {
     }
     setupResizeHandler();
     startStatsInterval();
-    initAudioContext();
+    if (audioEnabled) initAudioContext();
+    if (hudAudioCodec) hudAudioCodec.textContent = audioEnabled ? '--' : 'Off';
     showToolbar();
 }
 
@@ -550,8 +622,22 @@ function onMouseUp(e) {
 function onWheel(e) {
     if (!session) return;
     e.preventDefault();
-    const delta = Math.sign(e.deltaY) * -120; // Standard wheel delta
-    session.send_mouse_wheel(false, delta);
+    // Normalize deltaY/deltaX to RDP rotation units (120 = 1 detent).
+    // deltaMode: 0=pixels, 1=lines, 2=pages. Accumulate between throttle ticks
+    // so rapid trackpad events don't flood the remote with individual PDUs.
+    const scale = e.deltaMode === 0 ? 1.2 : e.deltaMode === 1 ? 120 : 480;
+    accWheelDeltaY -= e.deltaY * scale;
+    accWheelDeltaX -= e.deltaX * scale;
+    const now = performance.now();
+    if (now - lastWheelTime < MOUSE_THROTTLE_MS) return;
+    lastWheelTime = now;
+    // Clamp to ±720 (6 detents) per throttle window to prevent scroll overshooting
+    const dy = Math.round(Math.max(-720, Math.min(720, accWheelDeltaY)));
+    const dx = Math.round(Math.max(-720, Math.min(720, accWheelDeltaX)));
+    accWheelDeltaY = 0;
+    accWheelDeltaX = 0;
+    if (dy !== 0) session.send_mouse_wheel(false, dy);
+    if (dx !== 0) session.send_mouse_wheel(true, dx);
 }
 
 async function onWindowFocus() {
@@ -885,6 +971,8 @@ function cleanupSession() {
     document.removeEventListener('paste', onPaste);
     document.removeEventListener('copy', onCopy);
     lastSyncedClipboardText = '';
+    lastWheelTime = 0; accWheelDeltaY = 0; accWheelDeltaX = 0;
+    lastFrameTimestamp = 0;
     // Stop stats interval
     if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
     prevRxBytes = 0;
@@ -908,7 +996,7 @@ function cleanupSession() {
         audioWorkletNode = null;
     }
     currentAudioCodec = '--';
-    if (hudAudioCodec) hudAudioCodec.textContent = '--';
+    if (hudAudioCodec) hudAudioCodec.textContent = audioEnabled ? '--' : 'Off';
     if (audioContext) {
         audioContext.close().catch(() => {});
         audioContext = null;
@@ -959,6 +1047,8 @@ async function attemptReconnect() {
             document.removeEventListener('paste', onPaste);
             document.removeEventListener('copy', onCopy);
             lastSyncedClipboardText = '';
+            lastWheelTime = 0; accWheelDeltaY = 0; accWheelDeltaX = 0;
+            lastFrameTimestamp = 0;
 
             const { username, password, domain } = savedCredentials;
             await doConnect(username, password, domain);
@@ -1027,13 +1117,19 @@ function startStatsInterval() {
             : `${session.width}×${session.height}`;
         hudCodec.textContent = 'RFX';
 
-        // Latency ping
+        // Proxy latency (browser ↔ Rust server HTTP)
         const pingStart = performance.now();
         fetch('/ping').then(() => {
             hudLatency.textContent = `${Math.round(performance.now() - pingStart)} ms`;
         }).catch(() => {
             hudLatency.textContent = '-- ms';
         });
+
+        // Frame age: how stale the current display is. Near 1000/fpsCap ms during
+        // active rendering; grows when screen is idle or WASM is backlogged.
+        if (lastFrameTimestamp > 0) {
+            hudFrameAge.textContent = `${Math.round(performance.now() - lastFrameTimestamp)} ms`;
+        }
     }, 1000);
 }
 
@@ -1053,6 +1149,7 @@ function formatSize(bytes) {
 // Called from WASM on each graphics update
 window.__rdp_frame = function() {
     frameCount++;
+    lastFrameTimestamp = performance.now();
 };
 
 // ── Performance HUD Toggle ───────────────────────────────
