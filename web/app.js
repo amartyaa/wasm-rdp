@@ -363,8 +363,9 @@ function hideError() {
 function setupInputHandlers() {
     // Keyboard + clipboard on the main document.
     setupDocInput(document, window);
-    // Mouse on the main canvas. Single-monitor and the multi-monitor primary
-    // both map at offset (0,0); secondary popups get their own offsets.
+    // Mouse on the main canvas. Single-monitor: offset (0,0). Multi-monitor:
+    // setupMonitorSurfaces overwrites __rdpOffset with the primary's actual
+    // position in the combined desktop (may be non-zero after normalization).
     attachCanvasMouse(canvas, 0, 0);
 }
 
@@ -652,34 +653,41 @@ async function ensureScreenDetails() {
     screenDetailsObj.addEventListener('screenschange', onScreensChange);
 }
 
-// Enumerate physical screens and build a normalized layout. Primary is placed at
-// (0,0) and the others translated relative to it. v1 supports only non-negative
-// arrangements (secondaries to the right/below); negative offsets (a screen left
-// of / above the primary) fall back to single-monitor — RDP needs the primary at
-// the origin and our framebuffer is 0-based. Uses CSS pixels (scale factor 100).
+// Enumerate physical screens and build a normalized layout.
+// The screen the browser is currently on is designated the RDP primary — this
+// prevents any secondary popup from opening on top of the main browser window.
+// Coordinates are normalized so min(left,top) = 0, which supports monitors in
+// any direction relative to the browser's screen (left, right, above, below).
 async function buildMonitorLayout() {
     await ensureScreenDetails();
     const screens = screenDetailsObj.screens;
-    const primary = screens.find((s) => s.isPrimary) || screenDetailsObj.currentScreen || screens[0];
+    // Prefer currentScreen (where the browser lives) as the RDP primary so that
+    // no popup ever collides with the main browser window.
+    const primary = screenDetailsObj.currentScreen || screens.find((s) => s.isPrimary) || screens[0];
 
-    const layout = screens.map((s) => ({
+    let layout = screens.map((s) => ({
         screen: s,
         left: s.left - primary.left,
-        top: s.top - primary.top,
+        top:  s.top  - primary.top,
         width: s.width,
         height: s.height,
         primary: s === primary,
     }));
 
-    if (layout.some((m) => m.left < 0 || m.top < 0)) {
-        console.warn('[multimon] arrangement has a screen left of / above the primary; ' +
-            'this v1 supports right/below only — falling back to single monitor.');
-        return null;
+    // Shift the entire layout so the top-left corner of the bounding box is at
+    // (0,0). This turns any negative offsets (monitors to the left or above the
+    // browser's screen) into valid non-negative RDP coordinates.
+    const minLeft = Math.min(...layout.map((m) => m.left));
+    const minTop  = Math.min(...layout.map((m) => m.top));
+    if (minLeft < 0 || minTop < 0) {
+        layout = layout.map((m) => ({ ...m, left: m.left - minLeft, top: m.top - minTop }));
     }
 
     const flat = [];
     for (const m of layout) flat.push(m.left, m.top, m.width, m.height, m.primary ? 1 : 0);
-    console.log('[multimon] layout', layout.map((m) => `${m.width}x${m.height}@(${m.left},${m.top})${m.primary ? '*' : ''}`).join('  '));
+    console.log('[multimon] layout', layout.map((m) =>
+        `${m.width}x${m.height}@(${m.left},${m.top})${m.primary ? '*' : ''}`
+    ).join('  '));
     return { flat: Int32Array.from(flat), layout };
 }
 
@@ -712,9 +720,10 @@ function setupMonitorSurfaces(layout) {
     const primary = layout.find((m) => m.primary) || layout[0];
 
     session.clear_surfaces();
-    // Primary → main page canvas. Mouse already attached by setupInputHandlers.
-    canvas.__rdpOffset = { x: 0, y: 0 };
-    session.add_surface(canvas, 0, 0, primary.width, primary.height);
+    // Primary surface at its actual position in the normalized combined desktop.
+    // After normalization this may be non-zero when monitors exist to its left/above.
+    canvas.__rdpOffset = { x: primary.left, y: primary.top };
+    session.add_surface(canvas, primary.left, primary.top, primary.width, primary.height);
 
     for (const p of monitorPopups) {
         const m = p.monitor;

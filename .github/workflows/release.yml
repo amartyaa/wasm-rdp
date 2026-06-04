@@ -59,6 +59,8 @@ jobs:
           path: web/pkg/
 
       - name: Build Server
+        env:
+          RELEASE_VERSION: ${{ inputs.tag_name || github.ref_name }}
         run: cargo build --release -p server
 
       - name: Prepare Release
@@ -98,6 +100,8 @@ jobs:
           path: web/pkg/
 
       - name: Build Server
+        env:
+          RELEASE_VERSION: ${{ inputs.tag_name || github.ref_name }}
         run: cargo build --release -p server
 
       - name: Prepare Release
