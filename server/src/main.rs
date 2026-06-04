@@ -171,8 +171,9 @@ async fn embedded_handler(uri: Uri, State(config): State<AppConfig>) -> impl Int
             // runtime without a rebuild. All other assets are served verbatim.
             let body = if path == "index.html" {
                 if let Ok(html) = std::str::from_utf8(&content.data) {
+                    let ver = env!("APP_VERSION").replace('\\', "\\\\").replace('"', "\\\"");
                     let mut vars = format!(
-                        "window.__IB_TEXT_CLIPBOARD={};window.__IB_FILE_CLIPBOARD={};",
+                        r#"window.__IB_VERSION="{ver}";window.__IB_TEXT_CLIPBOARD={};window.__IB_FILE_CLIPBOARD={};"#,
                         config.enable_text_clipboard,
                         config.enable_file_clipboard,
                     );

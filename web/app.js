@@ -126,6 +126,13 @@ const hudTotalTx = document.getElementById('hud-total-tx');
 const hudResolution = document.getElementById('hud-resolution');
 const hudCodec = document.getElementById('hud-codec');
 const hudAudioCodec = document.getElementById('hud-audio-codec');
+const hudVersion = document.getElementById('hud-version');
+const appVersionEl = document.getElementById('app-version');
+
+// Populate version label from server-injected global (set in <head> by server).
+const _appVersion = window.__IB_VERSION || '';
+if (appVersionEl && _appVersion) appVersionEl.textContent = `v${_appVersion}`;
+if (hudVersion && _appVersion) hudVersion.textContent = _appVersion;
 
 // ── State ────────────────────────────────────────────────
 let frameCount = 0;
@@ -142,6 +149,7 @@ const RESIZE_DEBOUNCE_MS = 250;
 const PASTE_KEYSTROKE_DELAY_MS = 100;
 let suppressVUp = false;       // swallow the keyup of a deferred paste
 let pasteReplayTimer = null;
+let lastSyncedClipboardText = '';
 let statsInterval = null;
 let prevRxBytes = 0;
 let prevTxBytes = 0;
@@ -374,6 +382,7 @@ function setupDocInput(doc, win) {
     doc.addEventListener('keydown', onKeyDown, true);
     doc.addEventListener('keyup', onKeyUp, true);
     win.addEventListener('blur', releaseAllModifiers);
+    win.addEventListener('focus', onWindowFocus);
     doc.addEventListener('paste', onPaste);
     doc.addEventListener('copy', onCopy);
 }
@@ -543,6 +552,17 @@ function onWheel(e) {
     e.preventDefault();
     const delta = Math.sign(e.deltaY) * -120; // Standard wheel delta
     session.send_mouse_wheel(false, delta);
+}
+
+async function onWindowFocus() {
+    if (!session || !textClipboardEnabled) return;
+    try {
+        const text = await navigator.clipboard.readText();
+        if (text && text !== lastSyncedClipboardText) {
+            lastSyncedClipboardText = text;
+            wasm.set_pending_clipboard(text, session);
+        }
+    } catch (_) {}
 }
 
 function onPaste(e) {
@@ -861,8 +881,10 @@ function cleanupSession() {
     document.removeEventListener('keydown', onKeyDown, true);
     document.removeEventListener('keyup', onKeyUp, true);
     window.removeEventListener('blur', releaseAllModifiers);
+    window.removeEventListener('focus', onWindowFocus);
     document.removeEventListener('paste', onPaste);
     document.removeEventListener('copy', onCopy);
+    lastSyncedClipboardText = '';
     // Stop stats interval
     if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
     prevRxBytes = 0;
@@ -933,8 +955,10 @@ async function attemptReconnect() {
             document.removeEventListener('keydown', onKeyDown, true);
             document.removeEventListener('keyup', onKeyUp, true);
             window.removeEventListener('blur', releaseAllModifiers);
+            window.removeEventListener('focus', onWindowFocus);
             document.removeEventListener('paste', onPaste);
             document.removeEventListener('copy', onCopy);
+            lastSyncedClipboardText = '';
 
             const { username, password, domain } = savedCredentials;
             await doConnect(username, password, domain);

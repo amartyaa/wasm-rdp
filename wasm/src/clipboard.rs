@@ -1,6 +1,7 @@
 use ironrdp::cliprdr::backend::{ClipboardMessage, CliprdrBackend};
 use ironrdp::cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsFlags,
+    ClipboardFileAttributes, ClipboardFormat, ClipboardFormatId,
+    ClipboardGeneralCapabilityFlags, FileContentsFlags,
     FileContentsRequest, FileContentsResponse, FileDescriptor, FormatDataRequest,
     FormatDataResponse, LockDataId, FORMAT_NAME_FILE_LIST,
 };
@@ -250,7 +251,9 @@ pub fn set_pending_clipboard_file(name: String, bytes: &[u8], session: &crate::s
     PENDING_CLIPBOARD_TEXT.with(|cell| *cell.borrow_mut() = None);
     PENDING_CLIPBOARD_IMAGE.with(|cell| *cell.borrow_mut() = None);
 
-    let descriptor = FileDescriptor::new(name).with_file_size(size);
+    let descriptor = FileDescriptor::new(name)
+        .with_file_size(size)
+        .with_attributes(ClipboardFileAttributes::NORMAL);
     session.send_file_copy(vec![descriptor]);
 }
 

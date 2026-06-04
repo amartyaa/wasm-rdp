@@ -639,3 +639,15 @@ html, body {
 }
 
 .rdp-file-toast-dismiss:hover { color: var(--text-primary); }
+
+/* ── App version watermark (login page, bottom-right) ───── */
+.app-version {
+    position: fixed;
+    bottom: 12px;
+    right: 16px;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.22);
+    pointer-events: none;
+    user-select: none;
+    letter-spacing: 0.03em;
+}
