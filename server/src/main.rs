@@ -82,10 +82,13 @@ async fn main() {
         return;
     }
 
-    run_server(args).await;
+    if let Err(e) = run_server(args).await {
+        eprintln!("Server error: {e}");
+        std::process::exit(1);
+    }
 }
 
-async fn run_server(args: Args) {
+async fn run_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -149,8 +152,9 @@ async fn run_server(args: Args) {
     info!("IronBridge listening on http://{addr}{}/", if base.is_empty() { "" } else { &base });
     info!("RDP target: {}", args.rdp_target);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 /// Serve files from the embedded `WebAssets`.
@@ -444,41 +448,64 @@ fn run_as_windows_service() {
             },
         )?;
 
+        // Signal START_PENDING so the SCM knows we're initializing and won't
+        // timeout while the tokio runtime and TCP listener are being set up.
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
-            current_state: ServiceState::Running,
-            controls_accepted: ServiceControlAccept::STOP,
+            current_state: ServiceState::StartPending,
+            controls_accepted: ServiceControlAccept::empty(),
             exit_code: ServiceExitCode::Win32(0),
             checkpoint: 0,
-            wait_hint: std::time::Duration::default(),
+            wait_hint: std::time::Duration::from_secs(30),
             process_id: None,
         })?;
 
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async {
+        let server_result: Result<(), Box<dyn std::error::Error>> = rt.block_on(async {
             let args = Args::parse();
-            let server_future = run_server(args);
+
+            status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Running,
+                controls_accepted: ServiceControlAccept::STOP,
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 0,
+                wait_hint: std::time::Duration::default(),
+                process_id: None,
+            })?;
+
             tokio::select! {
-                _ = server_future => {},
+                result = run_server(args) => result,
                 _ = shutdown_rx => {
                     tracing::info!("Service stop requested");
+                    Ok(())
                 },
             }
         });
+
+        let exit_code = if server_result.is_err() {
+            ServiceExitCode::ServiceSpecific(1)
+        } else {
+            ServiceExitCode::Win32(0)
+        };
 
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: ServiceState::Stopped,
             controls_accepted: ServiceControlAccept::empty(),
-            exit_code: ServiceExitCode::Win32(0),
+            exit_code,
             checkpoint: 0,
             wait_hint: std::time::Duration::default(),
             process_id: None,
         })?;
 
-        Ok(())
+        server_result
     }
 
-    service_dispatcher::start(SERVICE_NAME, ffi_service_main)
-        .expect("Failed to start service dispatcher");
+    if let Err(e) = service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
+        eprintln!("error: failed to start service dispatcher: {e}");
+        eprintln!("note: this binary must be started by the Windows Service Control Manager.");
+        eprintln!("hint: run install-service-windows.ps1 to register and start the service.");
+        std::process::exit(1);
+    }
 }
