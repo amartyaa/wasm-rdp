@@ -334,7 +334,8 @@ loginForm.addEventListener('submit', async (e) => {
         await doConnect(username, password, domain);
 
     } catch (err) {
-        showError(String(err));
+        console.error('[connect] error:', err);
+        showError(friendlyError(err));
         setConnecting(false);
         // Close any secondary windows opened before the connect failed.
         teardownMonitorWindows();
@@ -433,6 +434,30 @@ function setConnecting(loading) {
 function showError(msg) {
     loginError.textContent = msg;
     loginError.hidden = false;
+}
+
+// Map a raw WASM/connection error into a friendly, actionable message.
+// The raw error is still logged to the console for debugging.
+function friendlyError(err) {
+    const raw = String(err && err.message ? err.message : err);
+    const s = raw.toLowerCase();
+    // Authentication / NLA (CredSSP) failure — almost always wrong credentials.
+    if (s.includes('credssp') || s.includes('earlyuserauth') ||
+        s.includes('logon') || s.includes('0xc000006d') ||
+        s.includes('access denied') || s.includes('access is denied') ||
+        s.includes('authentication')) {
+        return 'Sign-in failed — are you sure the username and password are correct?';
+    }
+    // Couldn't reach the proxy / host.
+    if (s.includes('websocket') || s.includes('connection failed') ||
+        s.includes('failed to open')) {
+        return "Couldn't reach the server. Check your network and that the host is online.";
+    }
+    // TLS / certificate problems during the secure upgrade.
+    if (s.includes('certificate') || s.includes('x.509') || s.includes('handshake')) {
+        return 'Secure connection failed — there was a problem with the server certificate.';
+    }
+    return raw;
 }
 
 function hideError() {

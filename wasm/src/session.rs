@@ -697,11 +697,25 @@ fn union_rect(
     }
 }
 
+/// Worst-case time (ms) we hold an incomplete server frame before flushing a
+/// partial paint. Bounds time-to-first-pixel at any resolution: small/medium UI
+/// frames complete (FrameEnd) well under this and present atomically; only a rare
+/// oversized high-res/multi-monitor frame hits the bound and degrades to
+/// progressive paint instead of freezing. Must be ≥ the largest FPS-cap interval
+/// (66.7ms at 15 FPS), so 100ms always satisfies it. See the rendering plan.
+const MAX_GATE_MS: f64 = 100.0;
+
 thread_local! {
     // Monotonic paint timestamp (rAF DOMHighResTimeStamp) used for fps cap.
     // Thread-local avoids capturing an Rc into the rAF closure and the Rc
     // cycle that would prevent the framebuffer from being freed on session end.
     static LAST_PAINT_MS: RefCell<f64> = RefCell::new(0.0);
+    // True while between a server frame's BEGIN and END markers. Presentation is
+    // gated (accumulate, don't paint) while true — see the rAF closure below.
+    static IN_FRAME: RefCell<bool> = RefCell::new(false);
+    // rAF timestamp when the current pending batch began accumulating; 0 = none.
+    // Used to enforce MAX_GATE_MS. Thread-local for the same anti-cycle reason.
+    static PENDING_SINCE_MS: RefCell<f64> = RefCell::new(0.0);
 }
 
 async fn run_session(
@@ -722,6 +736,8 @@ async fn run_session(
         0.0
     };
     LAST_PAINT_MS.with(|t| *t.borrow_mut() = 0.0);
+    IN_FRAME.with(|f| *f.borrow_mut() = false);
+    PENDING_SINCE_MS.with(|t| *t.borrow_mut() = 0.0);
 
     let image = Rc::new(RefCell::new(DecodedImage::new(PixelFormat::RgbA32, width, height)));
     let mut active_stage = ActiveStage::new(connection_result);
@@ -735,49 +751,62 @@ async fn run_session(
     let raf_scheduled = Rc::new(RefCell::new(false));
     let raf_closure: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
 
-    let schedule_repaint = {
+    // Build the rAF callback once. It decides per display frame whether to present
+    // the accumulated `pending` region, applying two bounds:
+    //   * FPS cap   — never paint more often than `frame_min_ms`.
+    //   * Frame gate — while inside a server frame (IN_FRAME), hold until the
+    //     frame closes (FrameEnd clears IN_FRAME) OR MAX_GATE_MS elapses, so a
+    //     multi-tile frame presents atomically instead of marching tile-by-tile.
+    // When it can't present yet it re-arms itself (via a Weak to avoid an Rc cycle)
+    // so a completed-but-cap-blocked or still-accumulating frame still flushes even
+    // if no further GraphicsUpdate arrives. The loop self-terminates once `pending`
+    // is taken (nothing left → no re-arm); new updates restart it via schedule_repaint.
+    {
         let pending = pending.clone();
         let raf_scheduled = raf_scheduled.clone();
-        let raf_closure = raf_closure.clone();
         let image = image.clone();
         let surfaces = surfaces.clone();
+        let raf_weak = Rc::downgrade(&raf_closure);
         // frame_min_ms is f64 (Copy) — captured by value, no Rc needed.
-        move || {
-            if *raf_scheduled.borrow() {
+        let cb = Closure::wrap(Box::new(move |now: f64| {
+            *raf_scheduled.borrow_mut() = false;
+
+            // Nothing to paint → stop the rAF loop.
+            if pending.borrow().is_none() {
+                PENDING_SINCE_MS.with(|t| *t.borrow_mut() = 0.0);
                 return;
             }
-            let window = match web_sys::window() {
-                Some(w) => w,
-                None => return,
-            };
-            *raf_scheduled.borrow_mut() = true;
 
-            let pending_cb = pending.clone();
-            let scheduled_cb = raf_scheduled.clone();
-            let image_cb = image.clone();
-            let surfaces_cb = surfaces.clone();
-
-            // rAF passes a DOMHighResTimeStamp (f64 ms). Using it directly
-            // avoids an extra web_sys::Performance::now() call per frame.
-            let cb = Closure::wrap(Box::new(move |now: f64| {
-                *scheduled_cb.borrow_mut() = false;
-
-                // FPS cap: if the last paint was too recent, leave the dirty
-                // region pending. The next GraphicsUpdate will re-schedule.
-                // Using LAST_PAINT_MS (thread_local) avoids capturing raf_closure
-                // here, which would create an Rc cycle preventing cleanup.
-                if frame_min_ms > 0.0 {
-                    let elapsed = LAST_PAINT_MS.with(|t| now - *t.borrow());
-                    if elapsed < frame_min_ms {
-                        return;
-                    }
+            // Mark when this batch began accumulating (for the MAX_GATE_MS bound).
+            PENDING_SINCE_MS.with(|t| {
+                if *t.borrow() == 0.0 {
+                    *t.borrow_mut() = now;
                 }
+            });
 
-                if let Some(region) = pending_cb.borrow_mut().take() {
+            // Decide whether to present this tick.
+            let mut present = true;
+            if frame_min_ms > 0.0 {
+                let elapsed = LAST_PAINT_MS.with(|t| now - *t.borrow());
+                if elapsed < frame_min_ms {
+                    present = false;
+                }
+            }
+            if present {
+                let in_frame = IN_FRAME.with(|f| *f.borrow());
+                let waited = PENDING_SINCE_MS.with(|t| now - *t.borrow());
+                if in_frame && waited < MAX_GATE_MS {
+                    present = false;
+                }
+            }
+
+            if present {
+                if let Some(region) = pending.borrow_mut().take() {
                     LAST_PAINT_MS.with(|t| *t.borrow_mut() = now);
-                    let img = image_cb.borrow();
+                    PENDING_SINCE_MS.with(|t| *t.borrow_mut() = 0.0);
+                    let img = image.borrow();
                     let mut painted = false;
-                    for surface in surfaces_cb.borrow_mut().iter_mut() {
+                    for surface in surfaces.borrow_mut().iter_mut() {
                         if surface.draw(&img, region.clone()).is_ok() {
                             painted = true;
                         }
@@ -786,10 +815,32 @@ async fn run_session(
                         crate::notify_frame();
                     }
                 }
-            }) as Box<dyn FnMut(f64)>);
+            } else if let (Some(window), Some(rc)) = (web_sys::window(), raf_weak.upgrade()) {
+                // Keep checking next frame until the gate releases / cap clears.
+                if !*raf_scheduled.borrow() {
+                    if let Some(cb) = rc.borrow().as_ref() {
+                        *raf_scheduled.borrow_mut() = true;
+                        let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
+                    }
+                }
+            }
+        }) as Box<dyn FnMut(f64)>);
+        *raf_closure.borrow_mut() = Some(cb);
+    }
 
-            let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
-            *raf_closure.borrow_mut() = Some(cb);
+    let schedule_repaint = {
+        let raf_scheduled = raf_scheduled.clone();
+        let raf_closure = raf_closure.clone();
+        move || {
+            if *raf_scheduled.borrow() {
+                return;
+            }
+            if let Some(window) = web_sys::window() {
+                if let Some(cb) = raf_closure.borrow().as_ref() {
+                    *raf_scheduled.borrow_mut() = true;
+                    let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
+                }
+            }
         }
     };
 
@@ -933,15 +984,25 @@ async fn run_session(
                     writer_tx.unbounded_send(frame)
                         .context("send response frame")?;
                 }
+                ActiveStageOutput::FrameBegin => {
+                    // Enter a server frame: gate presentation until END/MAX_GATE.
+                    IN_FRAME.with(|f| *f.borrow_mut() = true);
+                }
                 ActiveStageOutput::GraphicsUpdate(region) => {
-                    // Coalesce into the pending dirty region; the actual paint
-                    // happens on the next animation frame.
+                    // Coalesce into the pending dirty region; the rAF callback
+                    // decides when to actually paint (gated while inside a frame).
                     let mut p = pending.borrow_mut();
                     *p = Some(match p.take() {
                         Some(prev) => union_rect(prev, region),
                         None => region,
                     });
                     drop(p);
+                    schedule_repaint();
+                }
+                ActiveStageOutput::FrameEnd => {
+                    // Frame closed: release the gate so the accumulated region
+                    // presents atomically on the next animation frame.
+                    IN_FRAME.with(|f| *f.borrow_mut() = false);
                     schedule_repaint();
                 }
                 ActiveStageOutput::PointerDefault => {

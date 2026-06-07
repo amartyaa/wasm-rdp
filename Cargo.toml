@@ -16,6 +16,7 @@ panic = "abort"
  ironrdp         = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support" }
  ironrdp-core    = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support" }
  ironrdp-cliprdr-format = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support" }
+# Local-path patch (frame-marker dev) — re-enable to iterate on the fork locally:
 # ironrdp-session = { path = "../rdp-reference/IronRDP-fork/crates/ironrdp-session" }
 # ironrdp = { path = "../rdp-reference/IronRDP-fork/crates/ironrdp" }
 # ironrdp-core = { path = "../rdp-reference/IronRDP-fork/crates/ironrdp-core" }
