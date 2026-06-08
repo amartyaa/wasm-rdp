@@ -477,8 +477,13 @@ async fn perform_connection(
                     log("CredSSP: authentication successful!");
                 }
                 Err(e) => {
+                    // The server required NLA (we're in should_perform_credssp),
+                    // so a CredSSP failure is fatal — continuing only produces a
+                    // confusing downstream "connection closed" error. Propagate the
+                    // real cause (it carries STATUS_LOGON_FAILURE / 0xc000006d for
+                    // bad credentials) so the UI can show "check username/password".
                     log_error(&format!("CredSSP failed: {e:#}"));
-                    log("Attempting to continue without CredSSP...");
+                    return Err(e.context("CredSSP authentication failed"));
                 }
             }
 
