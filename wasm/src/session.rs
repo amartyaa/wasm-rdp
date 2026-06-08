@@ -689,26 +689,6 @@ fn extract_public_key(cert_der: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(raw_key.to_vec())
 }
 
-/// Union two inclusive rectangles into their bounding box.
-fn union_rect(
-    a: ironrdp::pdu::geometry::InclusiveRectangle,
-    b: ironrdp::pdu::geometry::InclusiveRectangle,
-) -> ironrdp::pdu::geometry::InclusiveRectangle {
-    ironrdp::pdu::geometry::InclusiveRectangle {
-        left: a.left.min(b.left),
-        top: a.top.min(b.top),
-        right: a.right.max(b.right),
-        bottom: a.bottom.max(b.bottom),
-    }
-}
-
-thread_local! {
-    // Monotonic paint timestamp (rAF DOMHighResTimeStamp) used for fps cap.
-    // Thread-local avoids capturing an Rc into the rAF closure and the Rc
-    // cycle that would prevent the framebuffer from being freed on session end.
-    static LAST_PAINT_MS: RefCell<f64> = RefCell::new(0.0);
-}
-
 async fn run_session(
     connection_result: ConnectionResult,
     mut framed: WasmFramed,
@@ -717,101 +697,10 @@ async fn run_session(
     surfaces: Rc<RefCell<Vec<Canvas>>>,
     width: u16,
     height: u16,
-    fps_cap: u32,
+    _fps_cap: u32,
 ) -> anyhow::Result<&'static str> {
-    // Minimum ms between canvas paints (0 = uncapped / display-rate).
-    // Reset the timer so a fresh session never incorrectly skips the first frame.
-    let frame_min_ms: f64 = if fps_cap > 0 && fps_cap < 300 {
-        1000.0 / fps_cap as f64
-    } else {
-        0.0
-    };
-    LAST_PAINT_MS.with(|t| *t.borrow_mut() = 0.0);
-
     let image = Rc::new(RefCell::new(DecodedImage::new(PixelFormat::RgbA32, width, height)));
     let mut active_stage = ActiveStage::new(connection_result);
-
-    // Dirty-region coalescing. Instead of painting synchronously on every
-    // GraphicsUpdate (which causes many putImageData boundary crossings and
-    // overdraw the monitor never shows), we accumulate the dirty region and
-    // flush exactly once per animation frame, aligned to the display refresh.
-    let pending: Rc<RefCell<Option<ironrdp::pdu::geometry::InclusiveRectangle>>> =
-        Rc::new(RefCell::new(None));
-    let raf_scheduled = Rc::new(RefCell::new(false));
-    let raf_closure: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
-
-    // Build the rAF callback once. It presents the accumulated `pending` region
-    // at most once per display frame, subject to one bound:
-    //   * FPS cap — never paint more often than `frame_min_ms` (0 = uncapped).
-    // When the cap blocks this tick it re-arms itself (via a Weak to avoid an Rc
-    // cycle) so the held region still flushes even if no further GraphicsUpdate
-    // arrives. The loop self-terminates once `pending` is taken (nothing left → no
-    // re-arm); new updates restart it via schedule_repaint.
-    {
-        let pending = pending.clone();
-        let raf_scheduled = raf_scheduled.clone();
-        let image = image.clone();
-        let surfaces = surfaces.clone();
-        let raf_weak = Rc::downgrade(&raf_closure);
-        // frame_min_ms is f64 (Copy) — captured by value, no Rc needed.
-        let cb = Closure::wrap(Box::new(move |now: f64| {
-            *raf_scheduled.borrow_mut() = false;
-
-            // Nothing to paint → stop the rAF loop.
-            if pending.borrow().is_none() {
-                return;
-            }
-
-            // FPS cap: if we painted too recently, re-arm and wait. The pending
-            // region stays accumulated until we're allowed to paint.
-            if frame_min_ms > 0.0 {
-                let elapsed = LAST_PAINT_MS.with(|t| now - *t.borrow());
-                if elapsed < frame_min_ms {
-                    if let (Some(window), Some(rc)) = (web_sys::window(), raf_weak.upgrade()) {
-                        if !*raf_scheduled.borrow() {
-                            if let Some(cb) = rc.borrow().as_ref() {
-                                *raf_scheduled.borrow_mut() = true;
-                                let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
-                            }
-                        }
-                    }
-                    return;
-                }
-            }
-
-            // Present the coalesced dirty region.
-            if let Some(region) = pending.borrow_mut().take() {
-                LAST_PAINT_MS.with(|t| *t.borrow_mut() = now);
-                let img = image.borrow();
-                let mut painted = false;
-                for surface in surfaces.borrow_mut().iter_mut() {
-                    if surface.draw(&img, region.clone()).is_ok() {
-                        painted = true;
-                    }
-                }
-                if painted {
-                    crate::notify_frame();
-                }
-            }
-        }) as Box<dyn FnMut(f64)>);
-        *raf_closure.borrow_mut() = Some(cb);
-    }
-
-    let schedule_repaint = {
-        let raf_scheduled = raf_scheduled.clone();
-        let raf_closure = raf_closure.clone();
-        move || {
-            if *raf_scheduled.borrow() {
-                return;
-            }
-            if let Some(window) = web_sys::window() {
-                if let Some(cb) = raf_closure.borrow().as_ref() {
-                    *raf_scheduled.borrow_mut() = true;
-                    let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
-                }
-            }
-        }
-    };
 
     loop {
         let outputs = select! {
@@ -954,15 +843,16 @@ async fn run_session(
                         .context("send response frame")?;
                 }
                 ActiveStageOutput::GraphicsUpdate(region) => {
-                    // Coalesce into the pending dirty region; the rAF callback
-                    // paints it once per display frame (subject to the FPS cap).
-                    let mut p = pending.borrow_mut();
-                    *p = Some(match p.take() {
-                        Some(prev) => union_rect(prev, region),
-                        None => region,
-                    });
-                    drop(p);
-                    schedule_repaint();
+                    let img = image.borrow();
+                    let mut painted = false;
+                    for surface in surfaces.borrow_mut().iter_mut() {
+                        if surface.draw(&img, region.clone()).is_ok() {
+                            painted = true;
+                        }
+                    }
+                    if painted {
+                        crate::notify_frame();
+                    }
                 }
                 ActiveStageOutput::PointerDefault => {
                     for surface in surfaces.borrow().iter() {
