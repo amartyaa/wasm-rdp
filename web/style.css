@@ -170,20 +170,40 @@ html, body {
     font-weight: 500;
 }
 .settings-row select {
-    background: var(--glass-bg);
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+    background-color: var(--glass-bg);
+    /* on-theme chevron (accent-tinted), drawn via SVG data URI */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23a9a6ff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 11px center;
     border: 1px solid var(--glass-border);
     color: var(--text-primary);
-    padding: 5px 10px;
-    border-radius: 6px;
+    padding: 7px 34px 7px 12px;
+    border-radius: var(--radius-sm);
     font-family: var(--font);
     font-size: 0.8rem;
+    font-weight: 500;
     cursor: pointer;
     outline: none;
-    transition: border-color 0.2s;
+    min-width: 116px;
+    transition: border-color 0.2s, background-color 0.2s, box-shadow 0.2s;
 }
-.settings-row select:hover,
+.settings-row select:hover {
+    border-color: var(--glass-highlight);
+    background-color: rgba(255, 255, 255, 0.09);
+}
 .settings-row select:focus {
     border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+}
+/* The native option popup can't inherit the glass/transparent background, so
+   set a solid on-theme dark fill — otherwise it renders light-on-light and the
+   options are barely readable. */
+.settings-row select option {
+    background: #141023;
+    color: var(--text-primary);
 }
 .settings-row + .settings-row {
     margin-top: 10px;
@@ -215,8 +235,8 @@ html, body {
 }
 .settings-advanced summary:hover { color: var(--text-primary); }
 .settings-advanced .settings-row { margin-top: 10px; }
-select option:disabled {
-    color: rgba(255,255,255,0.25);
+.settings-row select option:disabled {
+    color: rgba(255, 255, 255, 0.3);
 }
 
 .form-group {
