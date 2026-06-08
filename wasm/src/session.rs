@@ -25,6 +25,106 @@ use crate::canvas::Canvas;
 use crate::framed::WasmFramed;
 use crate::{log, log_error};
 
+// ===== EGFX graphics pipeline (MS-RDPEGFX) — H.264/AVC420 via WebCodecs =====
+// On Windows hosts (which negotiate the graphics pipeline) graphics arrive over
+// the EGFX DVC as H.264 instead of the legacy RFX fast-path. We run the egfx
+// client in *raw passthrough* mode: it parses the AVC420 envelope but, instead of
+// decoding inline (IronRDP's H264Decoder trait is synchronous and WebCodecs is
+// async), forwards the undecoded H.264 bitstream + output geometry to JS, which
+// decodes via `VideoDecoder` and `drawImage`s the frame. See web/app.js.
+//
+// We advertise **AVC420 only** (V8.1), not V10.7, so the server never sends
+// AVC444 (two H.264 streams for full chroma) — WebCodecs decodes a single AVC420
+// stream natively, AVC444 would need two decoders + YUV444 recombination.
+struct WasmGfxHandler {
+    /// Count of AVC420 frames forwarded; used to log only the first (the hot path
+    /// must stay allocation-free per frame).
+    avc_frames: u32,
+}
+
+impl WasmGfxHandler {
+    fn new() -> Self {
+        Self { avc_frames: 0 }
+    }
+}
+
+impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
+    fn capabilities(&self) -> Vec<ironrdp::egfx::pdu::CapabilitySet> {
+        use ironrdp::egfx::pdu::{CapabilitiesV8Flags, CapabilitiesV81Flags, CapabilitySet};
+        // Called by the egfx client when the graphics DVC opens — log the
+        // advertisement so the console shows negotiation start before the
+        // server's CapabilitiesConfirm.
+        log("[EGFX] graphics channel opened — advertising capabilities: AVC420 (V8.1) + V8 fallback");
+        vec![
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+            },
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::SMALL_CACHE,
+            },
+        ]
+    }
+
+    fn on_capabilities_confirmed(&mut self, caps: &ironrdp::egfx::pdu::CapabilitySet) {
+        log(&format!("[EGFX] capabilities confirmed by server: {caps:?}"));
+    }
+    fn on_reset_graphics(&mut self, width: u32, height: u32) {
+        log(&format!("[EGFX] reset graphics {width}x{height}"));
+    }
+    fn on_surface_created(&mut self, surface: &ironrdp::egfx::client::Surface) {
+        log(&format!(
+            "[EGFX] surface created id={} {}x{} fmt={:?}",
+            surface.id, surface.width, surface.height, surface.pixel_format
+        ));
+    }
+    fn on_surface_mapped(&mut self, surface_id: u16, origin_x: u32, origin_y: u32) {
+        log(&format!("[EGFX] surface {surface_id} mapped to output ({origin_x},{origin_y})"));
+    }
+
+    fn on_avc420_raw(
+        &mut self,
+        surface_id: u16,
+        origin_x: u32,
+        origin_y: u32,
+        width: u16,
+        height: u16,
+        data: &[u8],
+    ) {
+        // Log only the first frame's NAL structure to confirm H.264 at runtime
+        // (7=SPS, 8=PPS, 5=IDR, 1=non-IDR) without burdening the per-frame path.
+        if self.avc_frames == 0 {
+            let mut nal_types: Vec<u8> = Vec::new();
+            let mut off = 0usize;
+            while off + 4 <= data.len() {
+                let len = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]) as usize;
+                off += 4;
+                if off < data.len() {
+                    nal_types.push(data[off] & 0x1F);
+                }
+                off = off.saturating_add(len);
+                if nal_types.len() >= 8 {
+                    break;
+                }
+            }
+            log(&format!(
+                "[EGFX] AVC420 H.264 confirmed — surface={surface_id} origin=({origin_x},{origin_y}) {width}x{height} bytes={} NAL {nal_types:?}",
+                data.len()
+            ));
+        }
+        self.avc_frames = self.avc_frames.wrapping_add(1);
+        crate::notify_h264_data(surface_id, origin_x, origin_y, width, height, data);
+    }
+
+    fn on_wire_to_surface2(&mut self, _pdu: &ironrdp::egfx::pdu::WireToSurface2Pdu) {
+        // RFX progressive over EGFX — only the first occurrence matters for
+        // diagnosis; we don't render this path (we advertised AVC420/V8 only).
+        if self.avc_frames == 0 {
+            log("[EGFX] WireToSurface2 (RFX progressive) received — H.264 not in use");
+        }
+    }
+}
+// ===== END EGFX graphics pipeline =====
+
 /// An active RDP session handle exposed to JavaScript.
 #[wasm_bindgen]
 pub struct Session {
@@ -79,6 +179,7 @@ impl Session {
         allow_wallpaper: bool,
         allow_themes: bool,
         allow_animations: bool,
+        enable_gfx: bool,
     ) -> anyhow::Result<Session> {
         log(&format!("Connecting to proxy: {ws_url}"));
 
@@ -123,7 +224,7 @@ impl Session {
         let config = build_connector_config(
             username.clone(), password.clone(), domain.clone(), width, height,
             monitor_layout, enable_audio, enable_font_smoothing, disable_cursor_effects,
-            allow_wallpaper, allow_themes, allow_animations,
+            allow_wallpaper, allow_themes, allow_animations, enable_gfx,
         );
 
         // Split WebSocket for bidirectional I/O
@@ -155,6 +256,24 @@ impl Session {
                 Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac))
             );
             connector.with_static_channel(rdpsnd)
+        } else {
+            connector
+        };
+
+        // Attach the EGFX graphics pipeline over DRDYNVC when H.264 is enabled
+        // (the browser supports WebCodecs H.264 decode — see `enable_gfx`). The
+        // matching `config.support_graphics_pipeline` flag tells the server we
+        // accept the pipeline; without it Windows keeps the legacy RFX path.
+        // xrdp ignores the flag (no GFX support) and stays on RFX regardless.
+        let connector = if enable_gfx {
+            log("[EGFX] attaching graphics pipeline DVC (advertising AVC420 H.264)");
+            connector.with_static_channel(
+                ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(
+                    ironrdp::egfx::client::GraphicsPipelineClient::new_passthrough(
+                        Box::new(WasmGfxHandler::new()),
+                    ),
+                ),
+            )
         } else {
             connector
         };
@@ -1125,6 +1244,7 @@ fn build_connector_config(
     allow_wallpaper: bool,
     allow_themes: bool,
     allow_animations: bool,
+    enable_gfx: bool,
 ) -> connector::Config {
     let domain = if domain.is_empty() { None } else { Some(domain) };
 
@@ -1173,6 +1293,7 @@ fn build_connector_config(
         multitransport_flags: None,
         monitors,
         monitors_extended: Vec::new(),
+        support_graphics_pipeline: enable_gfx,
     }
 }
 

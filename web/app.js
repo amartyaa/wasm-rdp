@@ -91,6 +91,12 @@ async function loadWasm() {
     updateFpsOptions(); // apply gate on load
 
     // Advanced settings
+    const advH264 = document.getElementById('adv-h264');
+    advH264.checked = h264Enabled;
+    advH264.addEventListener('change', () => {
+        h264Enabled = advH264.checked;
+        localStorage.setItem('rdp_h264', h264Enabled ? '1' : '0');
+    });
     const advFontSmooth  = document.getElementById('adv-font-smoothing');
     const advCursorFx    = document.getElementById('adv-cursor-effects');
     advFontSmooth.checked = advEnableFontSmoothing;
@@ -201,6 +207,9 @@ let lastMouseTime = 0;
 let resizeTimeout = null;
 let fpsCap = parseInt(localStorage.getItem('rdp_fps_cap') || '30', 10);
 let audioEnabled = localStorage.getItem('rdp_audio') === '1';
+// H.264 video (RDPGFX). Default ON — falls back to RFX when the host or browser
+// can't do H.264, so it's safe to prefer. Set to '0' to force RFX.
+let h264Enabled = localStorage.getItem('rdp_h264') !== '0';
 // Advanced perf flags (applied at connect time)
 let advEnableFontSmoothing = localStorage.getItem('rdp_adv_font_smooth') === '1';
 let advDisableCursorEffects = localStorage.getItem('rdp_adv_cursor_fx') === '1';
@@ -238,6 +247,17 @@ let audioDecoderRate = 0;
 let audioDecoderChannels = 0;
 let audioPts = 0;                // monotonic timestamp for EncodedAudioChunk
 let currentAudioCodec = '--';    // negotiated codec, shown in the HUD
+
+// ── Video State (H.264 / RDPGFX via WebCodecs) ───────────
+// On Windows hosts that negotiate the graphics pipeline (MS-RDPEGFX), graphics
+// arrive as H.264 (AVC420) over the EGFX DVC instead of legacy RFX. WASM forwards
+// the raw bitstream here; we decode with WebCodecs `VideoDecoder` and drawImage
+// onto the matching canvas. Gated on `h264Supported` (probed at connect); when
+// unsupported we don't advertise the pipeline and the host stays on RFX.
+let h264Supported = false;       // WebCodecs H.264 decode available (probed)
+let videoDecoders = new Map();   // surfaceId -> decoder state
+let h264RenderTargets = [];      // [{ canvas, ctx, left, top, width, height }]
+let currentVideoCodec = '--';    // active video codec, shown in HUD + badge
 
 // ── Multi-Monitor State ──────────────────────────────────
 // Multi-monitor uses the Window Management API (Chromium + secure context only)
@@ -362,6 +382,14 @@ async function doConnect(username, password, domain) {
         console.log('[RDPSND] WebCodecs support — opus:', codecs.opus, 'aac:', codecs.aac);
     }
 
+    // Detect H.264 decode support. We advertise the RDP graphics pipeline (so
+    // Windows hosts deliver H.264/AVC420) only when the user enabled H.264 *and*
+    // the browser can decode it; otherwise the pipeline isn't advertised and the
+    // host stays on RFX. xrdp ignores the flag and uses RFX regardless.
+    h264Supported = h264Enabled ? await detectVideoCodec() : false;
+    const enableGfx = h264Enabled && h264Supported;
+    console.log('[EGFX] H.264 toggle:', h264Enabled, '· WebCodecs support:', h264Supported, '· advertise GFX:', enableGfx);
+
     // Multi-monitor: build the physical-screen layout when enabled & supported,
     // and open the secondary-display popups now (close to the connect gesture, to
     // avoid popup blocking). Falls back to single-monitor otherwise.
@@ -395,6 +423,7 @@ async function doConnect(username, password, domain) {
         fpsCap, audioEnabled,
         advEnableFontSmoothing, advDisableCursorEffects,
         advAllowWallpaper, advAllowThemes, advAllowAnimations,
+        enableGfx,
     );
     multimonInUse = !!monitorBuild;
 
@@ -418,6 +447,7 @@ async function doConnect(username, password, domain) {
     if (multimonInUse) {
         setupMonitorSurfaces(monitorBuild.layout);
     }
+    rebuildH264Targets();
     setupResizeHandler();
     startStatsInterval();
     if (audioEnabled) initAudioContext();
@@ -863,6 +893,9 @@ function setupMonitorSurfaces(layout) {
         setupDocInput(p.win.document, p.win);
         enableClickFullscreen(p.win, m.screen);
     }
+
+    // Rebuild H.264 render targets to match the new surface layout.
+    rebuildH264Targets();
 }
 
 // Fullscreen a popup on its screen on first interaction. requestFullscreen needs
@@ -1022,6 +1055,11 @@ function cleanupSession() {
     }
     currentAudioCodec = '--';
     if (hudAudioCodec) hudAudioCodec.textContent = audioEnabled ? '--' : 'Off';
+    // Tear down H.264 decoders and reset the video-codec label.
+    teardownVideoDecoders();
+    currentVideoCodec = '--';
+    if (hudCodec) hudCodec.textContent = '--';
+    if (codecBadge) codecBadge.textContent = '--';
     if (audioContext) {
         audioContext.close().catch(() => {});
         audioContext = null;
@@ -1140,7 +1178,7 @@ function startStatsInterval() {
         hudResolution.textContent = multimonInUse
             ? `${session.width}×${session.height} (${monitorPopups.length + 1} mon)`
             : `${session.width}×${session.height}`;
-        hudCodec.textContent = 'RFX';
+        hudCodec.textContent = currentVideoCodec;
 
         // Proxy latency (browser ↔ Rust server HTTP)
         const pingStart = performance.now();
@@ -1171,11 +1209,172 @@ function formatSize(bytes) {
     return `${bytes} B`;
 }
 
-// Called from WASM on each graphics update
+// Called from WASM on each graphics update (legacy RFX path).
 window.__rdp_frame = function() {
     frameCount++;
     lastFrameTimestamp = performance.now();
+    if (currentVideoCodec === '--') setVideoCodec('RFX');
 };
+
+// ── Video Decode (H.264 / RDPGFX) ────────────────────────
+// Update the HUD "Video" row and toolbar badge with the active codec.
+function setVideoCodec(name) {
+    if (currentVideoCodec === name) return;
+    currentVideoCodec = name;
+    if (hudCodec) hudCodec.textContent = name;
+    if (codecBadge) codecBadge.textContent = name;
+}
+
+// Build the list of H.264 render targets (canvas + its rect in combined-desktop
+// coords) from the current surface layout. Called after connect and on relayout.
+function makeRenderTarget(cvs, left, top) {
+    let ctx;
+    try { ctx = cvs.getContext('2d'); } catch (_) { ctx = null; }
+    return { canvas: cvs, ctx, left, top, width: cvs.width, height: cvs.height };
+}
+function rebuildH264Targets() {
+    h264RenderTargets = [];
+    if (!session) return;
+    if (multimonInUse) {
+        const off = canvas.__rdpOffset || { x: 0, y: 0 };
+        h264RenderTargets.push(makeRenderTarget(canvas, off.x, off.y));
+        for (const p of monitorPopups) {
+            h264RenderTargets.push(makeRenderTarget(p.canvas, p.monitor.left, p.monitor.top));
+        }
+    } else {
+        h264RenderTargets.push(makeRenderTarget(canvas, 0, 0));
+    }
+}
+
+// Pick the render target whose rect contains the surface's output origin.
+function pickRenderTarget(x, y) {
+    for (const t of h264RenderTargets) {
+        if (x >= t.left && x < t.left + t.width && y >= t.top && y < t.top + t.height) return t;
+    }
+    return h264RenderTargets[0] || null;
+}
+
+// Convert an RDP AVC420 stream (4-byte big-endian length-prefixed NAL units) to
+// Annex B (00 00 00 01 start codes) IN PLACE — prefix and start code are both 4
+// bytes, so no reallocation. Returns whether the access unit is a keyframe (has
+// IDR/SPS) and a copy of the SPS NAL (for VideoDecoder config) when present.
+function convertAvcInPlace(data) {
+    let off = 0, isKey = false, sps = null;
+    const n = data.length;
+    while (off + 4 <= n) {
+        const len = ((data[off] << 24) | (data[off + 1] << 16) | (data[off + 2] << 8) | data[off + 3]) >>> 0;
+        data[off] = 0; data[off + 1] = 0; data[off + 2] = 0; data[off + 3] = 1;
+        off += 4;
+        if (off + len > n) break;
+        const t = data[off] & 0x1F;
+        if (t === 5) {
+            isKey = true;                       // IDR slice
+        } else if (t === 7) {
+            isKey = true;                       // SPS → keyframe follows
+            if (!sps) sps = data.slice(off, off + len);
+        }
+        off += len;
+    }
+    return { isKey, sps };
+}
+
+// Derive the WebCodecs codec string from an SPS NAL: avc1.PPCCLL where
+// PP=profile_idc, CC=constraint flags, LL=level_idc (bytes 1..4 of the NAL).
+function spsToCodecString(sps) {
+    if (!sps || sps.length < 4) return 'avc1.42E01E';
+    const hex = (b) => b.toString(16).padStart(2, '0');
+    return 'avc1.' + hex(sps[1]) + hex(sps[2]) + hex(sps[3]);
+}
+
+function getVideoDecoderState(surfaceId) {
+    let st = videoDecoders.get(surfaceId);
+    if (st) return st;
+    st = { decoder: null, configured: false, pts: 0, dx: 0, dy: 0, w: 0, h: 0, target: null };
+    try {
+        st.decoder = new VideoDecoder({
+            output: (frame) => onDecodedVideo(surfaceId, frame),
+            error: (e) => console.warn('[EGFX] VideoDecoder error:', e),
+        });
+    } catch (e) {
+        console.warn('[EGFX] VideoDecoder unavailable:', e);
+        return null;
+    }
+    videoDecoders.set(surfaceId, st);
+    return st;
+}
+
+function onDecodedVideo(surfaceId, frame) {
+    const st = videoDecoders.get(surfaceId);
+    try {
+        if (st && st.target && st.target.ctx) {
+            const w = st.w || frame.displayWidth;
+            const h = st.h || frame.displayHeight;
+            // Crop to the surface size (the coded frame may be padded to a
+            // macroblock multiple) and blit at the surface's local offset.
+            st.target.ctx.drawImage(frame, 0, 0, w, h, st.dx, st.dy, w, h);
+            frameCount++;
+            lastFrameTimestamp = performance.now();
+        }
+    } catch (e) {
+        console.warn('[EGFX] drawImage failed:', e);
+    } finally {
+        frame.close();
+    }
+}
+
+// Called from WASM with a raw AVC420 H.264 access unit + output geometry.
+// data is AVC format (4-byte length-prefixed NALs); we convert in place and feed
+// WebCodecs. Decoding is async; onDecodedVideo draws the resulting frame.
+window.__rdp_h264_data = function(surfaceId, originX, originY, width, height, data) {
+    if (!h264Supported) return;
+    setVideoCodec('H.264');
+
+    const target = pickRenderTarget(originX, originY);
+    if (!target || !target.ctx) return;
+
+    const st = getVideoDecoderState(surfaceId);
+    if (!st || !st.decoder) return;
+
+    const { isKey, sps } = convertAvcInPlace(data);
+
+    // Geometry is stable per surface; record it for the async draw callback.
+    st.target = target;
+    st.dx = originX - target.left;
+    st.dy = originY - target.top;
+    st.w = width;
+    st.h = height;
+
+    if (!st.configured) {
+        // Must start on a keyframe carrying SPS so we can configure the decoder.
+        if (!isKey || !sps) return;
+        try {
+            st.decoder.configure({ codec: spsToCodecString(sps), optimizeForLatency: true });
+            st.configured = true;
+        } catch (e) {
+            console.warn('[EGFX] decoder configure failed:', e);
+            return;
+        }
+    }
+
+    try {
+        st.decoder.decode(new EncodedVideoChunk({
+            type: isKey ? 'key' : 'delta',
+            timestamp: st.pts,
+            data,
+        }));
+        st.pts += 16666; // ~60 fps; only needs to be monotonic
+    } catch (e) {
+        console.warn('[EGFX] decode() failed:', e);
+    }
+};
+
+function teardownVideoDecoders() {
+    for (const st of videoDecoders.values()) {
+        try { if (st.decoder && st.decoder.state !== 'closed') st.decoder.close(); } catch (_) {}
+    }
+    videoDecoders.clear();
+    h264RenderTargets = [];
+}
 
 // ── Performance HUD Toggle ───────────────────────────────
 fpsBadge.addEventListener('click', () => {
@@ -1226,6 +1425,22 @@ async function detectAudioCodecs() {
         result.aac = !!a.supported;
     } catch (_) {}
     return result;
+}
+
+// Probe WebCodecs for H.264 decode support. When false, we don't advertise the
+// RDP graphics pipeline, so the host falls back to RFX (no black screen).
+async function detectVideoCodec() {
+    if (typeof VideoDecoder === 'undefined' || !VideoDecoder.isConfigSupported) {
+        return false;
+    }
+    try {
+        // Probe a common baseline string; the real config is derived per-stream
+        // from the SPS. Decoders that support this generally support what RDP sends.
+        const s = await VideoDecoder.isConfigSupported({ codec: 'avc1.42E01E' });
+        return !!(s && s.supported);
+    } catch (_) {
+        return false;
+    }
 }
 
 // Ensure the worklet node matches the given format, then hand it per-channel PCM.

@@ -1,165 +1,80 @@
-# Web RDP Rust (WASM-based Client)
+# web-rdp
 
-A high-performance, web-native RDP client built with Rust and the [IronRDP](https://github.com/Devolutions/IronRDP) ecosystem. This project implements a lightweight agent that runs directly on target machines, providing a smooth HTML5 experience with minimal latency.
+A web-based RDP client where the full protocol stack runs in the browser as WebAssembly. The server is a WebSocket-to-TCP relay and nothing more — it never parses an RDP PDU.
 
-## 🚀 How It's Different
+Built on Devolutions' [IronRDP](https://github.com/Devolutions/IronRDP) library.
 
-Traditional web-based RDP solutions often rely on heavy server-side proxies (like Guacamole) that decode RDP traffic, re-encode it into image streams (MJPEG/PNG), and send pixels to the browser. This introduces significant CPU overhead and latency.
+## Why this instead of Guacamole
 
-**This solution is different because:**
-- **In-Browser Decoding:** The entire RDP protocol state machine and graphics decoding run in the browser via WebAssembly (WASM).
-- **Transparent Proxy:** The Rust server acts only as a simple WebSocket-to-TCP relay. It does zero PDU inspection or pixel re-encoding.
-- **Zero-Copy Rendering:** Decoded pixels are written directly to the HTML5 Canvas using `putImageData`, achieving native-like performance.
-- **Security:** Credential negotiation (NLA/CredSSP) is handled client-side using the `sspi` crate in WASM.
+Guacamole-style proxies decode RDP on the server and push pixel streams (JPEG or PNG tiles) to the browser. It works, but the server spends meaningful CPU re-encoding frames and the browser receives screenshots rather than the actual RDP output.
 
-## 🏗 Architecture
+Here the browser runs the complete IronRDP state machine — graphics decoder, NLA/CredSSP auth, scancode encoding — in WASM. The backend is a ~200-line relay that moves bytes between the WebSocket and a TCP socket. It does exactly one non-trivial thing: when NLA is required, it does the TLS handshake with the RDP host and sends the server certificate back so the WASM side can complete CredSSP.
 
-```mermaid
-graph LR
-    subgraph Browser
-        JS[Web UI] --- WASM[IronRDP WASM]
-        WASM --- Canvas[HTML5 Canvas]
-    end
-    
-    WASM <== WebSocket / Binary ==> Proxy[Rust Axum Server]
-    Proxy <== TCP ==> RDP[localhost:3389]
-```
+## Prerequisites to Build
 
-## 📂 Project Structure
+- Rust stable (any recent version)
+- wasm-pack (`cargo install wasm-pack`)
 
-- `server/`: The backend proxy built with `Axum` and `Tokio`.
-- `wasm/`: The core RDP logic using `ironrdp`. Compiles to WebAssembly.
-- `web/`: The frontend UI (Vanilla JavaScript + CSS).
-- `scripts/`: Automated build scripts for Windows and Ubuntu.
+## Build
 
-## 🛠 Pre-requisites
-
-- **Rust:** Latest stable version.
-- **Wasm-pack:** For building the WASM module.
-  ```powershell
-  cargo install wasm-pack
-  ```
-- **Wasm-opt:** (Optional but recommended) for optimizing WASM binary size. Usually bundled with wasm-pack.
-
-## ⚡ Quickstart
-
-### 1. Build the Project
-Use the provided build script for your platform:
-
-**Windows:**
+Windows:
 ```powershell
 .\scripts\build-windows.ps1
 ```
 
-**Ubuntu/Linux:**
+Linux:
 ```bash
 ./scripts/build-ubuntu.sh
 ```
 
-### 2. Run the Server
-The server serves both the static web files and the WebSocket proxy.
+The script builds the WASM module via wasm-pack, then compiles the server binary. Artefacts land in `target/release/`.
 
-```powershell
-.\target\release\server.exe --port 8080 --rdp-target localhost:3389
+## Running
+
+```
+./target/release/server --port 8080 --rdp-target <host>:3389
 ```
 
-### 3. Connect
-Open `http://localhost:8080` in any modern browser. Enter your credentials and enjoy a high-performance RDP session.
+Open `http://localhost:8080` in Chrome or Edge. `--rdp-target` is where the relay forwards connections — `localhost:3389` if the RDP host is on the same machine, or any reachable address otherwise.
 
-## 🧠 How It Works
+## Features
 
-1. **PDU Framing:** Since WebSockets are message-based but RDP is stream-oriented, we implement custom framing in `wasm/src/framed.rs` to extract TPKT (X224) and FastPath packets.
-2. **Connector Sequence:** The `ironrdp-connector` state machine drives the handshake through initiation, security upgrades (TLS/CredSSP), and capability negotiation.
-3. **Active Session:** Once connected, the `ActiveStage` processes incoming graphics PDUs, updating a local framebuffer which is then rendered by `canvas.rs`.
-4. **Input Handling:** Keyboard and mouse events are captured in JS, converted to AT-101 scancodes, and sent to WASM to be encoded as RDP input PDUs.
+- H.264 video via MS-RDPEGFX on Windows hosts (requires Chrome/Edge with WebCodecs; falls back to RemoteFX automatically)
+- Multi-monitor support using the Window Management API
+- Audio over RDPSND — PCM, Opus, and AAC
+- Bidirectional clipboard (text and images)
+- NLA authentication via NTLM/CredSSP
 
-## 🔍 Troubleshooting
+## How it works
 
-Based on challenges faced during the initial implementation:
+The WASM module (`wasm/`) runs the IronRDP state machine. RDP PDUs come in over the WebSocket, get parsed, and the decoded framebuffer is painted to an HTML canvas with `putImageData`. Keyboard and mouse events go the other direction — captured in JS, translated to AT-101 scancodes, encoded as FastPath input PDUs in WASM, and sent back over the WebSocket.
 
-### Build Errors
-- **File Access Denied (os error 32):** Frequently caused by Windows Defender or `rust-analyzer` locking files in the `target/` directory during high-intensity compilation (especially during `wasm-pack`). Try closing your IDE or disabling real-time scanning for the project folder.
-- **WASM Memory Limit:** If the WASM module fails to load, ensure you aren't initializing multiple large framebuffers. We use a single shared buffer for the canvas.
+The relay (`server/`) is an Axum server. The one non-trivial step is TLS: the WASM client sends `{"cmd":"tls_upgrade"}` over the WebSocket, the server does the TLS handshake with the RDP host, returns the server certificate in a JSON message, and from then on passes ciphertext in both directions unchanged. WASM does CredSSP (NTLM) over that tunnel.
 
-### Runtime Issues
-- **WebSocket Disconnection:** Ensure the `--rdp-target` is reachable from the server. If targeting a remote Windows machine, check firewall rule 3389.
-- **Blank Screen:** Headless browser environments (like testing tools) may not render the UI correctly if using `backdrop-filter: blur()`. Verify in a physical browser.
-- **Credentials/NLA:** If connection fails during the "CredSSP" state, verify that NLA is correctly configured on the target machine.
+For more detail on individual subsystems, see the `docs/` folder:
 
-### Design Notes
-- **Axum Router:** Axum 0.8+ no longer supports `nest_service` at the root path. The server uses `fallback_service` to correctly handle static assets alongside the `/ws` route.
-- **Web-Sys Features:** Several DOM APIs used by the client (like `Clipboard` or `CssStyleDeclaration`) require explicit feature flags in `wasm/Cargo.toml`.
+- [docs/credssp.md](docs/credssp.md) — TLS upgrade and CredSSP/NTLM sequence
+- [docs/graphics.md](docs/graphics.md) — RemoteFX and H.264/RDPEGFX rendering pipeline
+- [docs/audio.md](docs/audio.md) — RDPSND negotiation and AudioWorklet playback
+- [docs/input.md](docs/input.md) — keyboard scancode mapping and mouse handling
+- [docs/clipboard.md](docs/clipboard.md) — bidirectional CLIPRDR flow
 
+## Project layout
 
+| Path | Contents |
+|---|---|
+| `server/` | Axum WebSocket-to-TCP relay |
+| `wasm/` | IronRDP state machine compiled to WASM |
+| `web/` | HTML, JS, CSS frontend |
+| `crates/ironrdp-rdpsnd/` | Vendored audio crate with Opus and AAC support |
+| `scripts/` | Build scripts for Windows and Linux |
 
-# IronBridge — CredSSP/NLA Implementation Walkthrough
+## Common build and runtime issues
 
-## Architecture
+**Windows Defender locking files during wasm-pack** — wasm-pack writes to `target/` and Defender sometimes holds files open mid-build, causing "access denied" errors. Adding the project folder to Defender's exclusion list resolves it.
 
-The CredSSP implementation uses a **proxy-mediated TLS** approach:
+**Blank screen after connect** — check that `--rdp-target` is reachable and port 3389 is open on the target.
 
-```mermaid
-sequenceDiagram
-    participant Browser as WASM Client
-    participant Proxy as Server Proxy
-    participant RDP as RDP Server
+**CredSSP auth failure** — usually a username format issue. Try `user@domain` or `DOMAIN\user` depending on whether the machine is domain-joined. The domain field on the login form is only needed for domain-joined targets; for local accounts leave it blank.
 
-    Browser->>Proxy: X.224 Connection Request (via WS)
-    Proxy->>RDP: X.224 Connection Request (via TCP)
-    RDP->>Proxy: X.224 Connection Confirm (HYBRID)
-    Proxy->>Browser: X.224 Connection Confirm
-
-    Note over Browser: Connector → EnhancedSecurityUpgrade
-
-    Browser->>Proxy: {"cmd":"tls_upgrade"} (WS Text)
-    Proxy->>RDP: TLS Handshake (TCP→TLS)
-    RDP->>Proxy: TLS Established
-    Proxy->>Browser: {"cmd":"tls_ready","server_cert":"<hex>"} (WS Text)
-
-    Note over Browser: Connector → CredSSP
-
-    loop NTLM Rounds (2-3)
-        Browser->>Proxy: TSRequest (NTLM Token) (WS Binary)
-        Proxy->>RDP: TSRequest (via TLS)
-        RDP->>Proxy: TSRequest (Challenge) (via TLS)
-        Proxy->>Browser: TSRequest (WS Binary)
-    end
-
-    Browser->>Proxy: TSRequest (Final + auth_info) (WS Binary)
-    Proxy->>RDP: TSRequest (via TLS)
-
-    Note over Browser: Connector → BasicSettingsExchange
-    Note over Browser,RDP: Normal RDP session (all traffic via TLS tunnel)
-```
-
-## Build Verification
-
-| Component | Status | Notes |
-|---|---|---|
-| WASM (`--release`) | ✅ Exit 0 | 3 warnings (dead code, unused doc comment) |
-| Server (`--release`) | ✅ Exit 0 | Clean |
-| Full `build-windows.ps1` | ✅ Exit 0 | End-to-end verified |
-
-## How to Test
-
-1. **Build**: `.\scripts\build-windows.ps1`
-2. **Run**: `.\target\release\server.exe --port 8080 --rdp-target localhost:3389`
-3. **Connect** via browser: `http://localhost:8080`
-4. Enter username/password/domain → click Connect
-5. **Expected console logs** (if NLA is enabled on target):
-   ```
-   Security upgrade — requesting TLS from proxy...
-   TLS upgrade complete — server cert: XXX bytes
-   CredSSP: starting NTLM authentication...
-   CredSSP round 1
-   CredSSP round 2
-   CredSSP round 3
-   CredSSP: handshake complete
-   CredSSP: authentication successful!
-   Connector state: BasicSettingsExchangeSendInitial
-   ...
-   RDP connected!
-   ```
-
-> [!NOTE]
-> If the RDP target has NLA disabled, the connector will skip directly to BasicSettingsExchange (no TLS upgrade or CredSSP occurs). The code handles both paths.
+**H.264 not activating** — RDPGFX only works on Windows hosts. Enable the toggle under Advanced settings, and make sure the browser is Chrome or Edge (WebCodecs H.264 is not available in Firefox). The HUD "Video" row shows which codec is active.
