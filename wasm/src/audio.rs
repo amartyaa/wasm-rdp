@@ -17,12 +17,13 @@ pub struct WasmRdpsndHandler {
 
 impl WasmRdpsndHandler {
     pub fn new(enable_opus: bool, enable_aac: bool) -> Self {
-        // Advertise compressed codecs only — PCM is deliberately excluded.
-        // PCM requires synchronous deinterleaving on the main WASM thread for every
-        // packet (~50/sec), which competes with graphics decoding and makes video
-        // sessions unusable. If neither compressed codec is available, we still
-        // create the handler (RDPSND channel opens) but the server will send nothing
-        // it can encode — effectively silent, which is preferable to PCM's overhead.
+        // Advertise compressed codecs first (a server that supports them prefers
+        // them), then PCM as the universal fallback. Standard Windows and xrdp
+        // only speak PCM over RDPSND — Opus/AAC are non-standard formats our
+        // vendored crate adds — so without PCM there is no common format and the
+        // server sends nothing (silent). PCM is deinterleaved in JS and handed to
+        // the AudioWorklet (off the main thread), so the per-packet cost that once
+        // motivated dropping it no longer applies.
         let mut supported_tags = Vec::new();
         if enable_aac {
             supported_tags.push(WaveFormat::AAC_MS);
@@ -30,6 +31,7 @@ impl WasmRdpsndHandler {
         if enable_opus {
             supported_tags.push(WaveFormat::OPUS);
         }
+        supported_tags.push(WaveFormat::PCM);
         Self { supported_tags }
     }
 }
