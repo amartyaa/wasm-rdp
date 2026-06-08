@@ -213,9 +213,9 @@ impl Session {
                     desktop_height,
                     fps_cap,
                 ).await {
-                    Ok(()) => {
+                    Ok(tag) => {
                         log("RDP session ended");
-                        "user_disconnect"
+                        tag
                     }
                     Err(e) => {
                         log_error(&format!("RDP session error: {e:#}"));
@@ -718,7 +718,7 @@ async fn run_session(
     width: u16,
     height: u16,
     fps_cap: u32,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<&'static str> {
     // Minimum ms between canvas paints (0 = uncapped / display-rate).
     // Reset the timer so a fresh session never incorrectly skips the first frame.
     let frame_min_ms: f64 = if fps_cap > 0 && fps_cap < 300 {
@@ -985,16 +985,30 @@ async fn run_session(
                         );
                     }
                 }
-                ActiveStageOutput::Terminate(_reason) => {
-                    log("RDP session terminated by server");
-                    return Ok(());
+                ActiveStageOutput::Terminate(reason) => {
+                    use ironrdp::session::GracefulDisconnectReason as Gdr;
+                    log(&format!("RDP session terminated by server: {reason}"));
+                    // Classify so JS can decide whether to reconnect. A server-
+                    // initiated disconnect — logoff, admin action, or (critically)
+                    // eviction by a NEW connection to the same single-session host —
+                    // must NOT trigger reconnect: reconnecting evicts whoever
+                    // connected after us, and the two clients ping-pong, spiking the
+                    // connection count until the host falls over.
+                    let tag = match &reason {
+                        Gdr::Other(desc) if desc.contains("Another user connected") => "session_replaced",
+                        Gdr::UserInitiated => "user_disconnect",
+                        _ => "server_disconnect",
+                    };
+                    return Ok(tag);
                 }
                 _ => {}
             }
         }
     }
 
-    Ok(())
+    // Reached when the input channel closes (Session handle dropped) — an app-side
+    // teardown, treated like a user disconnect (no reconnect).
+    Ok("user_disconnect")
 }
 
 /// Parse the flat monitor array from JS (`[left, top, width, height, primary]`

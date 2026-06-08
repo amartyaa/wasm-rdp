@@ -255,6 +255,13 @@ let reconnectAttempt = 0;
 let reconnectTimer = null;
 const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_DELAYS = [2000, 4000, 8000, 16000, 32000]; // exponential backoff
+// Flap detection: a session that drops almost immediately after connecting is a
+// sign of a takeover war (another user keeps evicting us on a single-session
+// host) — reconnecting fast just hammers the host. Count such "flaps" and stop.
+let connectedAt = 0;          // Date.now() when the current session went live
+let flapCount = 0;            // consecutive connect→drop-too-soon cycles
+const FLAP_WINDOW_MS = 12000; // a session shorter than this counts as a flap
+const MAX_FLAPS = 2;          // stop reconnecting after this many flaps
 
 // ── AT-101 Scancode Map ──────────────────────────────────
 // Maps KeyboardEvent.code → [scancode, isExtended]
@@ -312,6 +319,7 @@ loginForm.addEventListener('submit', async (e) => {
 
     setConnecting(true);
     hideError();
+    flapCount = 0; // fresh user-initiated connect — clean slate for flap detection
 
     try {
         // Multi-monitor: acquire screen details FIRST, while the click's
@@ -402,6 +410,7 @@ async function doConnect(username, password, domain) {
     savedCredentials = { username, password, domain };
     isUserDisconnect = false;
     reconnectAttempt = 0;
+    connectedAt = Date.now();
 
     // Connected — switch to canvas view
     loginScreen.hidden = true;
@@ -1039,6 +1048,7 @@ function cancelReconnect() {
         reconnectTimer = null;
     }
     reconnectAttempt = 0;
+    flapCount = 0;
 }
 
 async function attemptReconnect() {
@@ -1094,18 +1104,53 @@ btnCancelReconnect.addEventListener('click', () => {
 // Called by WASM when the RDP session ends
 window.__rdp_session_ended = function(reason) {
     console.log('Session ended, reason:', reason);
+    session = null;
+
+    // Server evicted us because a new connection took over this machine. On a
+    // single-session host (Windows client, same xrdp user) reconnecting would
+    // evict whoever connected after us — the two clients ping-pong and the flood
+    // of connections can crash the host. Exit gracefully with a warning instead.
+    if (reason === 'session_replaced' && !isUserDisconnect) {
+        cancelReconnect();
+        cleanupSession();
+        showError('Your session was taken over by a new connection to this machine. Not reconnecting.');
+        return;
+    }
+
+    // Other server-initiated disconnects (logoff, admin action) — the host wanted
+    // us gone, so don't fight it. Back to login, no reconnect.
+    if (reason === 'server_disconnect' && !isUserDisconnect) {
+        cancelReconnect();
+        cleanupSession();
+        showError('The remote host ended the session.');
+        return;
+    }
+
     if (reason === 'connection_lost' && savedCredentials && !isUserDisconnect) {
-        // Unexpected disconnect — try to reconnect
-        session = null;
-        // Close frozen secondary windows during the backoff; they're re-opened
-        // by the reconnect's doConnect if multi-monitor is still in use.
+        // If the session dropped almost immediately after connecting, treat it as
+        // a flap (likely a takeover war or a host that keeps rejecting us) and
+        // stop after a couple — reconnecting fast only makes it worse.
+        const uptime = Date.now() - connectedAt;
+        if (uptime < FLAP_WINDOW_MS) {
+            flapCount++;
+            if (flapCount >= MAX_FLAPS) {
+                cancelReconnect();
+                cleanupSession();
+                showError('The connection keeps dropping right after connecting — another session may have taken over this machine, or the host is unavailable.');
+                return;
+            }
+        } else {
+            flapCount = 0; // a stable session dropped — a genuine network blip
+        }
+        // Unexpected disconnect — try to reconnect. Close frozen secondary windows
+        // during the backoff; the reconnect's doConnect re-opens them if multi-
+        // monitor is still in use.
         teardownMonitorWindows();
         reconnectOverlay.hidden = false;
         toolbar.hidden = true;
         attemptReconnect();
     } else {
         // User-initiated or unrecoverable — go to login
-        session = null;
         cleanupSession();
     }
 };
