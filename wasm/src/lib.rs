@@ -40,7 +40,6 @@ pub async fn connect(
     allow_wallpaper: bool,
     allow_themes: bool,
     allow_animations: bool,
-    enable_gfx: bool,
 ) -> Result<session::Session, JsValue> {
     session::Session::connect(
         ws_url, username, password, domain, width, height, canvas_id,
@@ -48,7 +47,7 @@ pub async fn connect(
         enable_text_clipboard, enable_file_clipboard,
         fps_cap, enable_audio,
         enable_font_smoothing, disable_cursor_effects,
-        allow_wallpaper, allow_themes, allow_animations, enable_gfx,
+        allow_wallpaper, allow_themes, allow_animations,
     )
     .await
     .map_err(|e| JsValue::from_str(&format!("{e:#}")))
@@ -142,55 +141,6 @@ pub(crate) fn notify_audio_data(
             args.push(&wasm_bindgen::JsValue::from(bits_per_sample));
             args.push(&js_sys::Uint8Array::from(data).into());
             args.push(&js_sys::Uint8Array::from(extradata).into());
-            let _ = func.apply(&wasm_bindgen::JsValue::NULL, &args);
-        }
-    });
-}
-
-/// Called from session.rs (EGFX handler) with a raw AVC420 H.264 frame in
-/// passthrough mode. Forwards the undecoded bitstream + output geometry to JS,
-/// which decodes via WebCodecs `VideoDecoder` and draws to the target canvas.
-/// `data` is AVC format (4-byte big-endian length-prefixed NAL units).
-/// Caches the JS function reference to avoid per-frame Reflect::get lookups.
-pub(crate) fn notify_h264_data(
-    surface_id: u16,
-    origin_x: u32,
-    origin_y: u32,
-    width: u16,
-    height: u16,
-    data: &[u8],
-) {
-    use std::cell::RefCell;
-    thread_local! {
-        static CACHED_FN: RefCell<Option<js_sys::Function>> = RefCell::new(None);
-        static LOOKED_UP: RefCell<bool> = RefCell::new(false);
-    }
-    CACHED_FN.with(|cell| {
-        let mut cached = cell.borrow_mut();
-        if cached.is_none() {
-            LOOKED_UP.with(|looked| {
-                if !*looked.borrow() {
-                    *looked.borrow_mut() = true;
-                    if let Some(window) = web_sys::window() {
-                        if let Ok(func) = js_sys::Reflect::get(
-                            &wasm_bindgen::JsValue::from(window),
-                            &wasm_bindgen::JsValue::from_str("__rdp_h264_data"),
-                        ) {
-                            *cached = func.dyn_ref::<js_sys::Function>().cloned();
-                        }
-                    }
-                }
-            });
-        }
-        if let Some(func) = cached.as_ref() {
-            // 6 args — use apply() with an argument array (call4 only takes 4).
-            let args = js_sys::Array::new();
-            args.push(&wasm_bindgen::JsValue::from(surface_id));
-            args.push(&wasm_bindgen::JsValue::from(origin_x));
-            args.push(&wasm_bindgen::JsValue::from(origin_y));
-            args.push(&wasm_bindgen::JsValue::from(width));
-            args.push(&wasm_bindgen::JsValue::from(height));
-            args.push(&js_sys::Uint8Array::from(data).into());
             let _ = func.apply(&wasm_bindgen::JsValue::NULL, &args);
         }
     });

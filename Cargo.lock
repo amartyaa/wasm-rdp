@@ -1513,14 +1513,13 @@ dependencies = [
 [[package]]
 name = "ironrdp"
 version = "0.14.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "ironrdp-cliprdr",
  "ironrdp-connector",
  "ironrdp-core",
  "ironrdp-displaycontrol",
  "ironrdp-dvc",
- "ironrdp-egfx",
  "ironrdp-graphics",
  "ironrdp-input",
  "ironrdp-pdu",
@@ -1532,12 +1531,12 @@ dependencies = [
 [[package]]
 name = "ironrdp-bulk"
 version = "0.1.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 
 [[package]]
 name = "ironrdp-cliprdr"
 version = "0.5.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
@@ -1549,7 +1548,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-cliprdr-format"
 version = "0.1.4"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "ironrdp-core",
  "png",
@@ -1558,7 +1557,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-connector"
 version = "0.8.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "ironrdp-core",
  "ironrdp-error",
@@ -1576,7 +1575,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-core"
 version = "0.1.5"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "ironrdp-error",
 ]
@@ -1584,7 +1583,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-displaycontrol"
 version = "0.5.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "ironrdp-core",
  "ironrdp-dvc",
@@ -1596,7 +1595,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-dvc"
 version = "0.5.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "ironrdp-core",
  "ironrdp-pdu",
@@ -1606,28 +1605,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "ironrdp-egfx"
-version = "0.1.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
-dependencies = [
- "bit_field",
- "bitflags 2.11.1",
- "ironrdp-core",
- "ironrdp-dvc",
- "ironrdp-graphics",
- "ironrdp-pdu",
- "tracing",
-]
-
-[[package]]
 name = "ironrdp-error"
 version = "0.1.3"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 
 [[package]]
 name = "ironrdp-graphics"
 version = "0.7.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "bit_field",
  "bitflags 2.11.1",
@@ -1643,7 +1628,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-input"
 version = "0.5.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "bitvec",
  "ironrdp-pdu",
@@ -1653,7 +1638,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-pdu"
 version = "0.7.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "bit_field",
  "bitflags 2.11.1",
@@ -1686,7 +1671,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-session"
 version = "0.8.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "ironrdp-bulk",
  "ironrdp-connector",
@@ -1703,7 +1688,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-svc"
 version = "0.6.0"
-source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#991bc6e4dd0c1827301b3df85c8bef769466f311"
+source = "git+https://github.com/amartyaa/IronRDP.git?branch=feat%2Fmulti-monitor-support#f728cca312436cb4bcb297408481bf94cdd160c0"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",

@@ -39,7 +39,7 @@ Open `http://localhost:8080` in Chrome or Edge. `--rdp-target` is where the rela
 
 ## Features
 
-- H.264 video via MS-RDPEGFX on Windows hosts (requires Chrome/Edge with WebCodecs; falls back to RemoteFX automatically)
+- RemoteFX graphics decoded in the browser
 - Multi-monitor support using the Window Management API
 - Audio over RDPSND — PCM, Opus, and AAC
 - Bidirectional clipboard (text and images)
@@ -54,7 +54,7 @@ The relay (`server/`) is an Axum server. The one non-trivial step is TLS: the WA
 For more detail on individual subsystems, see the `docs/` folder:
 
 - [docs/credssp.md](docs/credssp.md) — TLS upgrade and CredSSP/NTLM sequence
-- [docs/graphics.md](docs/graphics.md) — RemoteFX and H.264/RDPEGFX rendering pipeline
+- [docs/graphics.md](docs/graphics.md) — RemoteFX rendering pipeline
 - [docs/audio.md](docs/audio.md) — RDPSND negotiation and AudioWorklet playback
 - [docs/input.md](docs/input.md) — keyboard scancode mapping and mouse handling
 - [docs/clipboard.md](docs/clipboard.md) — bidirectional CLIPRDR flow
@@ -76,5 +76,3 @@ For more detail on individual subsystems, see the `docs/` folder:
 **Blank screen after connect** — check that `--rdp-target` is reachable and port 3389 is open on the target.
 
 **CredSSP auth failure** — usually a username format issue. Try `user@domain` or `DOMAIN\user` depending on whether the machine is domain-joined. The domain field on the login form is only needed for domain-joined targets; for local accounts leave it blank.
-
-**H.264 not activating** — RDPGFX only works on Windows hosts. Enable the toggle under Advanced settings, and make sure the browser is Chrome or Edge (WebCodecs H.264 is not available in Firefox). The HUD "Video" row shows which codec is active.
