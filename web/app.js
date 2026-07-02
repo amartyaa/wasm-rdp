@@ -1167,6 +1167,9 @@ function startStatsInterval() {
         const currentFps = frameCount;
         frameCount = 0;
 
+        // Active codec badge (always visible in toolbar) — live from negotiation.
+        if (session && codecBadge) codecBadge.textContent = session.video_codec;
+
         // Update HUD if visible
         if (!hudVisible || !session) return;
 
@@ -1185,7 +1188,7 @@ function startStatsInterval() {
         hudResolution.textContent = multimonInUse
             ? `${session.width}×${session.height} (${monitorPopups.length + 1} mon)`
             : `${session.width}×${session.height}`;
-        hudCodec.textContent = 'RFX';
+        hudCodec.textContent = session.video_codec;
 
         // Proxy latency (browser ↔ Rust server HTTP)
         const pingStart = performance.now();

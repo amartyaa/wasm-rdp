@@ -12,11 +12,15 @@ codegen-units = 1
 panic = "abort"
 
 [patch."https://github.com/Devolutions/IronRDP.git"]
- ironrdp-session = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support" }
- ironrdp         = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support" }
- ironrdp-core    = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support" }
- ironrdp-cliprdr-format = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support" }
-# Local-path patch (frame-marker dev) — re-enable to iterate on the fork locally:
+# Git patch (shipping): pinned to a specific fork commit for reproducible
+# builds off this machine (e.g. the Windows VM). To iterate on the fork
+# locally instead, comment these out and use the local-path patch below
+# (see ../rdp-reference/IronRDP-fork and scripts/ dev notes).
+ironrdp-session = { git = "https://github.com/amartyaa/IronRDP.git", rev = "b6ceab04d541c8d7bb0b0fe26b0fb2c200337aac" }
+ironrdp         = { git = "https://github.com/amartyaa/IronRDP.git", rev = "b6ceab04d541c8d7bb0b0fe26b0fb2c200337aac" }
+ironrdp-core    = { git = "https://github.com/amartyaa/IronRDP.git", rev = "b6ceab04d541c8d7bb0b0fe26b0fb2c200337aac" }
+ironrdp-cliprdr-format = { git = "https://github.com/amartyaa/IronRDP.git", rev = "b6ceab04d541c8d7bb0b0fe26b0fb2c200337aac" }
+# Local-path patch (fork dev):
 # ironrdp-session = { path = "../rdp-reference/IronRDP-fork/crates/ironrdp-session" }
 # ironrdp = { path = "../rdp-reference/IronRDP-fork/crates/ironrdp" }
 # ironrdp-core = { path = "../rdp-reference/IronRDP-fork/crates/ironrdp-core" }

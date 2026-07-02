@@ -25,6 +25,585 @@ use crate::canvas::Canvas;
 use crate::framed::WasmFramed;
 use crate::{log, log_error};
 
+// ===== EGFX graphics pipeline (MS-RDPEGFX) — RFX-Progressive over WASM =====
+// On a GPU-less Windows host the graphics pipeline DVC delivers RFX-Progressive
+// (WireToSurface2) instead of the legacy RFX fast-path. We advertise EGFX **V8
+// only** (no AVC) so the server always picks progressive — there's no GPU to
+// H.264-encode, and we have no WebCodecs path here. The progressive codec is
+// decoded on the WASM thread (`ironrdp_graphics::rfx_progressive`) and blitted
+// straight to the shared monitor canvas(es); when EGFX is active the legacy
+// GraphicsUpdate path goes quiet, so this handler is the sole renderer.
+// xrdp ignores the GFX flag entirely and stays on legacy RFX — no regression.
+
+use std::collections::HashMap;
+use ironrdp::graphics::rfx_progressive::ProgressiveDecoder;
+
+/// Per-EGFX-surface render state owned by the graphics-pipeline handler.
+struct GfxSurface {
+    decoder: ProgressiveDecoder,
+    /// RGBA framebuffer for this surface (surface-local, `width*height*4` bytes).
+    fb: Vec<u8>,
+    width: u16,
+    height: u16,
+    /// Surface position within the combined desktop (from MapSurfaceToOutput).
+    origin_x: u16,
+    origin_y: u16,
+    /// Whether this surface is mapped to the output. Windows composes in
+    /// OFFSCREEN surfaces and copies/maps them later — blitting an unmapped
+    /// surface to the canvas paints garbage over real output.
+    mapped: bool,
+}
+
+/// One bitmap-cache slot (MS-RDPEGFX 3.3.1.4). The cache is MANDATORY for a
+/// GFX client (Client Implementation Requirements) — servers save regions with
+/// SurfaceToCache and restore them later with CacheToSurface (cursor
+/// save-under, window scroll). No-oping these leaves never-painted (black)
+/// regions and cursor trails.
+struct CacheSlot {
+    width: u16,
+    height: u16,
+    data: Vec<u8>, // RGBA, width*height*4
+}
+
+/// Which video codec is actually painting, surfaced to the HUD. Defaults to the
+/// legacy RFX fast-path and flips when the EGFX pipeline delivers a frame
+/// (progressive on a GPU-less Windows host, Planar on xrdp).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum VideoCodec {
+    Rfx,
+    Progressive,
+    Planar,
+    Uncompressed,
+}
+
+impl VideoCodec {
+    fn as_str(self) -> &'static str {
+        match self {
+            VideoCodec::Rfx => "RFX",
+            VideoCodec::Progressive => "RFX-Progressive",
+            VideoCodec::Planar => "Planar",
+            VideoCodec::Uncompressed => "Uncompressed",
+        }
+    }
+}
+
+struct WasmGfxHandler {
+    /// Shared monitor canvases (same list the legacy path renders to).
+    surfaces: Rc<RefCell<Vec<Canvas>>>,
+    gfx: HashMap<u16, GfxSurface>,
+    /// Bitmap cache: slot → saved pixels. Server-managed; we just store/restore.
+    cache: HashMap<u16, CacheSlot>,
+    /// Set once the first EGFX surface exists; run_session uses it to stop the
+    /// legacy renderer from blitting its (black) DecodedImage over EGFX output.
+    egfx_active: Rc<std::cell::Cell<bool>>,
+    /// Live codec the EGFX pipeline is painting with; read by the Session HUD getter.
+    video_codec: Rc<std::cell::Cell<VideoCodec>>,
+    /// Progressive frames rendered; gates verbose first-frame logging.
+    frames: u32,
+    /// Planar/uncompressed BitmapUpdate tiles rendered; gates verbose logging.
+    bitmaps: u32,
+    /// Per-op log counters (each op type logged independently, ~first 40).
+    log_fill: u32,
+    log_s2s: u32,
+    log_cache: u32,
+    log_other: u32,
+}
+
+// SAFETY: `GraphicsPipelineHandler: Send`, but the handler holds `Rc`/web-sys
+// canvas state that is not `Send`. The wasm32 `--target web` build is strictly
+// single-threaded (no threads/atomics), and this handler is only ever created
+// and invoked on that one JS thread, so there is never cross-thread access.
+unsafe impl Send for WasmGfxHandler {}
+
+impl WasmGfxHandler {
+    fn new(
+        surfaces: Rc<RefCell<Vec<Canvas>>>,
+        egfx_active: Rc<std::cell::Cell<bool>>,
+        video_codec: Rc<std::cell::Cell<VideoCodec>>,
+    ) -> Self {
+        Self {
+            surfaces,
+            gfx: HashMap::new(),
+            cache: HashMap::new(),
+            egfx_active,
+            video_codec,
+            frames: 0,
+            bitmaps: 0,
+            log_fill: 0,
+            log_s2s: 0,
+            log_cache: 0,
+            log_other: 0,
+        }
+    }
+}
+
+impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
+    fn capabilities(&self) -> Vec<ironrdp::egfx::pdu::CapabilitySet> {
+        use ironrdp::egfx::pdu::{CapabilitiesV8Flags, CapabilitySet};
+        // Advertise V8 only (no AVC). A GPU-less host then selects RFX-Progressive;
+        // a GPU host would otherwise send H.264 we can't decode here.
+        //
+        // SMALL_CACHE: the bitmap cache is MANDATORY per MS-RDPEGFX (there is no
+        // opt-out flag — empty flags still mean "full 100MB cache"); SMALL_CACHE
+        // just bounds it. We implement the cache below.
+        log("[EGFX] graphics channel opened — advertising V8 (RFX-Progressive, no AVC, small cache)");
+        vec![CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::SMALL_CACHE,
+        }]
+    }
+
+    fn on_capabilities_confirmed(&mut self, caps: &ironrdp::egfx::pdu::CapabilitySet) {
+        log(&format!("[EGFX] capabilities confirmed by server: {caps:?}"));
+    }
+
+    fn on_reset_graphics(&mut self, width: u32, height: u32) {
+        log(&format!("[EGFX] reset graphics {width}x{height} — clearing {} surface(s)", self.gfx.len()));
+        self.gfx.clear();
+    }
+
+    fn on_surface_created(&mut self, surface: &ironrdp::egfx::client::Surface) {
+        log(&format!(
+            "[EGFX] surface created id={} {}x{} fmt={:?}",
+            surface.id, surface.width, surface.height, surface.pixel_format
+        ));
+        let w = surface.width;
+        let h = surface.height;
+        self.gfx.insert(
+            surface.id,
+            GfxSurface {
+                decoder: ProgressiveDecoder::new(w, h),
+                fb: vec![0u8; usize::from(w) * usize::from(h) * 4],
+                width: w,
+                height: h,
+                origin_x: 0,
+                origin_y: 0,
+                mapped: false,
+            },
+        );
+        // EGFX now owns rendering — the legacy DecodedImage path must stop
+        // painting (its framebuffer is black; blitting it stamps over us).
+        self.egfx_active.set(true);
+    }
+
+    fn on_surface_deleted(&mut self, surface_id: u16) {
+        log(&format!("[EGFX] surface deleted id={surface_id}"));
+        self.gfx.remove(&surface_id);
+    }
+
+    fn on_surface_mapped(&mut self, surface_id: u16, origin_x: u32, origin_y: u32) {
+        log(&format!("[EGFX] surface {surface_id} mapped to output ({origin_x},{origin_y})"));
+        if let Some(s) = self.gfx.get_mut(&surface_id) {
+            s.origin_x = origin_x as u16;
+            s.origin_y = origin_y as u16;
+            s.mapped = true;
+            // The surface may have been fully composed offscreen before being
+            // mapped — present its current contents now.
+            let full = [ironrdp::pdu::geometry::InclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: s.width.saturating_sub(1),
+                bottom: s.height.saturating_sub(1),
+            }];
+            blit_rects(&self.surfaces, &s.fb, s.width, s.height, s.origin_x, s.origin_y, &full);
+            crate::notify_frame();
+        }
+    }
+
+    fn on_map_surface_to_scaled_output(&mut self, pdu: &ironrdp::egfx::pdu::MapSurfaceToScaledOutputPdu) {
+        // Treat like a plain map; we don't scale (target size is logged so a
+        // mismatch is visible in testing).
+        log(&format!(
+            "[EGFX] surface {} mapped to SCALED output ({},{}) target {}x{} — rendering unscaled",
+            pdu.surface_id, pdu.output_origin_x, pdu.output_origin_y, pdu.target_width, pdu.target_height
+        ));
+        self.on_surface_mapped(pdu.surface_id, pdu.output_origin_x, pdu.output_origin_y);
+    }
+
+    fn on_progressive_data(
+        &mut self,
+        surface_id: u16,
+        _origin_x: u32,
+        _origin_y: u32,
+        _width: u16,
+        _height: u16,
+        data: &[u8],
+    ) {
+        let Some(s) = self.gfx.get_mut(&surface_id) else {
+            log(&format!("[EGFX] progressive data for unknown surface {surface_id} ({} bytes)", data.len()));
+            return;
+        };
+
+        let stride = usize::from(s.width) * 4;
+        let update = match s.decoder.decode(data, &mut s.fb, stride) {
+            Ok(u) => u,
+            Err(e) => {
+                log_error(&format!("[EGFX] progressive decode failed (surface {surface_id}): {e}"));
+                return;
+            }
+        };
+        self.video_codec.set(VideoCodec::Progressive);
+
+        // Verbose first-frame diagnostics + ALWAYS log any tile that failed to
+        // decode (these are the black-region / cursor-trail suspects).
+        if self.frames < 5 || update.errors > 0 {
+            log(&format!(
+                "[EGFX] prog frame {} surf={surface_id} {}x{} extrap={} regions={}(rects0={}) tiles[simple={} first={} upgrade={} coeffDiff={}] dirty={} errors={} black={} firstBlack={:?} bytes={}",
+                self.frames, s.width, s.height, update.extrapolate,
+                update.regions, update.region0_rects,
+                update.tiles_simple, update.tiles_first, update.tiles_upgrade, update.coeff_diff_tiles,
+                update.dirty.len(), update.errors, update.black_tiles, update.first_black, data.len()
+            ));
+            if let Some(err) = &update.first_error {
+                log_error(&format!("[EGFX] first tile error: {err}"));
+            }
+        }
+        self.frames = self.frames.wrapping_add(1);
+
+        if update.dirty.is_empty() || !s.mapped {
+            return;
+        }
+
+        if blit_rects(&self.surfaces, &s.fb, s.width, s.height, s.origin_x, s.origin_y, &update.dirty) {
+            crate::notify_frame();
+        }
+    }
+
+    // Decoded RGBA tile from the EGFX client (RDP6 Planar — what xrdp uses — or
+    // Uncompressed). Composite into the surface framebuffer at the destination
+    // rectangle and blit to the canvas.
+    fn on_bitmap_updated(&mut self, update: &ironrdp::egfx::client::BitmapUpdate) {
+        let Some(s) = self.gfx.get_mut(&update.surface_id) else { return };
+        self.video_codec.set(
+            if matches!(update.codec_id, ironrdp::egfx::pdu::Codec1Type::Planar) {
+                VideoCodec::Planar
+            } else {
+                VideoCodec::Uncompressed
+            },
+        );
+        let dx = usize::from(update.destination_rectangle.left);
+        let dy = usize::from(update.destination_rectangle.top);
+        let w = usize::from(update.width);
+        let h = usize::from(update.height);
+        let sw = usize::from(s.width);
+        let sh = usize::from(s.height);
+
+        // Sample the incoming tile: is it (near-)black? The cursor/region black
+        // artifacts on xrdp appear to come from Planar tiles, so always flag black
+        // ones (with position) regardless of frame count.
+        let is_black = {
+            const T: u8 = 10;
+            let mut black = !update.data.is_empty();
+            'outer: for sy in [4usize, h / 2, h.saturating_sub(4)] {
+                for sx in [4usize, w / 2, w.saturating_sub(4)] {
+                    let o = (sy * w + sx) * 4;
+                    if o + 2 < update.data.len()
+                        && (update.data[o] > T || update.data[o + 1] > T || update.data[o + 2] > T)
+                    {
+                        black = false;
+                        break 'outer;
+                    }
+                }
+            }
+            black
+        };
+        if self.bitmaps < 6 {
+            log(&format!(
+                "[EGFX] bitmap update surf={} codec={:?} at ({dx},{dy}) {w}x{h} black={is_black} bytes={}",
+                update.surface_id, update.codec_id, update.data.len()
+            ));
+        }
+        self.bitmaps = self.bitmaps.wrapping_add(1);
+
+        // NOTE: black tiles are painted as-is. xrdp deliberately clears regions to
+        // black (513-byte all-black RLE planar) before painting content and relies
+        // on the bitmap cache to restore saved pixels afterwards — now that the
+        // cache is implemented the sequence resolves correctly, and skipping black
+        // would break genuinely-black content (e.g. terminals).
+
+        // Copy the w×h RGBA tile into the surface framebuffer, clipped to bounds.
+        let cw = w.min(sw.saturating_sub(dx));
+        for row in 0..h {
+            let sy = dy + row;
+            if sy >= sh {
+                break;
+            }
+            let src_off = row * w * 4;
+            let dst_off = (sy * sw + dx) * 4;
+            if src_off + cw * 4 <= update.data.len() && dst_off + cw * 4 <= s.fb.len() {
+                s.fb[dst_off..dst_off + cw * 4].copy_from_slice(&update.data[src_off..src_off + cw * 4]);
+            }
+        }
+
+        if !s.mapped {
+            return;
+        }
+        let dirty = [ironrdp::pdu::geometry::InclusiveRectangle {
+            left: dx as u16,
+            top: dy as u16,
+            right: (dx + w).min(sw).saturating_sub(1) as u16,
+            bottom: (dy + h).min(sh).saturating_sub(1) as u16,
+        }];
+        if blit_rects(&self.surfaces, &s.fb, s.width, s.height, s.origin_x, s.origin_y, &dirty) {
+            crate::notify_frame();
+        }
+    }
+
+    fn on_solid_fill(&mut self, pdu: &ironrdp::egfx::pdu::SolidFillPdu) {
+        if self.log_fill < 40 {
+            self.log_fill += 1;
+            let c = &pdu.fill_pixel;
+            let first = pdu.rectangles.first();
+            log(&format!(
+                "[EGFX] SolidFill surf={} rgb=({},{},{}) rects={} first={:?}",
+                pdu.surface_id, c.r, c.g, c.b, pdu.rectangles.len(),
+                first.map(|r| (r.left, r.top, r.right, r.bottom))
+            ));
+        }
+        let Some(s) = self.gfx.get_mut(&pdu.surface_id) else { return };
+        let c = &pdu.fill_pixel;
+        let rgba = [c.r, c.g, c.b, 0xFF];
+        let sw = usize::from(s.width);
+        let sh = usize::from(s.height);
+
+        let mut dirty = Vec::with_capacity(pdu.rectangles.len());
+        for rect in &pdu.rectangles {
+            let x0 = usize::from(rect.left).min(sw);
+            let y0 = usize::from(rect.top).min(sh);
+            let x1 = usize::from(rect.right).min(sw);
+            let y1 = usize::from(rect.bottom).min(sh);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            for y in y0..y1 {
+                let row = y * sw * 4;
+                for x in x0..x1 {
+                    let off = row + x * 4;
+                    s.fb[off..off + 4].copy_from_slice(&rgba);
+                }
+            }
+            dirty.push(ironrdp::pdu::geometry::InclusiveRectangle {
+                left: x0 as u16,
+                top: y0 as u16,
+                right: (x1 - 1) as u16,
+                bottom: (y1 - 1) as u16,
+            });
+        }
+        if s.mapped && blit_rects(&self.surfaces, &s.fb, s.width, s.height, s.origin_x, s.origin_y, &dirty) {
+            crate::notify_frame();
+        }
+    }
+
+    fn on_surface_to_surface(&mut self, pdu: &ironrdp::egfx::pdu::SurfaceToSurfacePdu) {
+        if self.log_s2s < 40 {
+            self.log_s2s += 1;
+            let r = &pdu.source_rectangle;
+            log(&format!(
+                "[EGFX] SurfaceToSurface {}->{} src=({},{},{},{}) destPts={} first={:?}",
+                pdu.source_surface_id, pdu.destination_surface_id,
+                r.left, r.top, r.right, r.bottom, pdu.destination_points.len(),
+                pdu.destination_points.first().map(|p| (p.x, p.y))
+            ));
+        }
+
+        let src = &pdu.source_rectangle;
+        let src_x = usize::from(src.left);
+        let src_y = usize::from(src.top);
+        let rect_w = usize::from(src.right).saturating_sub(src_x);
+        let rect_h = usize::from(src.bottom).saturating_sub(src_y);
+
+        // Snapshot the source region into a temp buffer. Needed for overlapping
+        // same-surface copies (scroll), and it sidesteps the double-borrow for
+        // cross-surface copies (Windows composes via offscreen surfaces).
+        let (tmp, copy_w, copy_h) = {
+            let Some(src_s) = self.gfx.get(&pdu.source_surface_id) else { return };
+            let ssw = usize::from(src_s.width);
+            let ssh = usize::from(src_s.height);
+            let copy_w = rect_w.min(ssw.saturating_sub(src_x));
+            let copy_h = rect_h.min(ssh.saturating_sub(src_y));
+            if copy_w == 0 || copy_h == 0 {
+                return;
+            }
+            let mut tmp = vec![0u8; copy_w * copy_h * 4];
+            for row in 0..copy_h {
+                let s_off = ((src_y + row) * ssw + src_x) * 4;
+                let t_off = row * copy_w * 4;
+                tmp[t_off..t_off + copy_w * 4].copy_from_slice(&src_s.fb[s_off..s_off + copy_w * 4]);
+            }
+            (tmp, copy_w, copy_h)
+        };
+
+        let Some(s) = self.gfx.get_mut(&pdu.destination_surface_id) else { return };
+        let sw = usize::from(s.width);
+        let sh = usize::from(s.height);
+
+        let mut dirty = Vec::with_capacity(pdu.destination_points.len());
+        for p in &pdu.destination_points {
+            let dx = usize::from(p.x);
+            let dy = usize::from(p.y);
+            let w = copy_w.min(sw.saturating_sub(dx));
+            let h = copy_h.min(sh.saturating_sub(dy));
+            if w == 0 || h == 0 {
+                continue;
+            }
+            for row in 0..h {
+                let t_off = row * copy_w * 4;
+                let d_off = ((dy + row) * sw + dx) * 4;
+                s.fb[d_off..d_off + w * 4].copy_from_slice(&tmp[t_off..t_off + w * 4]);
+            }
+            dirty.push(ironrdp::pdu::geometry::InclusiveRectangle {
+                left: dx as u16,
+                top: dy as u16,
+                right: (dx + w - 1) as u16,
+                bottom: (dy + h - 1) as u16,
+            });
+        }
+        if s.mapped && blit_rects(&self.surfaces, &s.fb, s.width, s.height, s.origin_x, s.origin_y, &dirty) {
+            crate::notify_frame();
+        }
+    }
+
+    fn on_frame_complete(&mut self, _frame_id: u32) {}
+
+    // ── Bitmap cache (MANDATORY per MS-RDPEGFX Client Implementation
+    // Requirements). The server saves surface regions to slots and restores them
+    // later — cursor save-under on xrdp, scroll/window-move on Windows. ──
+
+    fn on_surface_to_cache(&mut self, pdu: &ironrdp::egfx::pdu::SurfaceToCachePdu) {
+        let Some(s) = self.gfx.get(&pdu.surface_id) else { return };
+        let sw = usize::from(s.width);
+        let sh = usize::from(s.height);
+        let r = &pdu.source_rectangle;
+        let x0 = usize::from(r.left).min(sw);
+        let y0 = usize::from(r.top).min(sh);
+        let x1 = usize::from(r.right).min(sw);
+        let y1 = usize::from(r.bottom).min(sh);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let w = x1 - x0;
+        let h = y1 - y0;
+        let mut data = vec![0u8; w * h * 4];
+        for row in 0..h {
+            let s_off = ((y0 + row) * sw + x0) * 4;
+            let d_off = row * w * 4;
+            data[d_off..d_off + w * 4].copy_from_slice(&s.fb[s_off..s_off + w * 4]);
+        }
+        if self.log_cache < 60 {
+            self.log_cache += 1;
+            log(&format!(
+                "[EGFX] SurfaceToCache surf={} slot={} rect=({x0},{y0} {w}x{h})",
+                pdu.surface_id, pdu.cache_slot
+            ));
+        }
+        self.cache.insert(
+            pdu.cache_slot,
+            CacheSlot {
+                width: w as u16,
+                height: h as u16,
+                data,
+            },
+        );
+    }
+
+    fn on_cache_to_surface(&mut self, pdu: &ironrdp::egfx::pdu::CacheToSurfacePdu) {
+        let Some(entry) = self.cache.get(&pdu.cache_slot) else {
+            log(&format!(
+                "[EGFX] CacheToSurface: slot {} is EMPTY (surf={}) — region will be missing",
+                pdu.cache_slot, pdu.surface_id
+            ));
+            return;
+        };
+        let Some(s) = self.gfx.get_mut(&pdu.surface_id) else { return };
+        let sw = usize::from(s.width);
+        let sh = usize::from(s.height);
+        let cw = usize::from(entry.width);
+        let ch = usize::from(entry.height);
+
+        if self.log_cache < 60 {
+            self.log_cache += 1;
+            log(&format!(
+                "[EGFX] CacheToSurface slot={} -> surf={} {}x{} at {:?}",
+                pdu.cache_slot,
+                pdu.surface_id,
+                cw,
+                ch,
+                pdu.destination_points.first().map(|p| (p.x, p.y))
+            ));
+        }
+
+        let mut dirty = Vec::with_capacity(pdu.destination_points.len());
+        for p in &pdu.destination_points {
+            let dx = usize::from(p.x);
+            let dy = usize::from(p.y);
+            let w = cw.min(sw.saturating_sub(dx));
+            let h = ch.min(sh.saturating_sub(dy));
+            if w == 0 || h == 0 {
+                continue;
+            }
+            for row in 0..h {
+                let c_off = row * cw * 4;
+                let d_off = ((dy + row) * sw + dx) * 4;
+                s.fb[d_off..d_off + w * 4].copy_from_slice(&entry.data[c_off..c_off + w * 4]);
+            }
+            dirty.push(ironrdp::pdu::geometry::InclusiveRectangle {
+                left: dx as u16,
+                top: dy as u16,
+                right: (dx + w - 1) as u16,
+                bottom: (dy + h - 1) as u16,
+            });
+        }
+        if s.mapped && blit_rects(&self.surfaces, &s.fb, s.width, s.height, s.origin_x, s.origin_y, &dirty) {
+            crate::notify_frame();
+        }
+    }
+
+    fn on_evict_cache_entry(&mut self, pdu: &ironrdp::egfx::pdu::EvictCacheEntryPdu) {
+        self.cache.remove(&pdu.cache_slot);
+    }
+
+    fn on_unhandled_pdu(&mut self, pdu: &ironrdp::egfx::pdu::GfxPdu) {
+        if self.log_other < 30 {
+            self.log_other += 1;
+            log(&format!("[EGFX] unhandled PDU: {pdu:?}"));
+        }
+    }
+
+    fn on_close(&mut self) {
+        log("[EGFX] graphics channel closed");
+    }
+}
+
+/// Blit surface-local dirty rectangles to every monitor canvas. Rects are
+/// translated into combined-desktop coordinates by the surface's output origin;
+/// each canvas clips to its own monitor rect. Returns whether anything painted.
+fn blit_rects(
+    surfaces: &Rc<RefCell<Vec<Canvas>>>,
+    fb: &[u8],
+    sw: u16,
+    sh: u16,
+    ox: u16,
+    oy: u16,
+    rects: &[ironrdp::pdu::geometry::InclusiveRectangle],
+) -> bool {
+    let mut painted = false;
+    let mut canvases = surfaces.borrow_mut();
+    for r in rects {
+        let region = ironrdp::pdu::geometry::InclusiveRectangle {
+            left: r.left.saturating_add(ox),
+            top: r.top.saturating_add(oy),
+            right: r.right.saturating_add(ox),
+            bottom: r.bottom.saturating_add(oy),
+        };
+        for canvas in canvases.iter_mut() {
+            if canvas.draw_rgba(fb, sw, sh, ox, oy, region.clone()).is_ok() {
+                painted = true;
+            }
+        }
+    }
+    painted
+}
+// ===== END EGFX graphics pipeline =====
+
 /// An active RDP session handle exposed to JavaScript.
 #[wasm_bindgen]
 pub struct Session {
@@ -36,6 +615,8 @@ pub struct Session {
     /// Render surfaces, one per monitor, shared with the session loop. JS adds
     /// popup-window surfaces here for multi-monitor; the rAF paint iterates them.
     surfaces: Rc<RefCell<Vec<Canvas>>>,
+    /// Live video codec, updated by the EGFX handler; surfaced to the HUD.
+    video_codec: Rc<std::cell::Cell<VideoCodec>>,
 }
 
 /// Bandwidth statistics shared between the session, framed reader, and writer.
@@ -119,11 +700,18 @@ impl Session {
         }
         log("WebSocket connected to proxy");
 
+        // Advertise the MS-RDPEGFX graphics pipeline so a GPU-less Windows host
+        // delivers RFX-Progressive. TODO(Phase 4): gate behind a UI toggle; on
+        // during dev so the progressive path is exercised end-to-end. (xrdp
+        // ignores the flag and stays on legacy RFX — no effect there.)
+        let enable_gfx = true;
+
         // Build IronRDP connector config
         let config = build_connector_config(
             username.clone(), password.clone(), domain.clone(), width, height,
             monitor_layout, enable_audio, enable_font_smoothing, disable_cursor_effects,
             allow_wallpaper, allow_themes, allow_animations,
+            enable_gfx,
         );
 
         // Split WebSocket for bidirectional I/O
@@ -140,6 +728,14 @@ impl Session {
         
         // Create input channel (must be done before CliprdrBackend to pass tx)
         let (input_tx, input_rx) = mpsc::unbounded();
+
+        // Set up the render surface (the main page canvas) BEFORE wiring the
+        // connector, so the EGFX graphics-pipeline handler can share it. Additional
+        // monitor surfaces are added by JS via `add_surface` for multi-monitor.
+        let (px, py, pw, ph) = primary_rect;
+        let canvas = Canvas::new(&canvas_id, px, py, pw, ph)
+            .context("Failed to initialize canvas")?;
+        let surfaces: Rc<RefCell<Vec<Canvas>>> = Rc::new(RefCell::new(vec![canvas]));
 
         let cliprdr = ironrdp::cliprdr::Cliprdr::new(Box::new(
             crate::clipboard::WasmCliprdrBackend::new(input_tx.clone(), enable_text_clipboard, enable_file_clipboard)
@@ -159,6 +755,27 @@ impl Session {
             connector
         };
 
+        // Attach the EGFX graphics pipeline over DRDYNVC when enabled. The matching
+        // `config.support_graphics_pipeline` flag tells the server we accept the
+        // pipeline; the handler decodes RFX-Progressive and renders to `surfaces`.
+        // `egfx_active` flips true on the first GFX surface; run_session then stops
+        // the legacy renderer from blitting its (black) DecodedImage over GFX output.
+        let egfx_active = Rc::new(std::cell::Cell::new(false));
+        let video_codec = Rc::new(std::cell::Cell::new(VideoCodec::Rfx));
+        let connector = if enable_gfx {
+            log("[EGFX] attaching graphics pipeline DVC (RFX-Progressive)");
+            connector.with_static_channel(
+                ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(
+                    ironrdp::egfx::client::GraphicsPipelineClient::new(
+                        Box::new(WasmGfxHandler::new(surfaces.clone(), egfx_active.clone(), video_codec.clone())),
+                        None, // no H.264 decoder — we advertise V8/progressive only
+                    ),
+                ),
+            )
+        } else {
+            connector
+        };
+
         log("Starting RDP connection sequence...");
 
         let (connection_result, framed, ws_write) = perform_connection(
@@ -172,13 +789,6 @@ impl Session {
         log(&format!(
             "RDP connected! Desktop: {desktop_width}x{desktop_height}"
         ));
-
-        // Set up the initial render surface (the main page canvas). Additional
-        // monitor surfaces are added by JS via `add_surface` for multi-monitor.
-        let (px, py, pw, ph) = primary_rect;
-        let canvas = Canvas::new(&canvas_id, px, py, pw, ph)
-            .context("Failed to initialize canvas")?;
-        let surfaces: Rc<RefCell<Vec<Canvas>>> = Rc::new(RefCell::new(vec![canvas]));
 
         // Create the writer channel
         let (writer_tx, mut writer_rx) = mpsc::unbounded::<Vec<u8>>();
@@ -212,6 +822,7 @@ impl Session {
                     desktop_width,
                     desktop_height,
                     fps_cap,
+                    egfx_active,
                 ).await {
                     Ok(tag) => {
                         log("RDP session ended");
@@ -233,6 +844,7 @@ impl Session {
             desktop_height,
             stats,
             surfaces,
+            video_codec,
         })
     }
 
@@ -314,6 +926,12 @@ impl Session {
     #[wasm_bindgen(getter)]
     pub fn tx_bytes(&self) -> f64 {
         self.stats.borrow().tx_bytes as f64
+    }
+
+    /// Active video codec label for the HUD ("RFX", "RFX-Progressive", "Planar").
+    #[wasm_bindgen(getter)]
+    pub fn video_codec(&self) -> String {
+        self.video_codec.get().as_str().to_string()
     }
     /// Request desktop resize (e.g. on fullscreen change)
     #[wasm_bindgen]
@@ -698,9 +1316,14 @@ async fn run_session(
     width: u16,
     height: u16,
     _fps_cap: u32,
+    egfx_active: Rc<std::cell::Cell<bool>>,
 ) -> anyhow::Result<&'static str> {
     let image = Rc::new(RefCell::new(DecodedImage::new(PixelFormat::RgbA32, width, height)));
     let mut active_stage = ActiveStage::new(connection_result);
+    // Diagnostic: count legacy (non-EGFX) GraphicsUpdate paints. When EGFX owns
+    // the surface these should be ZERO — any non-zero here means the legacy path
+    // is blitting its (mostly-black) DecodedImage over the EGFX content.
+    let mut legacy_paints: u32 = 0;
 
     loop {
         let outputs = select! {
@@ -843,6 +1466,20 @@ async fn run_session(
                         .context("send response frame")?;
                 }
                 ActiveStageOutput::GraphicsUpdate(region) => {
+                    // Once EGFX owns rendering, the legacy DecodedImage is black
+                    // (real content never reaches it) — blitting it would stamp
+                    // black rectangles over the GFX output. Suppress, but log so
+                    // any server that still mixes legacy updates is visible.
+                    if egfx_active.get() {
+                        if legacy_paints < 20 {
+                            log(&format!(
+                                "[LEGACY] GraphicsUpdate region=({},{},{},{}) SUPPRESSED (EGFX active)",
+                                region.left, region.top, region.right, region.bottom
+                            ));
+                        }
+                        legacy_paints = legacy_paints.wrapping_add(1);
+                        continue;
+                    }
                     let img = image.borrow();
                     let mut painted = false;
                     for surface in surfaces.borrow_mut().iter_mut() {
@@ -988,6 +1625,7 @@ fn build_connector_config(
     allow_wallpaper: bool,
     allow_themes: bool,
     allow_animations: bool,
+    enable_gfx: bool,
 ) -> connector::Config {
     let domain = if domain.is_empty() { None } else { Some(domain) };
 
@@ -1024,7 +1662,13 @@ fn build_connector_config(
         request_data: None,
         autologon: true,
         enable_audio_playback: enable_audio,
-        pointer_software_rendering: true,
+        // Render the cursor as an accelerated overlay (PointerBitmap → CSS cursor),
+        // NOT composited into the legacy DecodedImage. Software rendering draws the
+        // pointer into that framebuffer — which is black under EGFX — and emits it
+        // as a GraphicsUpdate (the original black cursor trail). As an overlay the
+        // browser positions a crisp, transparent cursor and the legacy path stays
+        // out of EGFX rendering entirely.
+        pointer_software_rendering: false,
         performance_flags: perf,
         desktop_scale_factor: 0,
         hardware_id: None,
@@ -1036,6 +1680,10 @@ fn build_connector_config(
         multitransport_flags: None,
         monitors,
         monitors_extended: Vec::new(),
+        // Advertise MS-RDPEGFX so a capable host opens the graphics DVC and
+        // delivers RFX-Progressive (GPU-less Windows) / H.264. We attach a GFX
+        // handler in run_session; without it a GFX-capable host would blank.
+        support_graphics_pipeline: enable_gfx,
     }
 }
 

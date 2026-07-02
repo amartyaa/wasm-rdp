@@ -17,6 +17,12 @@ std = []
 [dependencies]
 bitflags = "2.11"
 tracing = { version = "0.1", features = ["log"] }
-ironrdp-svc = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support", version = "0.6" }
-ironrdp-core = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support", version = "0.1", features = ["alloc"] }
-ironrdp-pdu = { git = "https://github.com/amartyaa/IronRDP.git", branch = "feat/multi-monitor-support", version = "0.7", features = ["alloc"] }
+# Pinned by `rev` (not `branch`) to match the root Cargo.toml's [patch] pin —
+# a branch ref and a rev ref to the identical commit are still different
+# Cargo SourceIds, which duplicates ironrdp-svc/-dvc/-core/-pdu in the
+# dependency graph and breaks trait bounds (SvcClientProcessor/DvcProcessor
+# "not satisfied" errors). Update this rev whenever the root pin changes.
+ironrdp-svc = { git = "https://github.com/amartyaa/IronRDP.git", rev = "b6ceab04d541c8d7bb0b0fe26b0fb2c200337aac", version = "0.6" }
+ironrdp-dvc = { git = "https://github.com/amartyaa/IronRDP.git", rev = "b6ceab04d541c8d7bb0b0fe26b0fb2c200337aac", version = "0.5" }
+ironrdp-core = { git = "https://github.com/amartyaa/IronRDP.git", rev = "b6ceab04d541c8d7bb0b0fe26b0fb2c200337aac", version = "0.1", features = ["alloc"] }
+ironrdp-pdu = { git = "https://github.com/amartyaa/IronRDP.git", rev = "b6ceab04d541c8d7bb0b0fe26b0fb2c200337aac", version = "0.7", features = ["alloc"] }

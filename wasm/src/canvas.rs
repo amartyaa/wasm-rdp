@@ -172,6 +172,91 @@ impl Canvas {
         Ok(())
     }
 
+    /// Blit a region from a raw RGBA framebuffer (used by the EGFX/RFX-Progressive
+    /// renderer, whose surface framebuffers are plain `Vec<u8>` rather than a
+    /// `DecodedImage`). `region` is in combined-desktop coordinates (inclusive
+    /// edges). The source surface occupies the combined desktop at
+    /// `(src_origin_x, src_origin_y)` with row stride `src_width * 4`; the region
+    /// is clipped to both this canvas's monitor rect and the source surface.
+    pub fn draw_rgba(
+        &mut self,
+        src: &[u8],
+        src_width: u16,
+        src_height: u16,
+        src_origin_x: u16,
+        src_origin_y: u16,
+        region: ironrdp::pdu::geometry::InclusiveRectangle,
+    ) -> anyhow::Result<()> {
+        // Intersect the region with this canvas's rect and the source surface's
+        // rect, all in combined inclusive coordinates.
+        let surf_left = u32::from(self.origin_x);
+        let surf_top = u32::from(self.origin_y);
+        let surf_right = surf_left + u32::from(self.width) - 1;
+        let surf_bottom = surf_top + u32::from(self.height) - 1;
+
+        let src_left = u32::from(src_origin_x);
+        let src_top = u32::from(src_origin_y);
+        let src_right = src_left + u32::from(src_width) - 1;
+        let src_bottom = src_top + u32::from(src_height) - 1;
+
+        let sx0 = u32::from(region.left).max(surf_left).max(src_left);
+        let sy0 = u32::from(region.top).max(surf_top).max(src_top);
+        let sx1 = u32::from(region.right).min(surf_right).min(src_right);
+        let sy1 = u32::from(region.bottom).min(surf_bottom).min(src_bottom);
+
+        if sx0 > sx1 || sy0 > sy1 {
+            return Ok(());
+        }
+
+        let w = (sx1 - sx0 + 1) as usize;
+        let h = (sy1 - sy0 + 1) as usize;
+        // Destination on this canvas = combined coord minus this canvas's origin.
+        let dx = (sx0 - surf_left) as f64;
+        let dy = (sy0 - surf_top) as f64;
+
+        let stride = usize::from(src_width) * 4;
+        let region_bytes = w * h * 4;
+
+        // Fast path: the clipped slice spans the source's full width and starts at
+        // its left edge → contiguous rows, no per-row copy (single-monitor case).
+        if w == usize::from(src_width) && sx0 == src_left {
+            let src_start = (sy0 - src_top) as usize * stride;
+            let src_end = src_start + region_bytes;
+            if src_end <= src.len() {
+                let image_data = ImageData::new_with_u8_clamped_array_and_sh(
+                    Clamped(&src[src_start..src_end]),
+                    w as u32,
+                    h as u32,
+                )
+                .map_err(|_| anyhow::anyhow!("ImageData creation failed"))?;
+                self.ctx
+                    .put_image_data(&image_data, dx, dy)
+                    .map_err(|_| anyhow::anyhow!("putImageData failed"))?;
+                return Ok(());
+            }
+        }
+
+        // Partial region: copy overlapping rows into the persistent scratch buffer.
+        self.rgba_buf.resize(region_bytes, 0);
+        let row_bytes = w * 4;
+        for row in 0..h {
+            let src_offset = (sy0 - src_top + row as u32) as usize * stride + (sx0 - src_left) as usize * 4;
+            let dst_offset = row * row_bytes;
+            if src_offset + row_bytes <= src.len() {
+                self.rgba_buf[dst_offset..dst_offset + row_bytes]
+                    .copy_from_slice(&src[src_offset..src_offset + row_bytes]);
+            }
+        }
+
+        let image_data = ImageData::new_with_u8_clamped_array_and_sh(Clamped(&self.rgba_buf), w as u32, h as u32)
+            .map_err(|_| anyhow::anyhow!("ImageData creation failed"))?;
+        self.ctx
+            .put_image_data(&image_data, dx, dy)
+            .map_err(|_| anyhow::anyhow!("putImageData failed"))?;
+
+        Ok(())
+    }
+
     pub fn set_cursor(&self, style: &str) {
         let element: &web_sys::HtmlElement = self.canvas.unchecked_ref();
         let _ = element.style().set_property("cursor", style);
