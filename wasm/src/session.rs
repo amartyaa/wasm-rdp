@@ -74,6 +74,7 @@ pub(crate) enum VideoCodec {
     Rfx,
     Progressive,
     Planar,
+    Clear,
     Uncompressed,
 }
 
@@ -83,6 +84,7 @@ impl VideoCodec {
             VideoCodec::Rfx => "RFX",
             VideoCodec::Progressive => "RFX-Progressive",
             VideoCodec::Planar => "Planar",
+            VideoCodec::Clear => "ClearCodec",
             VideoCodec::Uncompressed => "Uncompressed",
         }
     }
@@ -272,15 +274,30 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
     // Decoded RGBA tile from the EGFX client (RDP6 Planar — what xrdp uses — or
     // Uncompressed). Composite into the surface framebuffer at the destination
     // rectangle and blit to the canvas.
+    fn read_surface_rect(&self, surface_id: u16, x: u16, y: u16, width: u16, height: u16) -> Option<Vec<u8>> {
+        // Seed for ClearCodec delta decodes: return this rect's current pixels
+        // so gaps the codec doesn't repaint keep their existing content.
+        let s = self.gfx.get(&surface_id)?;
+        let (sw, sh) = (usize::from(s.width), usize::from(s.height));
+        let (x, y, w, h) = (usize::from(x), usize::from(y), usize::from(width), usize::from(height));
+        if x + w > sw || y + h > sh {
+            return None; // out of bounds — let the decoder fall back to a black seed
+        }
+        let mut out = Vec::with_capacity(w * h * 4);
+        for row in 0..h {
+            let off = ((y + row) * sw + x) * 4;
+            out.extend_from_slice(&s.fb[off..off + w * 4]);
+        }
+        Some(out)
+    }
+
     fn on_bitmap_updated(&mut self, update: &ironrdp::egfx::client::BitmapUpdate) {
         let Some(s) = self.gfx.get_mut(&update.surface_id) else { return };
-        self.video_codec.set(
-            if matches!(update.codec_id, ironrdp::egfx::pdu::Codec1Type::Planar) {
-                VideoCodec::Planar
-            } else {
-                VideoCodec::Uncompressed
-            },
-        );
+        self.video_codec.set(match update.codec_id {
+            ironrdp::egfx::pdu::Codec1Type::Planar => VideoCodec::Planar,
+            ironrdp::egfx::pdu::Codec1Type::ClearCodec => VideoCodec::Clear,
+            _ => VideoCodec::Uncompressed,
+        });
         let dx = usize::from(update.destination_rectangle.left);
         let dy = usize::from(update.destination_rectangle.top);
         let w = usize::from(update.width);
