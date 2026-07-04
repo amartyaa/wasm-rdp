@@ -434,6 +434,62 @@ async function doConnect(username, password, domain) {
     showToolbar();
 }
 
+// Completes a deferred RDP Server Redirection handoff (see the 'redirected'
+// case in __rdp_session_ended). Reuses the same connection parameters as
+// doConnect, minus username/password/domain — those come from the redirect
+// packet WASM already captured, not from saved credentials.
+//
+// ponytail: multi-monitor popups aren't reattached here (they'd need their
+// surfaces re-added to the new Session); only the primary canvas reconnects.
+// Redirection has only been exercised single-monitor so far — extend if a
+// multi-monitor GNOME headless target needs it.
+async function doConnectRedirected() {
+    // Detach the previous session's input handlers before setupInputHandlers
+    // re-adds them (same cleanup the normal reconnect path does) — otherwise
+    // every keystroke/paste fires twice after the redirect hop.
+    document.removeEventListener('keydown', onKeyDown, true);
+    document.removeEventListener('keyup', onKeyUp, true);
+    window.removeEventListener('blur', releaseAllModifiers);
+    window.removeEventListener('focus', onWindowFocus);
+    document.removeEventListener('paste', onPaste);
+    document.removeEventListener('copy', onCopy);
+    lastSyncedClipboardText = '';
+    lastWheelTime = 0; accWheelDeltaY = 0; accWheelDeltaX = 0;
+    lastFrameTimestamp = 0;
+
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const basePath = location.pathname.replace(/\/[^/]*$/, '');
+    const wsUrl = `${proto}://${location.host}${basePath}/ws`;
+
+    const codecs = audioEnabled ? await detectAudioCodecs() : { opus: false, aac: false };
+
+    session = await wasm.connect_redirected(
+        wsUrl, width, height, 'rdp-canvas',
+        codecs.opus, codecs.aac, new Int32Array(0),
+        textClipboardEnabled, fileClipboardEnabled,
+        fpsCap, audioEnabled,
+        advEnableFontSmoothing, advDisableCursorEffects,
+        advAllowWallpaper, advAllowThemes, advAllowAnimations,
+    );
+    connectedAt = Date.now();
+
+    loginScreen.hidden = true;
+    canvasContainer.hidden = false;
+    reconnectOverlay.hidden = true;
+    toolbar.hidden = false;
+
+    resBadge.textContent = `${session.width}×${session.height}`;
+    setupInputHandlers();
+    setupResizeHandler();
+    startStatsInterval();
+    if (audioEnabled) initAudioContext();
+    if (hudAudioCodec) hudAudioCodec.textContent = audioEnabled ? '--' : 'Off';
+    showToolbar();
+}
+
 function setConnecting(loading) {
     connectBtn.disabled = loading;
     btnText.hidden = loading;
@@ -1105,6 +1161,25 @@ btnCancelReconnect.addEventListener('click', () => {
 window.__rdp_session_ended = function(reason) {
     console.log('Session ended, reason:', reason);
     session = null;
+
+    // Deferred RDP Server Redirection (e.g. GNOME Remote Desktop's headless
+    // "Remote Login" mode handing off from its greeter-level daemon to the
+    // real per-user session). This is a protocol-mandated hop, not a failure —
+    // reconnect immediately with no backoff and don't count it against the
+    // normal reconnect-attempt limit (keep it distinct from the flap-detection
+    // logic below, which is about session-eviction takeover wars).
+    if (reason === 'redirected') {
+        (async () => {
+            try {
+                await doConnectRedirected();
+            } catch (err) {
+                console.error('Redirected reconnect failed:', err);
+                showError('Failed to complete the server redirect: ' + (err && err.message ? err.message : err));
+                cleanupSession();
+            }
+        })();
+        return;
+    }
 
     // Server evicted us because a new connection took over this machine. On a
     // single-session host (Windows client, same xrdp user) reconnecting would

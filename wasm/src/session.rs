@@ -23,6 +23,7 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::canvas::Canvas;
 use crate::framed::WasmFramed;
+use crate::redirect;
 use crate::{log, log_error};
 
 // ===== EGFX graphics pipeline (MS-RDPEGFX) — RFX-Progressive over WASM =====
@@ -848,6 +849,179 @@ impl Session {
         })
     }
 
+    /// Completes a deferred Server Redirection handoff (see `run_session`'s
+    /// `ActiveStageOutput::Redirect` handling, which stashes the redirect
+    /// packet's fields and returns the `"redirected"` disconnect reason). JS
+    /// calls this immediately in response, with the same connection
+    /// parameters as the original `connect()` — no username/password/domain,
+    /// since those come from the stashed redirect packet instead.
+    pub(crate) async fn connect_redirected(
+        ws_url: String,
+        width: u16,
+        height: u16,
+        canvas_id: String,
+        enable_opus: bool,
+        enable_aac: bool,
+        monitors: Vec<i32>,
+        enable_text_clipboard: bool,
+        enable_file_clipboard: bool,
+        fps_cap: u32,
+        enable_audio: bool,
+        enable_font_smoothing: bool,
+        disable_cursor_effects: bool,
+        allow_wallpaper: bool,
+        allow_themes: bool,
+        allow_animations: bool,
+    ) -> anyhow::Result<Session> {
+        let pending = PENDING_REDIRECT.with(|cell| cell.borrow_mut().take())
+            .context("connect_redirected called without a pending Server Redirection")?;
+
+        log(&format!("Reconnecting to proxy after redirect: {ws_url}"));
+
+        let monitor_layout = parse_monitor_layout(&monitors);
+        let (width, height) = if monitor_layout.is_empty() {
+            (width, height)
+        } else {
+            let (cw, ch) = combined_desktop_size(&monitor_layout);
+            (cw, ch)
+        };
+        let primary_rect = primary_surface_rect(&monitor_layout, width, height);
+
+        let ws = WebSocket::open(&ws_url).context("Failed to open WebSocket")?;
+        loop {
+            match ws.state() {
+                websocket::State::Closing | websocket::State::Closed => {
+                    anyhow::bail!("WebSocket connection failed");
+                }
+                websocket::State::Connecting => {
+                    gloo_timers::future::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                websocket::State::Open => break,
+            }
+        }
+        log("WebSocket connected to proxy");
+
+        let enable_gfx = true;
+
+        // Username/domain come from the redirect packet (UTF-16LE on the
+        // wire); password is left empty — RDSTLS already authenticated this
+        // connection, and the pre-encrypted blob in the packet can't safely
+        // be reused as a cleartext Client Info password.
+        let username = redirect::utf16le_to_string(&pending.user_name);
+        let domain = redirect::utf16le_to_string(&pending.domain);
+        let config = build_connector_config(
+            username, String::new(), domain, width, height,
+            monitor_layout, enable_audio, enable_font_smoothing, disable_cursor_effects,
+            allow_wallpaper, allow_themes, allow_animations,
+            enable_gfx,
+        );
+
+        let (ws_write, ws_read) = ws.split();
+        let stats = Rc::new(RefCell::new(SessionStats::default()));
+        let framed = WasmFramed::new(ws_read, stats.clone());
+        let socket_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3389));
+        let (input_tx, input_rx) = mpsc::unbounded();
+
+        let (px, py, pw, ph) = primary_rect;
+        let canvas = Canvas::new(&canvas_id, px, py, pw, ph)
+            .context("Failed to initialize canvas")?;
+        let surfaces: Rc<RefCell<Vec<Canvas>>> = Rc::new(RefCell::new(vec![canvas]));
+
+        let cliprdr = ironrdp::cliprdr::Cliprdr::new(Box::new(
+            crate::clipboard::WasmCliprdrBackend::new(input_tx.clone(), enable_text_clipboard, enable_file_clipboard)
+        ));
+
+        let connector = ClientConnector::new(config, socket_addr)
+            .with_static_channel(cliprdr);
+        let connector = if enable_audio {
+            let rdpsnd = ironrdp::rdpsnd::client::Rdpsnd::new(
+                Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac))
+            );
+            connector.with_static_channel(rdpsnd)
+        } else {
+            connector
+        };
+
+        let egfx_active = Rc::new(std::cell::Cell::new(false));
+        let video_codec = Rc::new(std::cell::Cell::new(VideoCodec::Rfx));
+        let connector = if enable_gfx {
+            connector.with_static_channel(
+                ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(
+                    ironrdp::egfx::client::GraphicsPipelineClient::new(
+                        Box::new(WasmGfxHandler::new(surfaces.clone(), egfx_active.clone(), video_codec.clone())),
+                        None,
+                    ),
+                ),
+            )
+        } else {
+            connector
+        };
+
+        log("[Redirect] starting redirected connection sequence...");
+
+        let (connection_result, framed, ws_write) =
+            perform_redirected_connection(connector, framed, ws_write, &pending).await?;
+
+        let desktop_width = connection_result.desktop_size.width;
+        let desktop_height = connection_result.desktop_size.height;
+
+        log(&format!("RDP reconnected after redirect! Desktop: {desktop_width}x{desktop_height}"));
+
+        let (writer_tx, mut writer_rx) = mpsc::unbounded::<Vec<u8>>();
+
+        spawn_local({
+            let mut ws_write = ws_write;
+            let stats = stats.clone();
+            async move {
+                while let Some(frame) = writer_rx.next().await {
+                    use gloo_net::websocket::Message;
+                    stats.borrow_mut().tx_bytes += frame.len() as u64;
+                    if ws_write.send(Message::Bytes(frame)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        spawn_local({
+            let writer_tx = writer_tx.clone();
+            let surfaces = surfaces.clone();
+            async move {
+                let reason = match run_session(
+                    connection_result,
+                    framed,
+                    writer_tx,
+                    input_rx,
+                    surfaces,
+                    desktop_width,
+                    desktop_height,
+                    fps_cap,
+                    egfx_active,
+                ).await {
+                    Ok(tag) => {
+                        log("RDP session ended");
+                        tag
+                    }
+                    Err(e) => {
+                        log_error(&format!("RDP session error: {e:#}"));
+                        "connection_lost"
+                    }
+                };
+                crate::notify_session_ended(reason);
+            }
+        });
+
+        Ok(Session {
+            input_tx,
+            input_db: ironrdp::input::Database::new(),
+            desktop_width,
+            desktop_height,
+            stats,
+            surfaces,
+            video_codec,
+        })
+    }
+
     /// Send a keyboard scancode event
     #[wasm_bindgen]
     pub fn send_keyboard(&mut self, scancode: u8, is_pressed: bool, is_extended: bool) {
@@ -1006,6 +1180,39 @@ impl Session {
 ///   1. We use `sspi::credssp::CredSspClient` with NTLM mode.
 ///   2. Exchange TSRequest PDUs with the RDP server through the proxy's TLS tunnel.
 ///   3. On success, mark CredSSP as done and continue with BasicSettingsExchange.
+/// Tells the proxy to upgrade its TCP connection to TLS and waits for the
+/// `tls_ready` response, returning the raw server certificate DER. Shared by
+/// the normal connection sequence (`perform_connection`) and the redirected
+/// reconnect (`redirect::perform_redirected_connection`), which both upgrade
+/// to TLS the same way — only what happens with the cert differs (CredSSP
+/// channel-binding SPKI extraction vs. a redirect-packet cert-pin check).
+async fn perform_tls_upgrade(
+    framed: &mut WasmFramed,
+    ws_write: &mut futures_util::stream::SplitSink<WebSocket, gloo_net::websocket::Message>,
+) -> anyhow::Result<Vec<u8>> {
+    log("Security upgrade — requesting TLS from proxy...");
+
+    // Tell the proxy to upgrade its TCP connection to TLS
+    use gloo_net::websocket::Message as WsMsg;
+    let cmd = r#"{"cmd":"tls_upgrade"}"#;
+    ws_write.send(WsMsg::Text(cmd.to_string()))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send tls_upgrade: {e}"))?;
+
+    // Wait for the proxy's tls_ready response (arrives as a text WS message)
+    let cert_hex = framed.read_text_message().await
+        .context("Failed to read tls_ready response")?;
+
+    // Parse the JSON response and extract the raw certificate DER
+    let Some(cert_str) = parse_tls_ready(&cert_hex) else {
+        log_error(&format!("Unexpected TLS response: {cert_hex}"));
+        anyhow::bail!("Invalid tls_ready response from proxy");
+    };
+    let cert_der = hex_decode(&cert_str)?;
+    log(&format!("TLS upgrade complete — cert DER: {} bytes", cert_der.len()));
+    Ok(cert_der)
+}
+
 async fn perform_connection(
     mut connector: ClientConnector,
     mut framed: WasmFramed,
@@ -1030,38 +1237,15 @@ async fn perform_connection(
 
         // Handle TLS security upgrade
         if connector.should_perform_security_upgrade() {
-            log("Security upgrade — requesting TLS from proxy...");
+            let cert_der = perform_tls_upgrade(&mut framed, &mut ws_write).await?;
 
-            // Tell the proxy to upgrade its TCP connection to TLS
-            use gloo_net::websocket::Message as WsMsg;
-            let cmd = r#"{"cmd":"tls_upgrade"}"#;
-            ws_write.send(WsMsg::Text(cmd.to_string()))
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to send tls_upgrade: {e}"))?;
-
-            // Wait for the proxy's tls_ready response (arrives as a text WS message)
-            let cert_hex = framed.read_text_message().await
-                .context("Failed to read tls_ready response")?;
-
-            // Parse the JSON response and extract SubjectPublicKeyInfo
-            if let Some(cert_str) = parse_tls_ready(&cert_hex) {
-                let cert_der = hex_decode(&cert_str)?;
-                log(&format!(
-                    "TLS upgrade complete — cert DER: {} bytes",
-                    cert_der.len()
-                ));
-
-                // Extract the SubjectPublicKeyInfo from the X.509 certificate.
-                // CredSSP uses the SPKI (not the full cert) for channel binding.
-                server_public_key = extract_public_key(&cert_der)?;
-                log(&format!(
-                    "Extracted SubjectPublicKeyInfo: {} bytes",
-                    server_public_key.len()
-                ));
-            } else {
-                log_error(&format!("Unexpected TLS response: {cert_hex}"));
-                anyhow::bail!("Invalid tls_ready response from proxy");
-            }
+            // Extract the SubjectPublicKeyInfo from the X.509 certificate.
+            // CredSSP uses the SPKI (not the full cert) for channel binding.
+            server_public_key = extract_public_key(&cert_der)?;
+            log(&format!(
+                "Extracted SubjectPublicKeyInfo: {} bytes",
+                server_public_key.len()
+            ));
 
             connector.mark_security_upgrade_as_done();
             continue;
@@ -1150,6 +1334,119 @@ async fn perform_connection(
             }
         }
     }
+}
+
+/// Completes a deferred RDP Server Redirection handoff (MS-RDPBCGR §2.2.13 /
+/// §2.2.17 RDSTLS) on a freshly-opened connection: hand-rolled X.224
+/// negotiation with the redirect's routing token, TLS upgrade + a best-effort
+/// certificate pin check, then the RDSTLS Capabilities/AuthRequest/AuthResponse
+/// exchange. RDSTLS replaces nego's own CredSSP phase, so once it succeeds we
+/// jump the connector's state machine straight to where a normal connection
+/// sits right after CredSSP and hand off to the ordinary `perform_connection`
+/// loop (unchanged) for MCS/capability exchange/finalization.
+async fn perform_redirected_connection(
+    mut connector: ClientConnector,
+    mut framed: WasmFramed,
+    mut ws_write: futures_util::stream::SplitSink<WebSocket, gloo_net::websocket::Message>,
+    pending: &redirect::PendingRedirect,
+) -> anyhow::Result<(ConnectionResult, WasmFramed, futures_util::stream::SplitSink<WebSocket, gloo_net::websocket::Message>)> {
+    use ironrdp::pdu::nego;
+    use ironrdp::pdu::x224::X224;
+
+    // 1. X.224 ConnectionRequest carrying the redirect's routing token instead
+    // of the usual username cookie, requesting RDSTLS.
+    let security_protocol = nego::SecurityProtocol::SSL | nego::SecurityProtocol::RDSTLS;
+    // LoadBalanceInfo arrives as the complete routing-token line
+    // ("Cookie: msts=<value>\r\n"), but IronRDP's RoutingToken encoder
+    // re-adds the prefix and CRLF itself. Pass only the bare value: grd
+    // peeks this line off the socket, strips the prefix, and parses the
+    // value as a base-10 u32 to look up the pending handover session —
+    // anything else makes it drop the connection on the spot.
+    let nego_data = pending.routing_token.as_ref().map(|token| {
+        let line = String::from_utf8_lossy(token);
+        let value = line.trim_end_matches(['\r', '\n']);
+        let value = value.strip_prefix("Cookie: msts=").unwrap_or(value);
+        nego::NegoRequestData::routing_token(value.to_owned())
+    });
+    let connection_request = nego::ConnectionRequest {
+        nego_data,
+        flags: nego::RequestFlags::empty(),
+        protocol: security_protocol,
+    };
+    let mut buf = WriteBuf::new();
+    ironrdp_core::encode_buf(&X224(connection_request), &mut buf)
+        .map_err(|e| anyhow::anyhow!("Failed to encode redirected ConnectionRequest: {e}"))?;
+    log(&format!(
+        "[Redirect] sending X.224 ConnectionRequest ({} bytes, routing token: {})",
+        buf.filled().len(),
+        pending.routing_token.is_some()
+    ));
+    ws_write
+        .send(gloo_net::websocket::Message::Bytes(buf.filled().to_vec()))
+        .await
+        .map_err(|e| anyhow::anyhow!("WebSocket send failed: {e}"))?;
+
+    // 2. Read the ConnectionConfirm and confirm RDSTLS was selected.
+    let confirm_bytes = framed
+        .read_by_hint(&ironrdp::pdu::X224_HINT)
+        .await
+        .context("Failed to read redirected ConnectionConfirm")?;
+    let confirm = ironrdp_core::decode::<X224<nego::ConnectionConfirm>>(&confirm_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to decode ConnectionConfirm: {e}"))?
+        .0;
+    let selected_protocol = match confirm {
+        nego::ConnectionConfirm::Response { protocol, .. } => protocol,
+        nego::ConnectionConfirm::Failure { code } => {
+            anyhow::bail!("Redirected connection negotiation failed: {code:?}");
+        }
+    };
+    log(&format!("[Redirect] server selected protocol: {selected_protocol:?}"));
+    if !selected_protocol.contains(nego::SecurityProtocol::RDSTLS) {
+        anyhow::bail!("Redirected server did not select RDSTLS (selected {selected_protocol:?})");
+    }
+
+    // 3. TLS upgrade (same proxy dance as a normal connection) + a best-effort
+    // certificate pin check against the redirect packet's TargetCertificate.
+    let cert_der = perform_tls_upgrade(&mut framed, &mut ws_write).await?;
+    redirect::check_cert_pin(pending.target_certificate.as_deref(), &cert_der);
+
+    // 4. RDSTLS: Capabilities (server->client) -> Authentication Request
+    // (client->server, forwarding the redirect packet's opaque credentials
+    // verbatim) -> Authentication Response (server->client).
+    let caps_bytes = framed
+        .read_exact(8)
+        .await
+        .context("Failed to read RDSTLS Capabilities PDU")?;
+    redirect::parse_capabilities(&caps_bytes)?;
+    log("[Redirect] RDSTLS capabilities OK (version 1)");
+
+    let auth_req = redirect::build_auth_request(
+        &pending.redirection_guid,
+        &pending.user_name,
+        &pending.domain,
+        &pending.password,
+    );
+    log(&format!(
+        "[Redirect] sending RDSTLS Authentication Request ({} bytes)",
+        auth_req.len()
+    ));
+    ws_write
+        .send(gloo_net::websocket::Message::Bytes(auth_req))
+        .await
+        .map_err(|e| anyhow::anyhow!("WebSocket send failed: {e}"))?;
+
+    let response_bytes = framed
+        .read_exact(10)
+        .await
+        .context("Failed to read RDSTLS Authentication Response PDU")?;
+    redirect::parse_auth_response(&response_bytes)?;
+    log("[Redirect] RDSTLS authentication succeeded");
+
+    // 5. Hand off to the ordinary post-CredSSP flow. Username/password/domain
+    // are unused by `perform_connection` once `should_perform_credssp()` can
+    // never be true again (we jumped past that state).
+    connector.state = ClientConnectorState::BasicSettingsExchangeSendInitial { selected_protocol };
+    perform_connection(connector, framed, ws_write, "", "", "").await
 }
 
 async fn perform_credssp(
@@ -1307,6 +1604,16 @@ fn extract_public_key(cert_der: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(raw_key.to_vec())
 }
 
+thread_local! {
+    /// Set when `run_session` receives a deferred Server Redirection PDU (e.g.
+    /// GNOME Remote Desktop's headless "Remote Login" handoff). JS reads the
+    /// `redirected` disconnect reason and immediately calls `connect_redirected`,
+    /// which consumes this to complete the reconnect. wasm32 is single-threaded
+    /// (see `unsafe impl Send for WasmGfxHandler` above), so a thread-local is
+    /// safe here without extra synchronization.
+    static PENDING_REDIRECT: RefCell<Option<crate::redirect::PendingRedirect>> = RefCell::new(None);
+}
+
 async fn run_session(
     connection_result: ConnectionResult,
     mut framed: WasmFramed,
@@ -1332,7 +1639,13 @@ async fn run_session(
                 match active_stage.process(&mut image.borrow_mut(), action, payload.as_ref()) {
                     Ok(outputs) => outputs,
                     Err(e) => {
-                        log_error(&format!("Ignoring PDU processing error: {e:#}"));
+                        // ponytail: temporary diagnostic to identify unhandled PDUs
+                        // (e.g. server redirection) by their raw bytes; remove once found.
+                        let hex: String = payload.iter().take(64).map(|b| format!("{b:02x}")).collect();
+                        log_error(&format!(
+                            "Ignoring PDU processing error: {e:#} | action={action:?} len={} bytes={hex}",
+                            payload.len()
+                        ));
                         Vec::new()
                     }
                 }
@@ -1527,6 +1840,21 @@ async fn run_session(
                         _ => "server_disconnect",
                     };
                     return Ok(tag);
+                }
+                ActiveStageOutput::Redirect(packet) => {
+                    log(&format!(
+                        "[Redirect] Server Redirection PDU received: session_id={} flags={:?} \
+                         has_routing_token={} has_username={} has_password={} has_cert={}",
+                        packet.session_id,
+                        packet.flags,
+                        packet.load_balance_info.is_some(),
+                        packet.user_name.is_some(),
+                        packet.password.is_some(),
+                        packet.target_certificate.is_some(),
+                    ));
+                    let pending = crate::redirect::PendingRedirect::from_packet(&packet);
+                    PENDING_REDIRECT.with(|cell| *cell.borrow_mut() = Some(pending));
+                    return Ok("redirected");
                 }
                 _ => {}
             }
