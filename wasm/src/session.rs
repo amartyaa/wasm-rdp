@@ -761,18 +761,33 @@ impl Session {
         // pipeline; the handler decodes RFX-Progressive and renders to `surfaces`.
         // `egfx_active` flips true on the first GFX surface; run_session then stops
         // the legacy renderer from blitting its (black) DecodedImage over GFX output.
+        //
+        // Audio rides DRDYNVC too: once a client advertises dynamic channels,
+        // modern servers move audio to "AUDIO_PLAYBACK_DVC" instead of the
+        // static rdpsnd channel (GNOME Remote Desktop implements only the DVC
+        // transport). The static channel above stays registered for servers
+        // that never open the dynamic one; whichever the server picks gets the
+        // traffic, the other stays silent.
         let egfx_active = Rc::new(std::cell::Cell::new(false));
         let video_codec = Rc::new(std::cell::Cell::new(VideoCodec::Rfx));
-        let connector = if enable_gfx {
-            log("[EGFX] attaching graphics pipeline DVC (RFX-Progressive)");
-            connector.with_static_channel(
-                ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(
+        let connector = if enable_gfx || enable_audio {
+            let mut drdynvc = ironrdp::dvc::DrdynvcClient::new();
+            if enable_gfx {
+                log("[EGFX] attaching graphics pipeline DVC (RFX-Progressive)");
+                drdynvc = drdynvc.with_dynamic_channel(
                     ironrdp::egfx::client::GraphicsPipelineClient::new(
                         Box::new(WasmGfxHandler::new(surfaces.clone(), egfx_active.clone(), video_codec.clone())),
                         None, // no H.264 decoder — we advertise V8/progressive only
                     ),
-                ),
-            )
+                );
+            }
+            if enable_audio {
+                log("[RDPSND] attaching audio DVC (AUDIO_PLAYBACK_DVC)");
+                drdynvc = drdynvc.with_dynamic_channel(ironrdp::rdpsnd::client::RdpsndDvcClient::new(
+                    Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac)),
+                ));
+            }
+            connector.with_static_channel(drdynvc)
         } else {
             connector
         };
@@ -942,17 +957,25 @@ impl Session {
             connector
         };
 
+        // DRDYNVC hosts both EGFX and DVC audio — same rationale as connect().
         let egfx_active = Rc::new(std::cell::Cell::new(false));
         let video_codec = Rc::new(std::cell::Cell::new(VideoCodec::Rfx));
-        let connector = if enable_gfx {
-            connector.with_static_channel(
-                ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(
+        let connector = if enable_gfx || enable_audio {
+            let mut drdynvc = ironrdp::dvc::DrdynvcClient::new();
+            if enable_gfx {
+                drdynvc = drdynvc.with_dynamic_channel(
                     ironrdp::egfx::client::GraphicsPipelineClient::new(
                         Box::new(WasmGfxHandler::new(surfaces.clone(), egfx_active.clone(), video_codec.clone())),
                         None,
                     ),
-                ),
-            )
+                );
+            }
+            if enable_audio {
+                drdynvc = drdynvc.with_dynamic_channel(ironrdp::rdpsnd::client::RdpsndDvcClient::new(
+                    Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac)),
+                ));
+            }
+            connector.with_static_channel(drdynvc)
         } else {
             connector
         };

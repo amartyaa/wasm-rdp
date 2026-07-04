@@ -8,12 +8,41 @@ mod clipboard;
 mod audio;
 mod redirect;
 
+/// Bridges IronRDP's internal `tracing` logs (which flow through the `log`
+/// facade via tracing's "log" feature) to the browser console. Info and above
+/// only — Debug would flood the console with per-PDU lines on the graphics
+/// hot path and tank FPS.
+struct ConsoleLogger;
+
+impl log::Log for ConsoleLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let msg = format!("[{}] {}", record.target(), record.args());
+        match record.level() {
+            log::Level::Error => log_error(&msg),
+            _ => log(&msg),
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static CONSOLE_LOGGER: ConsoleLogger = ConsoleLogger;
+
 /// Initialize the WASM module. Call this once before anything else.
 #[wasm_bindgen(start)]
 pub fn init() {
     std::panic::set_hook(Box::new(|info| {
         log_error(&format!("PANIC: {info}"));
     }));
+    let _ = log::set_logger(&CONSOLE_LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
     log(&format!("WASM module version {} loaded", env!("APP_VERSION")));
     log("IronRDP WASM module initialized");
 }

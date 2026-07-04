@@ -1464,8 +1464,17 @@ function showRemoteFilesNotification() {
 window.__rdp_remote_has_files = fileClipboardEnabled ? showRemoteFilesNotification : null;
 
 // codec: 0x0001 PCM, 0x704F Opus, 0xA106 AAC. extradata = codec config (AAC ASC).
+let audioDropWarned = false;
 window.__rdp_audio_data = function(codec, channels, sampleRate, bitsPerSample, uint8Array, extradata) {
-    if (!audioContext || !audioWorkletReady) return; // drop packets before the worklet is ready
+    if (!audioContext || !audioWorkletReady) {
+        // Drop packets before the worklet is ready — but say so once, so a
+        // "no audio" report can distinguish delivery from playback failures.
+        if (!audioDropWarned) {
+            audioDropWarned = true;
+            console.warn('[RDPSND] audio data arriving but AudioContext/worklet not ready — dropping until ready');
+        }
+        return;
+    }
 
     if (audioContext.state === 'suspended') {
         audioContext.resume();

@@ -91,6 +91,7 @@ impl RdpsndServer {
     pub fn training_pdu(&mut self) -> PduResult<RdpsndSvcMessages> {
         let pdu = pdu::TrainingPdu {
             timestamp: 4231, // a random number
+            pack_size: 0,
             data: vec![],
         };
         Ok(RdpsndSvcMessages::new(vec![

@@ -590,6 +590,11 @@ impl<'de> Decode<'de> for CryptKeyPdu {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrainingPdu {
     pub timestamp: u16,
+    /// Verbatim `wPackSize` field from the wire. The Training Confirm PDU
+    /// must echo this exact value — servers (e.g. GNOME Remote Desktop)
+    /// validate it and treat a recomputed/differing value as invalid,
+    /// aborting the audio protocol.
+    pub pack_size: u16,
     pub data: Vec<u8>,
 }
 
@@ -606,12 +611,7 @@ impl Encode for TrainingPdu {
         ensure_size!(in: dst, size: self.size());
 
         dst.write_u16(self.timestamp);
-        let len = if self.data.is_empty() {
-            0
-        } else {
-            self.size() + ServerAudioOutputPdu::FIXED_PART_SIZE
-        };
-        dst.write_u16(cast_length!("TrainingPdu::wPackSize", len)?);
+        dst.write_u16(self.pack_size);
         dst.write_slice(&self.data);
 
         Ok(())
@@ -633,19 +633,19 @@ impl<'de> Decode<'de> for TrainingPdu {
         ensure_fixed_part_size!(in: src);
 
         let timestamp = src.read_u16();
-        let len = usize::from(src.read_u16());
-        let data = if len != 0 {
-            if len < Self::FIXED_PART_SIZE + ServerAudioOutputPdu::FIXED_PART_SIZE {
-                return Err(invalid_field_err!("TrainingPdu::wPackSize", "too small"));
-            }
-            let len = len - Self::FIXED_PART_SIZE - ServerAudioOutputPdu::FIXED_PART_SIZE;
-            ensure_size!(in: src, size: len);
-            src.read_slice(len).into()
-        } else {
-            Vec::new()
-        };
+        let pack_size = src.read_u16();
+        // The training payload is whatever follows in this PDU. wPackSize is
+        // NOT a reliable payload length — MS-RDPEA defines it as the size of
+        // the whole Training PDU, but FreeRDP-based servers (grd, xrdp) put
+        // the raw payload size there instead. Consume the remainder and keep
+        // the field verbatim for the confirm echo.
+        let data = src.read_remaining().to_vec();
 
-        Ok(Self { timestamp, data })
+        Ok(Self {
+            timestamp,
+            pack_size,
+            data,
+        })
     }
 }
 
