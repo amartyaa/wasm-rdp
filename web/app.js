@@ -239,6 +239,13 @@ let audioDecoderChannels = 0;
 let audioPts = 0;                // monotonic timestamp for EncodedAudioChunk
 let currentAudioCodec = '--';    // negotiated codec, shown in the HUD
 
+// ── AVC420 (H.264) Video State ───────────────────────────
+// One VideoDecoder + offscreen canvas per EGFX surface (each surface is an
+// independent H.264 bitstream). Annex B mode (no `description`): SPS/PPS ride
+// inline in the stream, converted from AVC length-prefixed form in Rust.
+let h264Codec = null;            // probed codec string, or null if unsupported
+const avc420Decoders = new Map(); // surfaceId -> { decoder, canvas, ctx, width, height, pts }
+
 // ── Multi-Monitor State ──────────────────────────────────
 // Multi-monitor uses the Window Management API (Chromium + secure context only)
 // and opens one browser window per physical display, all driven by the single
@@ -370,6 +377,11 @@ async function doConnect(username, password, domain) {
         console.log('[RDPSND] WebCodecs support — opus:', codecs.opus, 'aac:', codecs.aac);
     }
 
+    // Probe H.264 decode support once per connect; only advertise AVC420 to
+    // the server (via wasm) when the browser can actually decode it.
+    h264Codec = await pickH264Codec();
+    console.log('[EGFX] WebCodecs H.264 support:', h264Codec || 'none');
+
     // Multi-monitor: build the physical-screen layout when enabled & supported,
     // and open the secondary-display popups now (close to the connect gesture, to
     // avoid popup blocking). Falls back to single-monitor otherwise.
@@ -403,6 +415,7 @@ async function doConnect(username, password, domain) {
         fpsCap, audioEnabled,
         advEnableFontSmoothing, advDisableCursorEffects,
         advAllowWallpaper, advAllowThemes, advAllowAnimations,
+        !!h264Codec,
     );
     multimonInUse = !!monitorBuild;
 
@@ -465,6 +478,7 @@ async function doConnectRedirected() {
     const wsUrl = `${proto}://${location.host}${basePath}/ws`;
 
     const codecs = audioEnabled ? await detectAudioCodecs() : { opus: false, aac: false };
+    h264Codec = await pickH264Codec();
 
     session = await wasm.connect_redirected(
         wsUrl, width, height, 'rdp-canvas',
@@ -473,6 +487,7 @@ async function doConnectRedirected() {
         fpsCap, audioEnabled,
         advEnableFontSmoothing, advDisableCursorEffects,
         advAllowWallpaper, advAllowThemes, advAllowAnimations,
+        !!h264Codec,
     );
     connectedAt = Date.now();
 
@@ -1094,6 +1109,11 @@ function cleanupSession() {
         audioWorkletReady = false;
         audioFormat = null;
     }
+    // Close any per-surface AVC420 decoders left over from the ended session.
+    for (const entry of avc420Decoders.values()) {
+        try { entry.decoder.close(); } catch (_) {}
+    }
+    avc420Decoders.clear();
 }
 
 // ── Auto-Reconnection ────────────────────────────────────
@@ -1351,6 +1371,24 @@ async function detectAudioCodecs() {
     return result;
 }
 
+// Probe WebCodecs for H.264 (AVC420) decode support, Annex B / no description
+// (RDP's AVC420 carries SPS/PPS inline). Returns a supported codec string, or
+// null. Tried high-to-low profile since RDP servers commonly encode High or
+// Main profile; browsers reject a config whose profile they can't decode.
+async function pickH264Codec() {
+    if (typeof VideoDecoder === 'undefined' || !VideoDecoder.isConfigSupported) {
+        return null;
+    }
+    const candidates = ['avc1.640028', 'avc1.4d0028', 'avc1.42e01e'];
+    for (const codec of candidates) {
+        try {
+            const support = await VideoDecoder.isConfigSupported({ codec, optimizeForLatency: true });
+            if (support.supported) return codec;
+        } catch (_) {}
+    }
+    return null;
+}
+
 // Ensure the worklet node matches the given format, then hand it per-channel PCM.
 function postPcmToWorklet(channelData, channels, sourceRate) {
     if (!audioWorkletNode || audioFormat.channels !== channels || audioFormat.sourceRate !== sourceRate) {
@@ -1548,6 +1586,90 @@ window.__rdp_audio_volume = function(left, right) {
     if (!audioGain) return;
     const g = Math.max(left, right) / 0xFFFF;
     audioGain.gain.value = Math.max(0, Math.min(1, g));
+};
+
+// ── AVC420 (H.264) Video Decode (WebCodecs) ──────────────
+// One VideoDecoder per EGFX surface — surfaces are independent bitstreams, so
+// a shared decoder would corrupt reference-frame state. Decoded frames are
+// read back to RGBA via an offscreen canvas and handed to wasm, which writes
+// them into the same surface framebuffer every other codec paints through
+// (so multi-monitor clipping and mixed-codec compositing need no AVC420-
+// specific logic on this side).
+function getOrCreateAvc420Decoder(surfaceId, width, height) {
+    let entry = avc420Decoders.get(surfaceId);
+    if (entry && entry.width === width && entry.height === height) {
+        return entry;
+    }
+    if (entry) {
+        try { entry.decoder.close(); } catch (_) {}
+        avc420Decoders.delete(surfaceId);
+    }
+    if (!h264Codec) return null;
+
+    const canvas = new OffscreenCanvas(width, height);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const decoder = new VideoDecoder({
+        output: (frame) => {
+            try {
+                ctx.drawImage(frame, 0, 0, width, height, 0, 0, width, height);
+                const rgba = ctx.getImageData(0, 0, width, height).data;
+                if (session) {
+                    session.on_avc420_decoded(surfaceId, new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength));
+                }
+            } catch (e) {
+                console.warn('[EGFX] AVC420 frame handling failed:', e);
+            } finally {
+                frame.close();
+            }
+        },
+        error: (e) => {
+            console.warn('[EGFX] AVC420 VideoDecoder error:', e);
+            // The decoder is unusable after an error; drop it so the next
+            // frame creates a fresh one (self-heals once a keyframe arrives).
+            avc420Decoders.delete(surfaceId);
+        },
+    });
+    try {
+        decoder.configure({ codec: h264Codec, codedWidth: width, codedHeight: height, optimizeForLatency: true });
+    } catch (e) {
+        console.warn('[EGFX] AVC420 VideoDecoder configure failed:', e);
+        return null;
+    }
+    entry = { decoder, canvas, ctx, width, height, pts: 0, awaitingKeyframe: true };
+    avc420Decoders.set(surfaceId, entry);
+    return entry;
+}
+
+// Called from WASM with a raw AVC420 (Annex B H.264) access unit for one EGFX
+// surface (a full-surface frame — AVC420 access units are never partial
+// regions). originX/originY are the surface's output position; unused here
+// since decoded RGBA is handed back to wasm, which already tracks it.
+window.__rdp_avc420_frame = function(surfaceId, originX, originY, width, height, isKeyframe, data) {
+    const entry = getOrCreateAvc420Decoder(surfaceId, width, height);
+    if (!entry) return;
+    if (entry.awaitingKeyframe && !isKeyframe) {
+        return; // WebCodecs requires the first chunk after configure() to be a keyframe
+    }
+    try {
+        entry.decoder.decode(new EncodedVideoChunk({
+            type: isKeyframe ? 'key' : 'delta',
+            timestamp: entry.pts,
+            data,
+        }));
+        entry.awaitingKeyframe = false;
+        entry.pts += 1000; // no B-frames expected from a low-latency RDP encoder; only needs to be monotonic
+    } catch (e) {
+        console.warn('[EGFX] AVC420 decode() failed:', e);
+    }
+};
+
+// Called from WASM when a surface carrying AVC420 is deleted, or on
+// ResetGraphics (once per surviving surface) — release that surface's decoder.
+window.__rdp_avc420_closed = function(surfaceId) {
+    const entry = avc420Decoders.get(surfaceId);
+    if (!entry) return;
+    try { entry.decoder.close(); } catch (_) {}
+    avc420Decoders.delete(surfaceId);
 };
 
 // ── Init ─────────────────────────────────────────────────

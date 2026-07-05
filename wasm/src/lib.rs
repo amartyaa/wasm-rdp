@@ -70,6 +70,7 @@ pub async fn connect(
     allow_wallpaper: bool,
     allow_themes: bool,
     allow_animations: bool,
+    enable_avc420: bool,
 ) -> Result<session::Session, JsValue> {
     session::Session::connect(
         ws_url, username, password, domain, width, height, canvas_id,
@@ -78,6 +79,7 @@ pub async fn connect(
         fps_cap, enable_audio,
         enable_font_smoothing, disable_cursor_effects,
         allow_wallpaper, allow_themes, allow_animations,
+        enable_avc420,
     )
     .await
     .map_err(|e| JsValue::from_str(&format!("{e:#}")))
@@ -105,6 +107,7 @@ pub async fn connect_redirected(
     allow_wallpaper: bool,
     allow_themes: bool,
     allow_animations: bool,
+    enable_avc420: bool,
 ) -> Result<session::Session, JsValue> {
     session::Session::connect_redirected(
         ws_url, width, height, canvas_id,
@@ -113,6 +116,7 @@ pub async fn connect_redirected(
         fps_cap, enable_audio,
         enable_font_smoothing, disable_cursor_effects,
         allow_wallpaper, allow_themes, allow_animations,
+        enable_avc420,
     )
     .await
     .map_err(|e| JsValue::from_str(&format!("{e:#}")))
@@ -224,6 +228,75 @@ pub(crate) fn notify_audio_volume(left: u16, right: u16) {
                     &wasm_bindgen::JsValue::NULL,
                     &wasm_bindgen::JsValue::from(left),
                     &wasm_bindgen::JsValue::from(right),
+                );
+            }
+        }
+    }
+}
+
+/// Called from session.rs to forward a raw AVC420 (H.264, Annex B) access unit
+/// to JS for asynchronous WebCodecs decode. `is_keyframe` tells JS whether to
+/// mark the `EncodedVideoChunk` as `key` (required for the first chunk fed to
+/// a fresh `VideoDecoder`). Caches the JS function reference like the audio
+/// bridges above.
+pub(crate) fn notify_avc420_frame(
+    surface_id: u16,
+    origin_x: u32,
+    origin_y: u32,
+    width: u16,
+    height: u16,
+    is_keyframe: bool,
+    data: &[u8],
+) {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHED_FN: RefCell<Option<js_sys::Function>> = RefCell::new(None);
+        static LOOKED_UP: RefCell<bool> = RefCell::new(false);
+    }
+    CACHED_FN.with(|cell| {
+        let mut cached = cell.borrow_mut();
+        if cached.is_none() {
+            LOOKED_UP.with(|looked| {
+                if !*looked.borrow() {
+                    *looked.borrow_mut() = true;
+                    if let Some(window) = web_sys::window() {
+                        if let Ok(func) = js_sys::Reflect::get(
+                            &wasm_bindgen::JsValue::from(window),
+                            &wasm_bindgen::JsValue::from_str("__rdp_avc420_frame"),
+                        ) {
+                            *cached = func.dyn_ref::<js_sys::Function>().cloned();
+                        }
+                    }
+                }
+            });
+        }
+        if let Some(func) = cached.as_ref() {
+            let args = js_sys::Array::new();
+            args.push(&wasm_bindgen::JsValue::from(surface_id));
+            args.push(&wasm_bindgen::JsValue::from(origin_x));
+            args.push(&wasm_bindgen::JsValue::from(origin_y));
+            args.push(&wasm_bindgen::JsValue::from(width));
+            args.push(&wasm_bindgen::JsValue::from(height));
+            args.push(&wasm_bindgen::JsValue::from(is_keyframe));
+            args.push(&js_sys::Uint8Array::from(data).into());
+            let _ = func.apply(&wasm_bindgen::JsValue::NULL, &args);
+        }
+    });
+}
+
+/// Called from session.rs when an EGFX surface carrying AVC420 is deleted, or
+/// on ResetGraphics (once per surviving surface) — tells JS to close and
+/// discard that surface's `VideoDecoder`, if one exists.
+pub(crate) fn notify_avc420_surface_closed(surface_id: u16) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(func) = js_sys::Reflect::get(
+            &wasm_bindgen::JsValue::from(window),
+            &wasm_bindgen::JsValue::from_str("__rdp_avc420_closed"),
+        ) {
+            if let Some(func) = func.dyn_ref::<js_sys::Function>() {
+                let _ = func.call1(
+                    &wasm_bindgen::JsValue::NULL,
+                    &wasm_bindgen::JsValue::from(surface_id),
                 );
             }
         }

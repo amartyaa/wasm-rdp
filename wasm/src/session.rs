@@ -76,6 +76,7 @@ pub(crate) enum VideoCodec {
     Planar,
     Clear,
     Uncompressed,
+    Avc420,
 }
 
 impl VideoCodec {
@@ -86,6 +87,7 @@ impl VideoCodec {
             VideoCodec::Planar => "Planar",
             VideoCodec::Clear => "ClearCodec",
             VideoCodec::Uncompressed => "Uncompressed",
+            VideoCodec::Avc420 => "AVC420",
         }
     }
 }
@@ -93,7 +95,10 @@ impl VideoCodec {
 struct WasmGfxHandler {
     /// Shared monitor canvases (same list the legacy path renders to).
     surfaces: Rc<RefCell<Vec<Canvas>>>,
-    gfx: HashMap<u16, GfxSurface>,
+    /// Shared with `Session` so the async AVC420 decode callback (JS WebCodecs,
+    /// arriving well after `on_avc420_raw` returns) can write decoded RGBA back
+    /// into the same surface framebuffer this handler paints into.
+    gfx: Rc<RefCell<HashMap<u16, GfxSurface>>>,
     /// Bitmap cache: slot → saved pixels. Server-managed; we just store/restore.
     cache: HashMap<u16, CacheSlot>,
     /// Set once the first EGFX surface exists; run_session uses it to stop the
@@ -101,6 +106,9 @@ struct WasmGfxHandler {
     egfx_active: Rc<std::cell::Cell<bool>>,
     /// Live codec the EGFX pipeline is painting with; read by the Session HUD getter.
     video_codec: Rc<std::cell::Cell<VideoCodec>>,
+    /// Whether to advertise AVC420 (only when the browser's WebCodecs actually
+    /// supports H.264 decode — see `enable_avc420` on `Session::connect`).
+    avc420_enabled: bool,
     /// Progressive frames rendered; gates verbose first-frame logging.
     frames: u32,
     /// Planar/uncompressed BitmapUpdate tiles rendered; gates verbose logging.
@@ -110,6 +118,7 @@ struct WasmGfxHandler {
     log_s2s: u32,
     log_cache: u32,
     log_other: u32,
+    log_avc: u32,
 }
 
 // SAFETY: `GraphicsPipelineHandler: Send`, but the handler holds `Rc`/web-sys
@@ -121,38 +130,59 @@ unsafe impl Send for WasmGfxHandler {}
 impl WasmGfxHandler {
     fn new(
         surfaces: Rc<RefCell<Vec<Canvas>>>,
+        gfx: Rc<RefCell<HashMap<u16, GfxSurface>>>,
         egfx_active: Rc<std::cell::Cell<bool>>,
         video_codec: Rc<std::cell::Cell<VideoCodec>>,
+        avc420_enabled: bool,
     ) -> Self {
         Self {
             surfaces,
-            gfx: HashMap::new(),
+            gfx,
             cache: HashMap::new(),
             egfx_active,
             video_codec,
+            avc420_enabled,
             frames: 0,
             bitmaps: 0,
             log_fill: 0,
             log_s2s: 0,
             log_cache: 0,
             log_other: 0,
+            log_avc: 0,
         }
     }
 }
 
 impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
     fn capabilities(&self) -> Vec<ironrdp::egfx::pdu::CapabilitySet> {
-        use ironrdp::egfx::pdu::{CapabilitiesV8Flags, CapabilitySet};
-        // Advertise V8 only (no AVC). A GPU-less host then selects RFX-Progressive;
-        // a GPU host would otherwise send H.264 we can't decode here.
-        //
+        use ironrdp::egfx::pdu::{CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet};
         // SMALL_CACHE: the bitmap cache is MANDATORY per MS-RDPEGFX (there is no
         // opt-out flag — empty flags still mean "full 100MB cache"); SMALL_CACHE
         // just bounds it. We implement the cache below.
-        log("[EGFX] graphics channel opened — advertising V8 (RFX-Progressive, no AVC, small cache)");
-        vec![CapabilitySet::V8 {
-            flags: CapabilitiesV8Flags::SMALL_CACHE,
-        }]
+        //
+        // V8.1 with AVC420_ENABLED (and only that — not V10, whose AVC_DISABLED
+        // flag ties AVC420 and AVC444 together) is advertised only when the
+        // browser's WebCodecs actually supports H.264 decode (`avc420_enabled`,
+        // set from a runtime probe in app.js). AVC444 is never advertised: it's
+        // GPO-gated dual-stream on the server side and not worth decoding here.
+        // V8 (no AVC) is always included as a fallback for hosts/browsers
+        // without AVC420 (GNOME Remote Desktop, xrdp, older browsers).
+        if self.avc420_enabled {
+            log("[EGFX] graphics channel opened — advertising V8.1 (AVC420) + V8 fallback (small cache)");
+            vec![
+                CapabilitySet::V8_1 {
+                    flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+                },
+                CapabilitySet::V8 {
+                    flags: CapabilitiesV8Flags::SMALL_CACHE,
+                },
+            ]
+        } else {
+            log("[EGFX] graphics channel opened — advertising V8 (RFX-Progressive, no AVC, small cache)");
+            vec![CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::SMALL_CACHE,
+            }]
+        }
     }
 
     fn on_capabilities_confirmed(&mut self, caps: &ironrdp::egfx::pdu::CapabilitySet) {
@@ -160,8 +190,15 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
     }
 
     fn on_reset_graphics(&mut self, width: u32, height: u32) {
-        log(&format!("[EGFX] reset graphics {width}x{height} — clearing {} surface(s)", self.gfx.len()));
-        self.gfx.clear();
+        let mut gfx = self.gfx.borrow_mut();
+        log(&format!("[EGFX] reset graphics {width}x{height} — clearing {} surface(s)", gfx.len()));
+        // Tell JS to close any per-surface AVC420 decoders — their H.264 decode
+        // state (reference frames) is meaningless across a reset, and a fresh
+        // CreateSurface always starts a new independent bitstream.
+        for &id in gfx.keys() {
+            crate::notify_avc420_surface_closed(id);
+        }
+        gfx.clear();
     }
 
     fn on_surface_created(&mut self, surface: &ironrdp::egfx::client::Surface) {
@@ -171,7 +208,7 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
         ));
         let w = surface.width;
         let h = surface.height;
-        self.gfx.insert(
+        self.gfx.borrow_mut().insert(
             surface.id,
             GfxSurface {
                 decoder: ProgressiveDecoder::new(w, h),
@@ -190,12 +227,14 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
 
     fn on_surface_deleted(&mut self, surface_id: u16) {
         log(&format!("[EGFX] surface deleted id={surface_id}"));
-        self.gfx.remove(&surface_id);
+        self.gfx.borrow_mut().remove(&surface_id);
+        crate::notify_avc420_surface_closed(surface_id);
     }
 
     fn on_surface_mapped(&mut self, surface_id: u16, origin_x: u32, origin_y: u32) {
         log(&format!("[EGFX] surface {surface_id} mapped to output ({origin_x},{origin_y})"));
-        if let Some(s) = self.gfx.get_mut(&surface_id) {
+        let mut gfx = self.gfx.borrow_mut();
+        if let Some(s) = gfx.get_mut(&surface_id) {
             s.origin_x = origin_x as u16;
             s.origin_y = origin_y as u16;
             s.mapped = true;
@@ -231,7 +270,8 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
         _height: u16,
         data: &[u8],
     ) {
-        let Some(s) = self.gfx.get_mut(&surface_id) else {
+        let mut gfx = self.gfx.borrow_mut();
+        let Some(s) = gfx.get_mut(&surface_id) else {
             log(&format!("[EGFX] progressive data for unknown surface {surface_id} ({} bytes)", data.len()));
             return;
         };
@@ -277,7 +317,8 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
     fn read_surface_rect(&self, surface_id: u16, x: u16, y: u16, width: u16, height: u16) -> Option<Vec<u8>> {
         // Seed for ClearCodec delta decodes: return this rect's current pixels
         // so gaps the codec doesn't repaint keep their existing content.
-        let s = self.gfx.get(&surface_id)?;
+        let gfx = self.gfx.borrow();
+        let s = gfx.get(&surface_id)?;
         let (sw, sh) = (usize::from(s.width), usize::from(s.height));
         let (x, y, w, h) = (usize::from(x), usize::from(y), usize::from(width), usize::from(height));
         if x + w > sw || y + h > sh {
@@ -292,7 +333,8 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
     }
 
     fn on_bitmap_updated(&mut self, update: &ironrdp::egfx::client::BitmapUpdate) {
-        let Some(s) = self.gfx.get_mut(&update.surface_id) else { return };
+        let mut gfx = self.gfx.borrow_mut();
+        let Some(s) = gfx.get_mut(&update.surface_id) else { return };
         self.video_codec.set(match update.codec_id {
             ironrdp::egfx::pdu::Codec1Type::Planar => VideoCodec::Planar,
             ironrdp::egfx::pdu::Codec1Type::ClearCodec => VideoCodec::Clear,
@@ -366,6 +408,34 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
         }
     }
 
+    // AVC420 (H.264) raw passthrough. WebCodecs decode is async (the browser
+    // calls back well after this returns), so unlike every other codec above we
+    // can't decode-and-blit synchronously here — we forward the bitstream to JS
+    // and the decoded RGBA comes back later via `Session::on_avc420_decoded`,
+    // which writes into this same surface's `fb` and reuses `blit_rects` below.
+    // Each access unit is a *full* surface frame (no per-region rects, per the
+    // fork's passthrough contract), so the eventual write-back is a full-surface
+    // overwrite, not a tile blit.
+    fn on_avc420_raw(
+        &mut self,
+        surface_id: u16,
+        origin_x: u32,
+        origin_y: u32,
+        width: u16,
+        height: u16,
+        data: &[u8],
+    ) {
+        let (annex_b, is_keyframe) = avc_to_annexb(data);
+        if self.log_avc < 10 {
+            self.log_avc += 1;
+            log(&format!(
+                "[EGFX] AVC420 raw surf={surface_id} at ({origin_x},{origin_y}) {width}x{height} bytes={} keyframe={is_keyframe}",
+                annex_b.len()
+            ));
+        }
+        crate::notify_avc420_frame(surface_id, origin_x, origin_y, width, height, is_keyframe, &annex_b);
+    }
+
     fn on_solid_fill(&mut self, pdu: &ironrdp::egfx::pdu::SolidFillPdu) {
         if self.log_fill < 40 {
             self.log_fill += 1;
@@ -377,7 +447,8 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
                 first.map(|r| (r.left, r.top, r.right, r.bottom))
             ));
         }
-        let Some(s) = self.gfx.get_mut(&pdu.surface_id) else { return };
+        let mut gfx = self.gfx.borrow_mut();
+        let Some(s) = gfx.get_mut(&pdu.surface_id) else { return };
         let c = &pdu.fill_pixel;
         let rgba = [c.r, c.g, c.b, 0xFF];
         let sw = usize::from(s.width);
@@ -433,7 +504,12 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
         // same-surface copies (scroll), and it sidesteps the double-borrow for
         // cross-surface copies (Windows composes via offscreen surfaces).
         let (tmp, copy_w, copy_h) = {
-            let Some(src_s) = self.gfx.get(&pdu.source_surface_id) else { return };
+            // Scoped so this immutable borrow is released before the mutable
+            // borrow below — source and destination can be the same surface_id
+            // (same-surface scroll), which would otherwise double-borrow the
+            // shared RefCell and panic at runtime.
+            let gfx = self.gfx.borrow();
+            let Some(src_s) = gfx.get(&pdu.source_surface_id) else { return };
             let ssw = usize::from(src_s.width);
             let ssh = usize::from(src_s.height);
             let copy_w = rect_w.min(ssw.saturating_sub(src_x));
@@ -450,7 +526,8 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
             (tmp, copy_w, copy_h)
         };
 
-        let Some(s) = self.gfx.get_mut(&pdu.destination_surface_id) else { return };
+        let mut gfx = self.gfx.borrow_mut();
+        let Some(s) = gfx.get_mut(&pdu.destination_surface_id) else { return };
         let sw = usize::from(s.width);
         let sh = usize::from(s.height);
 
@@ -487,7 +564,8 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
     // later — cursor save-under on xrdp, scroll/window-move on Windows. ──
 
     fn on_surface_to_cache(&mut self, pdu: &ironrdp::egfx::pdu::SurfaceToCachePdu) {
-        let Some(s) = self.gfx.get(&pdu.surface_id) else { return };
+        let gfx = self.gfx.borrow();
+        let Some(s) = gfx.get(&pdu.surface_id) else { return };
         let sw = usize::from(s.width);
         let sh = usize::from(s.height);
         let r = &pdu.source_rectangle;
@@ -531,7 +609,8 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
             ));
             return;
         };
-        let Some(s) = self.gfx.get_mut(&pdu.surface_id) else { return };
+        let mut gfx = self.gfx.borrow_mut();
+        let Some(s) = gfx.get_mut(&pdu.surface_id) else { return };
         let sw = usize::from(s.width);
         let sh = usize::from(s.height);
         let cw = usize::from(entry.width);
@@ -620,6 +699,29 @@ fn blit_rects(
     }
     painted
 }
+
+/// Convert MS-RDPEGFX AVC420's length-prefixed NAL stream (4-byte big-endian
+/// length per NAL, per `Avc420BitmapStream`) to Annex B (4-byte 0x00000001
+/// start code per NAL — same total size, since both prefixes are 4 bytes) for
+/// WebCodecs, which we configure without an avcC `description` and rely on the
+/// SPS/PPS riding inline in the stream. Also reports whether this access unit
+/// contains an IDR slice (NAL type 5): WebCodecs requires the first chunk fed
+/// to a fresh decoder to be marked `key`.
+fn avc_to_annexb(data: &[u8]) -> (Vec<u8>, bool) {
+    let mut out = data.to_vec();
+    let mut is_keyframe = false;
+    let mut pos = 0usize;
+    while pos + 4 <= out.len() {
+        let len = u32::from_be_bytes([out[pos], out[pos + 1], out[pos + 2], out[pos + 3]]) as usize;
+        out[pos..pos + 4].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        let nal_start = pos + 4;
+        if nal_start < out.len() && (out[nal_start] & 0x1F) == 5 {
+            is_keyframe = true;
+        }
+        pos = nal_start.saturating_add(len);
+    }
+    (out, is_keyframe)
+}
 // ===== END EGFX graphics pipeline =====
 
 /// An active RDP session handle exposed to JavaScript.
@@ -635,6 +737,10 @@ pub struct Session {
     surfaces: Rc<RefCell<Vec<Canvas>>>,
     /// Live video codec, updated by the EGFX handler; surfaced to the HUD.
     video_codec: Rc<std::cell::Cell<VideoCodec>>,
+    /// EGFX surfaces, shared with `WasmGfxHandler`. JS's async AVC420 WebCodecs
+    /// decode callback writes decoded RGBA back in via `on_avc420_decoded`,
+    /// well after `on_avc420_raw` forwarded the bitstream and returned.
+    gfx_surfaces: Rc<RefCell<HashMap<u16, GfxSurface>>>,
 }
 
 /// Bandwidth statistics shared between the session, framed reader, and writer.
@@ -678,6 +784,7 @@ impl Session {
         allow_wallpaper: bool,
         allow_themes: bool,
         allow_animations: bool,
+        enable_avc420: bool,
     ) -> anyhow::Result<Session> {
         log(&format!("Connecting to proxy: {ws_url}"));
 
@@ -787,14 +894,24 @@ impl Session {
         // traffic, the other stays silent.
         let egfx_active = Rc::new(std::cell::Cell::new(false));
         let video_codec = Rc::new(std::cell::Cell::new(VideoCodec::Rfx));
+        let gfx_surfaces: Rc<RefCell<HashMap<u16, GfxSurface>>> = Rc::new(RefCell::new(HashMap::new()));
         let connector = if enable_gfx || enable_audio {
             let mut drdynvc = ironrdp::dvc::DrdynvcClient::new();
             if enable_gfx {
                 log("[EGFX] attaching graphics pipeline DVC (RFX-Progressive)");
+                // Passthrough mode: no synchronous H.264 decoder here — AVC420 is
+                // decoded asynchronously by JS WebCodecs (see `on_avc420_raw`).
+                // Advertisement of AVC420 itself is still gated by `enable_avc420`
+                // inside `WasmGfxHandler::capabilities()`.
                 drdynvc = drdynvc.with_dynamic_channel(
-                    ironrdp::egfx::client::GraphicsPipelineClient::new(
-                        Box::new(WasmGfxHandler::new(surfaces.clone(), egfx_active.clone(), video_codec.clone())),
-                        None, // no H.264 decoder — we advertise V8/progressive only
+                    ironrdp::egfx::client::GraphicsPipelineClient::new_passthrough(
+                        Box::new(WasmGfxHandler::new(
+                            surfaces.clone(),
+                            gfx_surfaces.clone(),
+                            egfx_active.clone(),
+                            video_codec.clone(),
+                            enable_avc420,
+                        )),
                     ),
                 );
             }
@@ -878,6 +995,7 @@ impl Session {
             stats,
             surfaces,
             video_codec,
+            gfx_surfaces,
         })
     }
 
@@ -904,6 +1022,7 @@ impl Session {
         allow_wallpaper: bool,
         allow_themes: bool,
         allow_animations: bool,
+        enable_avc420: bool,
     ) -> anyhow::Result<Session> {
         let pending = PENDING_REDIRECT.with(|cell| cell.borrow_mut().take())
             .context("connect_redirected called without a pending Server Redirection")?;
@@ -977,13 +1096,19 @@ impl Session {
         // DRDYNVC hosts both EGFX and DVC audio — same rationale as connect().
         let egfx_active = Rc::new(std::cell::Cell::new(false));
         let video_codec = Rc::new(std::cell::Cell::new(VideoCodec::Rfx));
+        let gfx_surfaces: Rc<RefCell<HashMap<u16, GfxSurface>>> = Rc::new(RefCell::new(HashMap::new()));
         let connector = if enable_gfx || enable_audio {
             let mut drdynvc = ironrdp::dvc::DrdynvcClient::new();
             if enable_gfx {
                 drdynvc = drdynvc.with_dynamic_channel(
-                    ironrdp::egfx::client::GraphicsPipelineClient::new(
-                        Box::new(WasmGfxHandler::new(surfaces.clone(), egfx_active.clone(), video_codec.clone())),
-                        None,
+                    ironrdp::egfx::client::GraphicsPipelineClient::new_passthrough(
+                        Box::new(WasmGfxHandler::new(
+                            surfaces.clone(),
+                            gfx_surfaces.clone(),
+                            egfx_active.clone(),
+                            video_codec.clone(),
+                            enable_avc420,
+                        )),
                     ),
                 );
             }
@@ -1059,6 +1184,7 @@ impl Session {
             stats,
             surfaces,
             video_codec,
+            gfx_surfaces,
         })
     }
 
@@ -1200,6 +1326,42 @@ impl Session {
         match crate::canvas::Canvas::from_element(canvas, origin_x, origin_y, width, height) {
             Ok(surface) => self.surfaces.borrow_mut().push(surface),
             Err(e) => log_error(&format!("add_surface failed: {e:#}")),
+        }
+    }
+
+    /// Delivers an AVC420 frame decoded by JS WebCodecs (see `on_avc420_raw` in
+    /// `WasmGfxHandler`, which forwarded the raw bitstream to JS in the first
+    /// place). `rgba` must be exactly `width * height * 4` bytes for the target
+    /// surface — a full-surface frame, since AVC420 access units are never
+    /// partial regions. Overwrites the surface framebuffer and blits it,
+    /// reusing the same `blit_rects` path every other codec paints through
+    /// (so multi-monitor clipping and mixed-codec compositing need no
+    /// AVC420-specific logic).
+    #[wasm_bindgen]
+    pub fn on_avc420_decoded(&self, surface_id: u16, rgba: Vec<u8>) {
+        let mut gfx = self.gfx_surfaces.borrow_mut();
+        let Some(s) = gfx.get_mut(&surface_id) else { return };
+        if rgba.len() != s.fb.len() {
+            log_error(&format!(
+                "[EGFX] AVC420 decoded frame size mismatch surf={surface_id} got={} want={}",
+                rgba.len(),
+                s.fb.len()
+            ));
+            return;
+        }
+        s.fb.copy_from_slice(&rgba);
+        self.video_codec.set(VideoCodec::Avc420);
+        if !s.mapped {
+            return;
+        }
+        let full = [ironrdp::pdu::geometry::InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: s.width.saturating_sub(1),
+            bottom: s.height.saturating_sub(1),
+        }];
+        if blit_rects(&self.surfaces, &s.fb, s.width, s.height, s.origin_x, s.origin_y, &full) {
+            crate::notify_frame();
         }
     }
 }
