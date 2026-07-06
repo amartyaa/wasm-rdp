@@ -1,4 +1,4 @@
-# web-rdp
+# IronBridge
 
 A web-based RDP client where the full protocol stack runs in the browser as WebAssembly. The server is a WebSocket-to-TCP relay and nothing more — it never parses an RDP PDU.
 
