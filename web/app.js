@@ -215,6 +215,7 @@ const RESIZE_DEBOUNCE_MS = 250;
 const PASTE_KEYSTROKE_DELAY_MS = 100;
 let suppressVUp = false;       // swallow the keyup of a deferred paste
 let pasteReplayTimer = null;
+let pasteKeystrokeSent = false; // guards sendPasteKeystrokeOnce against double-firing
 let lastSyncedClipboardText = '';
 // Wheel scroll state: accumulate delta between throttle ticks
 let lastWheelTime = 0;
@@ -640,21 +641,29 @@ function onKeyDown(e) {
         return;
     }
 
-    // Paste (Ctrl+V): let the browser fire the 'paste' event, but DON'T send the
-    // V keystroke yet. onPaste advertises the clipboard (Format List) first, then
-    // replays the keystroke after a short delay so the remote has registered our
-    // format before it processes the paste. Sending V first (the old behavior)
-    // made the remote paste stale data — needing a 2nd Ctrl+V on Windows and
-    // lagging on xrdp. The delay only needs to cover the remote's clipboard
-    // registration (tens of ms), not the network RTT, since both PDUs travel the
-    // same ordered stream.
-    if (e.ctrlKey && e.code === 'KeyV') {
+    // Paste (Ctrl+V / Cmd+V): the V keystroke must always reach the remote —
+    // that's what makes paste work at all, including purely remote-internal
+    // copy/paste that never touches the host clipboard. When clipboard sync is
+    // enabled, give onPaste a short window to advertise the host clipboard's
+    // content via CLIPRDR first, since sending V before the remote has
+    // registered our Format List makes it paste stale data (needing a 2nd
+    // Ctrl+V on Windows, lagging on xrdp). Either way the keystroke is
+    // guaranteed to be sent: onPaste falls through to sendPasteKeystrokeOnce()
+    // when it has nothing to advertise, and the timer below is the fallback if
+    // the 'paste' DOM event never fires at all.
+    if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') {
         suppressVUp = true; // also swallow the matching keyup
-        return;             // no preventDefault (paste fires), no keystroke yet
+        pasteKeystrokeSent = false;
+        if (!textClipboardEnabled && !fileClipboardEnabled) {
+            sendPasteKeystrokeOnce(); // nothing to advertise — same passthrough as Ctrl+C
+        } else {
+            pasteReplayTimer = setTimeout(sendPasteKeystrokeOnce, PASTE_KEYSTROKE_DELAY_MS);
+        }
+        return; // no preventDefault (paste fires)
     }
 
-    // Allow Ctrl+C to pass through so the browser fires the native 'copy' event.
-    if (!(e.ctrlKey && e.code === 'KeyC')) {
+    // Allow Ctrl+C/Cmd+C to pass through so the browser fires the native 'copy' event.
+    if (!((e.ctrlKey || e.metaKey) && e.code === 'KeyC')) {
         e.preventDefault();
     }
     const mapping = SCANCODE_MAP[e.code];
@@ -677,16 +686,16 @@ function onKeyUp(e) {
     }
 }
 
-// Replay a Ctrl+V to the remote after the clipboard Format List has been sent.
-// Ctrl is still physically held by the user, so we send only V down/up.
-function scheduleReplayPaste() {
-    if (pasteReplayTimer) clearTimeout(pasteReplayTimer);
-    pasteReplayTimer = setTimeout(() => {
-        pasteReplayTimer = null;
-        if (!session) return;
-        session.send_keyboard(0x2F, true, false);  // V down
-        session.send_keyboard(0x2F, false, false); // V up
-    }, PASTE_KEYSTROKE_DELAY_MS);
+// Deliver the deferred Ctrl+V to the remote. Ctrl is still physically held by
+// the user, so we send only V down/up. Idempotent per keypress — both the
+// clipboard-advertise path in onPaste and the onKeyDown fallback timer call
+// this, and only the first call must actually send anything.
+function sendPasteKeystrokeOnce() {
+    if (pasteReplayTimer) { clearTimeout(pasteReplayTimer); pasteReplayTimer = null; }
+    if (pasteKeystrokeSent || !session) return;
+    pasteKeystrokeSent = true;
+    session.send_keyboard(0x2F, true, false);  // V down
+    session.send_keyboard(0x2F, false, false); // V up
 }
 
 function getCanvasCoords(e) {
@@ -757,7 +766,7 @@ async function onWindowFocus() {
 }
 
 function onPaste(e) {
-    if (!session || !wasm) return;
+    if (!session || !wasm) { sendPasteKeystrokeOnce(); return; }
 
     // Files: Local→Remote file transfer via CLIPRDR.
     if (fileClipboardEnabled) {
@@ -768,9 +777,10 @@ function onPaste(e) {
                 file.arrayBuffer().then(buf => {
                     try {
                         wasm.set_pending_clipboard_file(file.name, new Uint8Array(buf), session);
-                        scheduleReplayPaste(); // Advertise then deliver the paste keystroke
                     } catch (err) {
                         console.warn('Clipboard file paste to WASM failed:', err);
+                    } finally {
+                        sendPasteKeystrokeOnce(); // Advertise (if any) then deliver the paste keystroke
                     }
                 });
                 return;
@@ -778,42 +788,45 @@ function onPaste(e) {
         }
     }
 
-    if (!textClipboardEnabled) return;
-
-    // Check for image data first (screenshots, copied images)
-    const items = e.clipboardData?.items;
-    if (items) {
-        for (const item of items) {
-            if (item.type === 'image/png') {
-                const blob = item.getAsFile();
-                if (blob) {
-                    blob.arrayBuffer().then(buf => {
-                        try {
-                            const bytes = new Uint8Array(buf);
-                            wasm.set_pending_clipboard_image(bytes, session);
-                            // Advertise sent — now deliver the paste keystroke.
-                            scheduleReplayPaste();
-                        } catch (err) {
-                            console.warn('Clipboard image paste to WASM failed:', err);
-                        }
-                    });
-                    return; // image takes priority
+    if (textClipboardEnabled) {
+        // Check for image data first (screenshots, copied images)
+        const items = e.clipboardData?.items;
+        if (items) {
+            for (const item of items) {
+                if (item.type === 'image/png') {
+                    const blob = item.getAsFile();
+                    if (blob) {
+                        blob.arrayBuffer().then(buf => {
+                            try {
+                                const bytes = new Uint8Array(buf);
+                                wasm.set_pending_clipboard_image(bytes, session);
+                            } catch (err) {
+                                console.warn('Clipboard image paste to WASM failed:', err);
+                            } finally {
+                                sendPasteKeystrokeOnce();
+                            }
+                        });
+                        return; // image takes priority
+                    }
                 }
+            }
+        }
+
+        // Fall back to text
+        const text = e.clipboardData?.getData('text/plain');
+        if (text) {
+            try {
+                wasm.set_pending_clipboard(text, session);
+            } catch (err) {
+                console.warn('Clipboard paste to WASM failed:', err);
             }
         }
     }
 
-    // Fall back to text
-    const text = e.clipboardData?.getData('text/plain');
-    if (text) {
-        try {
-            wasm.set_pending_clipboard(text, session);
-            // Advertise sent — now deliver the paste keystroke.
-            scheduleReplayPaste();
-        } catch (err) {
-            console.warn('Clipboard paste to WASM failed:', err);
-        }
-    }
+    // Nothing left to advertise here (sync off for this content type, empty
+    // clipboard, or a purely remote-internal paste) — the keystroke must still
+    // reach the remote.
+    sendPasteKeystrokeOnce();
 }
 
 function onCopy(e) {
@@ -1085,6 +1098,7 @@ function cleanupSession() {
     // Reset deferred-paste state
     if (pasteReplayTimer) { clearTimeout(pasteReplayTimer); pasteReplayTimer = null; }
     suppressVUp = false;
+    pasteKeystrokeSent = false;
     const fileToast = document.getElementById('rdp-file-toast');
     if (fileToast) fileToast.hidden = true;
     // Close audio context and tear down the worklet graph
