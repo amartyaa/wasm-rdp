@@ -102,6 +102,17 @@
                     <label for="domain">Domain <span class="optional">(optional)</span></label>
                     <input type="text" id="domain" name="domain" autocomplete="off" placeholder="WORKGROUP">
                 </div>
+                <!-- RemoteApp picker: shown only when the server sets __IB_REMOTE_APP.
+                     "Full desktop" is the default; "Custom…" reveals a free-text path. -->
+                <div class="form-group" id="rail-app-group" hidden>
+                    <label for="rail-app">Application <span class="optional">(optional)</span></label>
+                    <select id="rail-app">
+                        <option value="" selected>Full desktop</option>
+                        <option value="__custom__">Custom path…</option>
+                    </select>
+                    <input type="text" id="rail-app-custom" autocomplete="off"
+                        placeholder="||notepad  or  C:\Windows\System32\notepad.exe" hidden>
+                </div>
                 <div class="form-row">
                     <label class="checkbox-label">
                         <input type="checkbox" id="fullscreen-preconnect" checked>
@@ -120,6 +131,11 @@
     <!-- RDP Canvas (hidden until connected) -->
     <div id="canvas-container" class="canvas-container" hidden>
         <canvas id="rdp-canvas"></canvas>
+        <!-- RemoteApp (RAIL) window host: one absolutely-positioned canvas per
+             remote top-level window lives here. Hidden in full-desktop mode. -->
+        <div id="rail-desktop" class="rail-desktop" hidden></div>
+        <!-- Transient toast (RAIL launch failures, host-doesn't-support-RAIL) -->
+        <div id="toast" class="toast" hidden></div>
         <!-- Reconnection Overlay -->
         <div id="reconnect-overlay" class="reconnect-overlay" hidden>
             <div class="reconnect-card">

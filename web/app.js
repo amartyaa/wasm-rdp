@@ -1,6 +1,12 @@
 // ── Feature flags (injected by server into window.* before this script loads) ─
 const textClipboardEnabled = window.__IB_TEXT_CLIPBOARD === true;
 const fileClipboardEnabled = window.__IB_FILE_CLIPBOARD === true;
+const remoteAppEnabled = window.__IB_REMOTE_APP === true;
+const remoteAppCatalog = Array.isArray(window.__IB_REMOTE_APPS) ? window.__IB_REMOTE_APPS : [];
+
+// RemoteApp (RAIL) launch target for the current/next connection, persisted so
+// reconnect relaunches the same app. Empty ⇒ full-desktop session.
+let railProgram = '';
 
 // ── WASM Module Loading ──────────────────────────────────
 let wasm = null;
@@ -56,6 +62,9 @@ async function loadWasm() {
     const cachedUsername = localStorage.getItem('rdp_username');
     if (cachedDomain) document.getElementById('domain').value = cachedDomain;
     if (cachedUsername) document.getElementById('username').value = cachedUsername;
+
+    // RemoteApp (RAIL) picker: only rendered when the server enabled the feature.
+    initRailPicker();
 
     // Restore FPS cap setting
     const fpsSelect = document.getElementById('fps-cap');
@@ -160,6 +169,7 @@ const btnLoader = connectBtn.querySelector('.btn-loader');
 const loginError = document.getElementById('login-error');
 const canvasContainer = document.getElementById('canvas-container');
 const canvas = document.getElementById('rdp-canvas');
+const railDesktop = document.getElementById('rail-desktop');
 const toolbar = document.getElementById('toolbar');
 const fpsBadge = document.getElementById('fps-badge');
 const resBadge = document.getElementById('resolution-badge');
@@ -255,6 +265,9 @@ let multimonEnabled = localStorage.getItem('rdp_multimon') === '1';
 let monitorPopups = [];      // secondary displays: [{ win, canvas, monitor }]
 let screenDetailsObj = null; // ScreenDetails handle (source of 'screenschange')
 let multimonInUse = false;   // true while a multi-monitor session is active
+let railInUse = false;       // true while a RemoteApp (RAIL) session is active
+// RAIL window manager: windowId → { el, canvas, x, y, w, h }.
+const railWindows = new Map();
 
 // ── Reconnection State ───────────────────────────────────
 let savedCredentials = null;  // { username, password, domain }
@@ -325,6 +338,10 @@ loginForm.addEventListener('submit', async (e) => {
     const password = document.getElementById('password').value;
     const domain = document.getElementById('domain').value || '';
 
+    // Capture the RemoteApp selection now (module-level so reconnect reuses it).
+    railProgram = getRailSelection();
+    if (remoteAppEnabled) localStorage.setItem('rdp_rail_app', railProgram);
+
     setConnecting(true);
     hideError();
     flapCount = 0; // fresh user-initiated connect — clean slate for flap detection
@@ -361,6 +378,56 @@ loginForm.addEventListener('submit', async (e) => {
         }
     }
 });
+
+// Populate + reveal the Application picker when the server enabled RemoteApp.
+function initRailPicker() {
+    if (!remoteAppEnabled) return;
+    const group = document.getElementById('rail-app-group');
+    const select = document.getElementById('rail-app');
+    const custom = document.getElementById('rail-app-custom');
+    if (!group || !select) return;
+
+    const customOpt = select.querySelector('option[value="__custom__"]');
+    for (const app of remoteAppCatalog) {
+        if (!app || !app.program) continue;
+        const opt = document.createElement('option');
+        opt.value = app.program;
+        opt.textContent = app.name || app.program;
+        select.insertBefore(opt, customOpt);
+    }
+
+    const saved = localStorage.getItem('rdp_rail_app');
+    if (saved) {
+        if ([...select.options].some(o => o.value === saved)) {
+            select.value = saved;
+        } else {
+            select.value = '__custom__';
+            custom.value = saved;
+        }
+    }
+
+    const syncCustom = () => { custom.hidden = select.value !== '__custom__'; };
+    select.addEventListener('change', syncCustom);
+    syncCustom();
+    group.hidden = false;
+
+    // Deep link: ?app=||notepad → bookmarkable per-app launch (Citrix icon eq).
+    const q = new URLSearchParams(location.search).get('app');
+    if (q) { select.value = '__custom__'; custom.value = q; syncCustom(); }
+}
+
+// Resolve the picker to a program string ('' = full desktop).
+function getRailSelection() {
+    if (!remoteAppEnabled) return '';
+    const select = document.getElementById('rail-app');
+    if (!select) return '';
+    const raw = select.value === '__custom__'
+        ? (document.getElementById('rail-app-custom').value || '')
+        : select.value;
+    // Strip bidi/zero-width control chars — Windows Explorer's "Copy as path"
+    // prefixes a U+202A (LTR embedding), which corrupts the exec path.
+    return raw.replace(/[​-‏‪-‮⁦-⁩﻿]/g, '').trim();
+}
 
 async function doConnect(username, password, domain) {
     const width = window.innerWidth;
@@ -417,8 +484,10 @@ async function doConnect(username, password, domain) {
         advEnableFontSmoothing, advDisableCursorEffects,
         advAllowWallpaper, advAllowThemes, advAllowAnimations,
         !!h264Codec,
+        railProgram, '', '',
     );
     multimonInUse = !!monitorBuild;
+    railInUse = railProgram !== '';
 
     // Store credentials in-memory for reconnection
     savedCredentials = { username, password, domain };
@@ -437,6 +506,14 @@ async function doConnect(username, password, domain) {
     localStorage.setItem('rdp_username', username);
 
     resBadge.textContent = `${session.width}×${session.height}`;
+    // RemoteApp: hide the full-desktop canvas and reveal the window host, sized
+    // to the negotiated desktop (windows are placed at server coordinates).
+    if (railInUse) {
+        railDesktop.style.width = `${session.width}px`;
+        railDesktop.style.height = `${session.height}px`;
+        railDesktop.hidden = false;
+        canvas.hidden = true;
+    }
     setupInputHandlers();
     if (multimonInUse) {
         setupMonitorSurfaces(monitorBuild.layout);
@@ -522,6 +599,11 @@ function showError(msg) {
 function friendlyError(err) {
     const raw = String(err && err.message ? err.message : err);
     const s = raw.toLowerCase();
+    // RemoteApp requested against a host that doesn't serve RAIL (xrdp / GNOME /
+    // unconfigured Windows). Deliberate hard-fail, not a silent desktop fallback.
+    if (s.includes('does not support remoteapp')) {
+        return "This host doesn't support RemoteApp — connect with the Application set to Full desktop.";
+    }
     // Authentication / NLA (CredSSP) failure — almost always wrong credentials.
     if (s.includes('credssp') || s.includes('earlyuserauth') ||
         s.includes('logon') || s.includes('0xc000006d') ||
@@ -1077,6 +1159,8 @@ function cleanupSession() {
     // Multi-monitor: close secondary windows and stop tracking screen changes.
     teardownMonitorWindows();
     multimonInUse = false;
+    // RemoteApp: drop all window canvases and restore the desktop canvas.
+    teardownRailWindows();
     if (screenDetailsObj) {
         try { screenDetailsObj.removeEventListener('screenschange', onScreensChange); } catch (_) {}
         screenDetailsObj = null;
@@ -1215,6 +1299,18 @@ window.__rdp_session_ended = function(reason) {
         return;
     }
 
+    // RAIL: the published app exiting logs the session off host-side. If every
+    // app window was already gone when the session ended, that's a normal app
+    // exit, not a failure — land back on login quietly and never auto-reconnect
+    // (a reconnect would relaunch the application the user just closed).
+    if (railInUse && railWindows.size === 0 && !isUserDisconnect &&
+        (reason === 'server_disconnect' || reason === 'connection_lost')) {
+        cancelReconnect();
+        cleanupSession();
+        showToast('Application closed — session ended.');
+        return;
+    }
+
     // Server evicted us because a new connection took over this machine. On a
     // single-session host (Windows client, same xrdp user) reconnecting would
     // evict whoever connected after us — the two clients ping-pong and the flood
@@ -1333,6 +1429,220 @@ window.__rdp_frame = function() {
     frameCount++;
     lastFrameTimestamp = performance.now();
 };
+
+// ── RemoteApp (RAIL) window manager ──────────────────────
+// Each remote top-level window is an absolutely-positioned <canvas> inside
+// #rail-desktop. WASM paints each via its own surface (framebuffer region at the
+// window's server coordinates), so windows composite with correct overlap.
+const SW_HIDE = 0, SW_SHOWMINIMIZED = 2;
+const SC_MAXIMIZE = 0xF030;
+let railMaximizedFirst = false; // one-shot: auto-maximize the app's main window
+let railMainWindowId = null;    // the maximized window; its close = app exit
+let railHadWindows = false;     // guards startup's initial 0-window state
+let railExitTimer = null;       // debounce for app-closed → session end
+
+// Rebuild the WASM surface list from the currently-visible windows, then repaint.
+// Called on any geometry/visibility/set change — low-rate (server-throttled), so
+// it stays off the paint hot path.
+function rebuildRailSurfaces() {
+    if (!session) return;
+    session.clear_surfaces();
+    for (const w of railWindows.values()) {
+        if (w.hidden) continue;
+        session.add_surface(w.canvas, w.x, w.y, w.w, w.h);
+    }
+    session.repaint();
+}
+
+// window.__rdp_rail_window(id, isNew, hasPos, x, y, hasSize, w, h, showState, title, visRects)
+window.__rdp_rail_window = function(id, isNew, hasPos, x, y, hasSize, w, h, showState, title, visRects) {
+    let win = railWindows.get(id);
+    let structural = false; // did the surface set / geometry change?
+
+    if (!win) {
+        const el = document.createElement('div');
+        el.className = 'rail-window';
+        const c = document.createElement('canvas');
+        el.appendChild(c);
+        railDesktop.appendChild(el);
+        attachCanvasMouse(c, 0, 0);
+        // Focus the window on press before the click reaches the server-drawn chrome.
+        c.addEventListener('mousedown', () => { if (session) session.rail_activate(id >>> 0); }, true);
+        win = { el, canvas: c, x: 0, y: 0, w: 0, h: 0, hidden: false };
+        railWindows.set(id, win);
+        structural = true;
+        railHadWindows = true;
+        if (railExitTimer) { clearTimeout(railExitTimer); railExitTimer = null; }
+    }
+
+    if (hasPos && (win.x !== x || win.y !== y)) {
+        win.x = x; win.y = y;
+        win.el.style.transform = `translate(${x}px, ${y}px)`;
+        win.canvas.__rdpOffset = { x, y };
+        structural = true;
+    }
+    if (hasSize && (win.w !== w || win.h !== h)) {
+        win.w = w; win.h = h;
+        win.canvas.width = w;
+        win.canvas.height = h;
+        win.canvas.style.width = `${w}px`;
+        win.canvas.style.height = `${h}px`;
+        win.canvas.__rdpOffset = { x: win.x, y: win.y };
+        structural = true;
+    }
+    if (isNew) {
+        win.el.style.transform = `translate(${win.x}px, ${win.y}px)`;
+    }
+
+    if (showState !== -1) {
+        const nowHidden = showState === SW_HIDE || showState === SW_SHOWMINIMIZED;
+        if (nowHidden !== win.hidden) {
+            win.hidden = nowHidden;
+            win.el.hidden = nowHidden;
+            structural = true;
+        }
+    }
+
+    // Visibility rects (non-rectangular / occluded region) → CSS clip-path,
+    // relative to the window origin. Empty ⇒ no clip.
+    if (visRects && visRects.length >= 8) {
+        const polys = [];
+        for (let i = 0; i + 3 < visRects.length; i += 4) {
+            const l = visRects[i] - win.x, t = visRects[i + 1] - win.y;
+            const r = visRects[i + 2] - win.x, b = visRects[i + 3] - win.y;
+            polys.push(`${l}px ${t}px, ${r}px ${t}px, ${r}px ${b}px, ${l}px ${b}px`);
+        }
+        // Multiple rects: union via evenodd is not expressible in one polygon;
+        // fall back to the bounding clip (tightens reveals without artifacts).
+        win.canvas.style.clipPath = polys.length ? `polygon(${polys[0]})` : 'none';
+    }
+
+    if (title != null) win.el.title = title;
+
+    if (structural) rebuildRailSurfaces();
+};
+
+// One-shot: activate + maximize the app's main window so it fills the canvas.
+// The RAIL work area we declared equals the canvas size, so SC_MAXIMIZE is an
+// exact server-side fit — no client scaling, no blur, no per-frame cost.
+// ponytail: maximizes the first window the server marks foreground (ACTIVE_WND).
+// The window must already exist locally (has() filters the 0xFFFFFFFF "desktop
+// deactivated" order); dialogs/child windows keep their natural size.
+function maximizeFirstRailWindow(id) {
+    if (railMaximizedFirst || !session || !railWindows.has(id)) return;
+    railMaximizedFirst = true;
+    railMainWindowId = id >>> 0;
+    console.log(`[RAIL] maximizing window 0x${(id >>> 0).toString(16)}`);
+    session.rail_activate(id >>> 0);
+    session.rail_sys_command(id >>> 0, SC_MAXIMIZE);
+}
+
+// Server reports a window became foreground (ACTIVE_WND desktop order). This is
+// the "window fully created and foreground" signal — sending SC_MAXIMIZE at
+// window-create time is ignored host-side (the window isn't routing
+// WM_SYSCOMMAND yet), so this is the sole, reliable maximize trigger. Fires with
+// 0xFFFFFFFF for "no active window"; maximizeFirstRailWindow filters that out.
+window.__rdp_rail_active = function(id) {
+    maximizeFirstRailWindow(id);
+};
+
+window.__rdp_rail_window_deleted = function(id) {
+    const win = railWindows.get(id);
+    if (!win) return;
+    win.el.remove();
+    railWindows.delete(id);
+    rebuildRailSurfaces();
+    console.log(`[RAIL] window deleted 0x${(id >>> 0).toString(16)} (${railWindows.size} left)`);
+    // App exit = the visible main (maximized) window closed, OR every window is
+    // gone. Prefer the main-window signal: Win11 apps keep invisible helper
+    // windows alive for seconds after the visible window closes, so waiting for
+    // size===0 adds a multi-second lag before the session ends. The host may not
+    // log the session off either (the app lingers as a process), so we end it
+    // client-side. Debounced to ride out a window being deleted+recreated.
+    const mainGone = railMaximizedFirst && (id >>> 0) === railMainWindowId;
+    if (railHadWindows && (mainGone || railWindows.size === 0)) scheduleRailExitCheck();
+};
+
+function scheduleRailExitCheck() {
+    if (railExitTimer) clearTimeout(railExitTimer);
+    railExitTimer = setTimeout(() => {
+        railExitTimer = null;
+        const mainGone = railMainWindowId !== null && !railWindows.has(railMainWindowId);
+        if (railInUse && session && railHadWindows && (mainGone || railWindows.size === 0)) {
+            console.log('[RAIL] app closed — ending session');
+            disconnect();
+            showToast('Application closed — session ended.');
+        }
+    }, 150);
+}
+
+// Top-most first. DOM z-index descends from a high base so later (lower) windows
+// still sit above the backdrop.
+window.__rdp_rail_zorder = function(ids) {
+    const n = ids.length;
+    for (let i = 0; i < n; i++) {
+        const win = railWindows.get(ids[i] >>> 0);
+        if (win) win.el.style.zIndex = String(1000 + (n - i));
+    }
+};
+
+// exec result: 0 = success; nonzero drives a launch-failure toast + disconnect.
+window.__rdp_rail_exec_result = function(execResult, rawResult) {
+    if (execResult === 0) { console.log('[RAIL] exec confirmed by host (result=0)'); return; }
+    const reasons = {
+        1: 'the application hook is not loaded',
+        2: 'the launch request could not be decoded',
+        3: 'the application is not in the host allow-list',
+        5: 'the application file was not found',
+        6: 'the application failed to launch',
+        7: 'the session is locked',
+    };
+    const why = reasons[execResult] || `error ${execResult}`;
+    showToast(`Application failed to launch — ${why}.`);
+    isUserDisconnect = true; // don't auto-reconnect into the same failure
+    setTimeout(() => disconnect(), 50);
+};
+
+// Remove every RAIL window and restore the full-desktop canvas (on disconnect).
+function teardownRailWindows() {
+    for (const w of railWindows.values()) w.el.remove();
+    railWindows.clear();
+    railMaximizedFirst = false;
+    railMainWindowId = null;
+    railHadWindows = false;
+    if (railExitTimer) { clearTimeout(railExitTimer); railExitTimer = null; }
+    if (railDesktop) railDesktop.hidden = true;
+    canvas.hidden = false;
+    railInUse = false;
+}
+
+// ── Transient toast ──────────────────────────────────────
+let toastTimer = null;
+function showToast(msg) {
+    const el = document.getElementById('toast');
+    if (!el) { console.warn('[toast]', msg); return; }
+    el.textContent = msg;
+    el.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.hidden = true; }, 6000);
+}
+
+// ── Tab/window close guard ───────────────────────────────
+// Confirm before leaving while a session is live (an accidental tab close kills
+// the RDP session). On an actual leave, ask the host to log the session off so
+// the remote app closes itself instead of lingering in a disconnected session.
+window.addEventListener('beforeunload', (e) => {
+    if (!session) return;
+    e.preventDefault();
+    e.returnValue = ''; // some browsers require this to show the prompt
+});
+window.addEventListener('pagehide', (e) => {
+    if (e.persisted || !session) return; // bfcache stash, not a real close
+    // ponytail: best-effort — shutdown() enqueues a Shutdown Request over the WS;
+    // the browser flushes buffered WS bytes on unload but doesn't guarantee it.
+    // Worst case degrades to a dropped socket (today's behavior), no regression.
+    session.shutdown();
+});
 
 // ── Performance HUD Toggle ───────────────────────────────
 fpsBadge.addEventListener('click', () => {

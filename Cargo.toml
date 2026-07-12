@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "wasm"]
+members = ["server", "wasm", "crates/ironrdp-rail"]
 resolver = "2"
 
 # Optimized release builds for both the server and the WASM decoder.
@@ -16,10 +16,10 @@ panic = "abort"
 # builds off this machine (e.g. the Windows VM). To iterate on the fork
 # locally instead, comment these out and use the local-path patch below
 # (see ../rdp-reference/IronRDP-fork and scripts/ dev notes).
-ironrdp-session = { git = "https://github.com/amartyaa/IronRDP.git", rev = "2dbc36a0b6cafb26dc5330c93cc4bc5e5e87e316" }
-ironrdp         = { git = "https://github.com/amartyaa/IronRDP.git", rev = "2dbc36a0b6cafb26dc5330c93cc4bc5e5e87e316" }
-ironrdp-core    = { git = "https://github.com/amartyaa/IronRDP.git", rev = "2dbc36a0b6cafb26dc5330c93cc4bc5e5e87e316" }
-ironrdp-cliprdr-format = { git = "https://github.com/amartyaa/IronRDP.git", rev = "2dbc36a0b6cafb26dc5330c93cc4bc5e5e87e316" }
+ironrdp-session = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f" }
+ironrdp         = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f" }
+ironrdp-core    = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f" }
+ironrdp-cliprdr-format = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f" }
 # Local-path patch (fork dev):
 # ironrdp-session = { path = "../rdp-reference/IronRDP-fork/crates/ironrdp-session" }
 # ironrdp = { path = "../rdp-reference/IronRDP-fork/crates/ironrdp" }

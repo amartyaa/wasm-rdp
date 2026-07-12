@@ -1,28 +1,21 @@
 [package]
-name = "ironrdp-rdpsnd"
-version = "0.7.0"
-description = "RDPSND static channel for audio output implemented as described in MS-RDPEA"
+name = "ironrdp-rail"
+version = "0.1.0"
+description = "RAIL (RemoteApp) static channel + window orders, implemented as described in MS-RDPERP"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 
 [lib]
 doctest = false
-test = false
-
-[features]
-default = []
-std = []
 
 [dependencies]
-bitflags = "2.11"
 tracing = { version = "0.1", features = ["log"] }
 # Pinned by `rev` (not `branch`) to match the root Cargo.toml's [patch] pin —
 # a branch ref and a rev ref to the identical commit are still different
-# Cargo SourceIds, which duplicates ironrdp-svc/-dvc/-core/-pdu in the
-# dependency graph and breaks trait bounds (SvcClientProcessor/DvcProcessor
-# "not satisfied" errors). Update this rev whenever the root pin changes.
+# Cargo SourceIds, which duplicates ironrdp-svc/-core/-pdu in the dependency
+# graph and breaks trait bounds (SvcClientProcessor "not satisfied" errors).
+# Update this rev whenever the root pin changes (same gotcha as ironrdp-rdpsnd).
 ironrdp-svc = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f", version = "0.6" }
-ironrdp-dvc = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f", version = "0.5" }
 ironrdp-core = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f", version = "0.1", features = ["alloc"] }
 ironrdp-pdu = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f", version = "0.7", features = ["alloc"] }

@@ -7,6 +7,7 @@ mod framed;
 mod clipboard;
 mod audio;
 mod redirect;
+mod rail;
 
 /// Bridges IronRDP's internal `tracing` logs (which flow through the `log`
 /// facade via tracing's "log" feature) to the browser console. Info and above
@@ -71,6 +72,9 @@ pub async fn connect(
     allow_themes: bool,
     allow_animations: bool,
     enable_avc420: bool,
+    rail_program: String,
+    rail_args: String,
+    rail_dir: String,
 ) -> Result<session::Session, JsValue> {
     session::Session::connect(
         ws_url, username, password, domain, width, height, canvas_id,
@@ -80,6 +84,7 @@ pub async fn connect(
         enable_font_smoothing, disable_cursor_effects,
         allow_wallpaper, allow_themes, allow_animations,
         enable_avc420,
+        rail_program, rail_args, rail_dir,
     )
     .await
     .map_err(|e| JsValue::from_str(&format!("{e:#}")))

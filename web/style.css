@@ -366,13 +366,49 @@ html, body {
     image-rendering: auto;
 }
 
+/* ── RemoteApp (RAIL) window host ──────────────────────── */
+/* Sized to the negotiated desktop; windows are absolutely positioned within it
+   at server coordinates (via transform on .rail-window). */
+.rail-desktop {
+    position: relative;
+    overflow: hidden;
+}
+
+.rail-window {
+    position: absolute;
+    top: 0;
+    left: 0;
+    will-change: transform;
+}
+
+.rail-window canvas {
+    display: block;
+}
+
+/* ── Transient toast ───────────────────────────────────── */
+.toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 2000;
+    max-width: 90vw;
+    padding: 12px 18px;
+    background: rgba(20, 20, 22, 0.95);
+    color: #fff;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 10px;
+    font-size: 14px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+}
+
 /* ── Toolbar ───────────────────────────────────────────── */
 .toolbar {
     position: fixed;
     top: 0;
     left: 50%;
     transform: translateX(-50%) translateY(-100%);
-    z-index: 1000;
+    z-index: 5000; /* above RAIL windows (1000+n) */
     transition: transform 0.25s ease;
     padding-top: 4px;
 }
@@ -462,7 +498,7 @@ html, body {
     left: 0;
     right: 0;
     height: 8px;
-    z-index: 999;
+    z-index: 4999; /* above RAIL windows, just under the toolbar itself */
 }
 
 /* ── Reconnection Overlay ──────────────────────────────── */
@@ -475,7 +511,7 @@ html, body {
     background: rgba(10, 14, 26, 0.85);
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
-    z-index: 100;
+    z-index: 5000; /* must cover stale RAIL windows during reconnect backoff */
 }
 
 .reconnect-card {
@@ -536,11 +572,12 @@ html, body {
 }
 
 /* ── Performance HUD ──────────────────────────────────── */
+/* Session chrome sits above RAIL windows (z-index 1000+n). */
 .perf-hud {
     position: absolute;
     top: 16px;
     right: 16px;
-    z-index: 100;
+    z-index: 5000;
     min-width: 200px;
     padding: 14px 18px;
     background: rgba(10, 14, 26, 0.75);

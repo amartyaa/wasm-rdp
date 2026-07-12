@@ -759,6 +759,13 @@ pub(crate) enum InputEvent {
     Cliprdr(ironrdp::cliprdr::backend::ClipboardMessage),
     /// Advertise local files to the remote (Local→Remote file transfer).
     FileCopy(Vec<ironrdp::cliprdr::pdu::FileDescriptor>),
+    /// RAIL: focus a window (Client Activate PDU).
+    RailActivate { window_id: u32, enabled: bool },
+    /// RAIL: window system command — minimize/restore/close (Client SysCommand PDU).
+    RailSysCommand { window_id: u32, command: u16 },
+    /// RAIL: re-blit the current framebuffer into all surfaces after JS rebuilds
+    /// the per-window canvases on a geometry change.
+    Repaint,
     Terminate,
 }
 
@@ -785,8 +792,16 @@ impl Session {
         allow_themes: bool,
         allow_animations: bool,
         enable_avc420: bool,
+        rail_program: String,
+        rail_args: String,
+        rail_dir: String,
     ) -> anyhow::Result<Session> {
         log(&format!("Connecting to proxy: {ws_url}"));
+
+        // RemoteApp (RAIL) mode is opt-in per connection: a non-empty program
+        // ⇒ launch it as a seamless app; empty ⇒ today's full-desktop behavior,
+        // byte-for-byte (every RAIL branch below is gated on `rail_mode`).
+        let rail_mode = !rail_program.is_empty();
 
         // Multi-monitor: parse the flat layout from JS into GCC monitor rects.
         // Empty ⇒ single-monitor (unchanged legacy behavior). When present, the
@@ -826,17 +841,23 @@ impl Session {
         log("WebSocket connected to proxy");
 
         // Advertise the MS-RDPEGFX graphics pipeline so a GPU-less Windows host
-        // delivers RFX-Progressive. TODO(Phase 4): gate behind a UI toggle; on
-        // during dev so the progressive path is exercised end-to-end. (xrdp
-        // ignores the flag and stays on legacy RFX — no effect there.)
-        let enable_gfx = true;
+        // delivers RFX-Progressive. (xrdp ignores the flag and stays on legacy
+        // RFX — no effect there.)
+        //
+        // Classic RAIL exception (plan risk R2): with EGFX on, a RAIL host maps
+        // per-window EGFX surfaces (MapSurfaceToWindow — it opens the
+        // RDS::Geometry DVCs and routes pixels there), which our Phase-6 hook
+        // doesn't render yet → black windows. Force legacy graphics in rail_mode
+        // so the desktop framebuffer flows through DecodedImage, which the
+        // per-window canvases read. Enhanced RemoteApp (Phase 6) re-enables it.
+        let enable_gfx = !rail_mode;
 
         // Build IronRDP connector config
         let config = build_connector_config(
             username.clone(), password.clone(), domain.clone(), width, height,
             monitor_layout, enable_audio, enable_font_smoothing, disable_cursor_effects,
             allow_wallpaper, allow_themes, allow_animations,
-            enable_gfx,
+            enable_gfx, rail_mode,
         );
 
         // Split WebSocket for bidirectional I/O
@@ -876,6 +897,24 @@ impl Session {
                 Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac))
             );
             connector.with_static_channel(rdpsnd)
+        } else {
+            connector
+        };
+
+        // RAIL (RemoteApp) static channel: launches `rail_program` once the
+        // server completes the RAIL handshake. Only registered in rail_mode, so
+        // desktop sessions never advertise the channel.
+        let connector = if rail_mode {
+            log(&format!("[RAIL] attaching rail channel, program='{rail_program}'"));
+            let rail = ironrdp_rail::Rail::new(
+                Box::new(crate::rail::WasmRailHandler),
+                rail_program.clone(),
+                rail_dir.clone(),
+                rail_args.clone(),
+                width,
+                height,
+            );
+            connector.with_static_channel(rail)
         } else {
             connector
         };
@@ -973,6 +1012,7 @@ impl Session {
                     desktop_height,
                     fps_cap,
                     egfx_active,
+                    rail_mode,
                 ).await {
                     Ok(tag) => {
                         log("RDP session ended");
@@ -1064,7 +1104,7 @@ impl Session {
             username, String::new(), domain, width, height,
             monitor_layout, enable_audio, enable_font_smoothing, disable_cursor_effects,
             allow_wallpaper, allow_themes, allow_animations,
-            enable_gfx,
+            enable_gfx, false, // redirected sessions are always full desktop
         );
 
         let (ws_write, ws_read) = ws.split();
@@ -1162,6 +1202,7 @@ impl Session {
                     desktop_height,
                     fps_cap,
                     egfx_active,
+                    false, // server-redirected sessions are always full desktop
                 ).await {
                     Ok(tag) => {
                         log("RDP session ended");
@@ -1363,6 +1404,52 @@ impl Session {
         if blit_rects(&self.surfaces, &s.fb, s.width, s.height, s.origin_x, s.origin_y, &full) {
             crate::notify_frame();
         }
+    }
+
+    /// RAIL: give focus to a remote window ([MS-RDPERP] Client Activate PDU).
+    /// JS calls this on mousedown over a window canvas before forwarding input.
+    #[wasm_bindgen]
+    pub fn rail_activate(&self, window_id: u32) {
+        let _ = self
+            .input_tx
+            .unbounded_send(InputEvent::RailActivate { window_id, enabled: true });
+    }
+
+    /// RAIL: send a window system command ([MS-RDPERP] Client SysCommand PDU) —
+    /// e.g. SC_MINIMIZE / SC_RESTORE / SC_CLOSE.
+    #[wasm_bindgen]
+    pub fn rail_sys_command(&self, window_id: u32, command: u16) {
+        let _ = self
+            .input_tx
+            .unbounded_send(InputEvent::RailSysCommand { window_id, command });
+    }
+
+    /// RAIL: repaint every window canvas after JS rebuilds the surface list on a
+    /// window geometry change (re-blits the current framebuffer; no server round
+    /// trip). Handles both EGFX (re-blit mapped GFX surfaces) and legacy (via a
+    /// full-desktop GraphicsUpdate through the session loop).
+    #[wasm_bindgen]
+    pub fn repaint(&self) {
+        let gfx = self.gfx_surfaces.borrow();
+        let mut painted = false;
+        for s in gfx.values() {
+            if !s.mapped {
+                continue;
+            }
+            let full = [ironrdp::pdu::geometry::InclusiveRectangle {
+                left: 0,
+                top: 0,
+                right: s.width.saturating_sub(1),
+                bottom: s.height.saturating_sub(1),
+            }];
+            if blit_rects(&self.surfaces, &s.fb, s.width, s.height, s.origin_x, s.origin_y, &full) {
+                painted = true;
+            }
+        }
+        if painted {
+            crate::notify_frame();
+        }
+        let _ = self.input_tx.unbounded_send(InputEvent::Repaint);
     }
 }
 
@@ -1816,6 +1903,38 @@ thread_local! {
     static PENDING_REDIRECT: RefCell<Option<crate::redirect::PendingRedirect>> = RefCell::new(None);
 }
 
+/// A full-desktop dirty region, used to force a complete repaint.
+fn full_region(width: u16, height: u16) -> ironrdp::pdu::geometry::InclusiveRectangle {
+    ironrdp::pdu::geometry::InclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: width.saturating_sub(1),
+        bottom: height.saturating_sub(1),
+    }
+}
+
+/// Run a closure against the live RAIL SVC processor, encode whatever it emits
+/// (Activate / SysCommand PDUs) and return it as a response frame.
+fn rail_svc_messages(
+    active_stage: &mut ActiveStage,
+    f: impl FnOnce(&ironrdp_rail::Rail) -> Vec<ironrdp::svc::SvcMessage>,
+) -> anyhow::Result<Vec<ActiveStageOutput>> {
+    let Some(rail) = active_stage.get_svc_processor_mut::<ironrdp_rail::Rail>() else {
+        log_error("RAIL command but rail channel is not available");
+        return Ok(Vec::new());
+    };
+    let messages = f(rail);
+    if messages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let frame = active_stage
+        .process_svc_processor_messages(
+            ironrdp::svc::SvcProcessorMessages::<ironrdp_rail::Rail>::new(messages),
+        )
+        .context("encode RAIL SVC messages")?;
+    Ok(vec![ActiveStageOutput::ResponseFrame(frame)])
+}
+
 async fn run_session(
     connection_result: ConnectionResult,
     mut framed: WasmFramed,
@@ -1826,6 +1945,7 @@ async fn run_session(
     height: u16,
     _fps_cap: u32,
     egfx_active: Rc<std::cell::Cell<bool>>,
+    rail_mode: bool,
 ) -> anyhow::Result<&'static str> {
     let image = Rc::new(RefCell::new(DecodedImage::new(PixelFormat::RgbA32, width, height)));
     let mut active_stage = ActiveStage::new(connection_result);
@@ -1965,6 +2085,19 @@ async fn run_session(
                             Vec::new()
                         }
                     }
+                    Some(InputEvent::RailActivate { window_id, enabled }) => {
+                        rail_svc_messages(&mut active_stage, |rail| rail.activate(window_id, enabled))?
+                    }
+                    Some(InputEvent::RailSysCommand { window_id, command }) => {
+                        rail_svc_messages(&mut active_stage, |rail| rail.sys_command(window_id, command))?
+                    }
+                    Some(InputEvent::Repaint) => {
+                        // Re-blit the whole framebuffer after JS repositions the
+                        // per-window canvases. In EGFX mode the DecodedImage is
+                        // black (suppressed below), so the Session-side EGFX
+                        // re-blit handles that case; this covers legacy RAIL.
+                        vec![ActiveStageOutput::GraphicsUpdate(full_region(width, height))]
+                    }
                     Some(InputEvent::Terminate) => {
                         active_stage.graceful_shutdown()
                             .context("graceful shutdown")?
@@ -2057,6 +2190,76 @@ async fn run_session(
                     let pending = crate::redirect::PendingRedirect::from_packet(&packet);
                     PENDING_REDIRECT.with(|cell| *cell.borrow_mut() = Some(pending));
                     return Ok("redirected");
+                }
+                ActiveStageOutput::Orders(data) => {
+                    // RAIL window-management orders (MS-RDPERP altsec window info).
+                    // Only parsed in rail_mode — desktop sessions never opt in, so
+                    // this stays off their hot path entirely (perf: zero cost when
+                    // rail is off; a low-rate metadata parse when on).
+                    if rail_mode {
+                        crate::rail::dispatch_window_events(&data);
+                    }
+                }
+                ActiveStageOutput::DeactivateAll(mut activation) => {
+                    // Deactivation-Reactivation Sequence (MS-RDPBCGR 1.3.1.3):
+                    // the server drops back to capability re-exchange mid-session.
+                    // RAIL hosts do this right after the rdpshell starts — before
+                    // this arm existed the request was silently swallowed and the
+                    // server waited on a Confirm Active forever (black screen, no
+                    // window orders). Ported from the fork's ironrdp-client
+                    // rdp.rs DeactivateAll arm, hand-pumped over WasmFramed.
+                    log("Deactivate All received — running reactivation sequence");
+                    let mut buf = WriteBuf::new();
+                    loop {
+                        if let ironrdp::connector::connection_activation::ConnectionActivationState::Finalized {
+                            io_channel_id,
+                            user_channel_id,
+                            desktop_size,
+                            share_id,
+                            enable_server_pointer,
+                            pointer_software_rendering,
+                        } = activation.connection_activation_state()
+                        {
+                            log(&format!(
+                                "Reactivation complete: {}x{}",
+                                desktop_size.width, desktop_size.height
+                            ));
+                            *image.borrow_mut() = DecodedImage::new(
+                                PixelFormat::RgbA32,
+                                desktop_size.width,
+                                desktop_size.height,
+                            );
+                            active_stage.set_fastpath_processor(
+                                ironrdp::session::fast_path::ProcessorBuilder {
+                                    io_channel_id,
+                                    user_channel_id,
+                                    share_id,
+                                    enable_server_pointer,
+                                    pointer_software_rendering,
+                                    bulk_decompressor: None,
+                                }
+                                .build(),
+                            );
+                            active_stage.set_share_id(share_id);
+                            active_stage.set_enable_server_pointer(enable_server_pointer);
+                            break;
+                        }
+                        buf.clear();
+                        let written = match activation.next_pdu_hint() {
+                            Some(hint) => {
+                                let pdu = framed.read_by_hint(hint).await
+                                    .context("read reactivation PDU")?;
+                                activation.step(&pdu, &mut buf)
+                                    .context("reactivation step")?
+                            }
+                            None => activation.step_no_input(&mut buf)
+                                .context("reactivation step")?,
+                        };
+                        if written.size().is_some() {
+                            writer_tx.unbounded_send(buf.filled().to_vec())
+                                .context("send reactivation frame")?;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -2156,6 +2359,7 @@ fn build_connector_config(
     allow_themes: bool,
     allow_animations: bool,
     enable_gfx: bool,
+    enable_remote_apps: bool,
 ) -> connector::Config {
     let domain = if domain.is_empty() { None } else { Some(domain) };
 
@@ -2214,6 +2418,9 @@ fn build_connector_config(
         // delivers RFX-Progressive (GPU-less Windows) / H.264. We attach a GFX
         // handler in run_session; without it a GFX-capable host would blank.
         support_graphics_pipeline: enable_gfx,
+        // RemoteApp (RAIL): sets INFO_RAIL + advertises the Remote Programs /
+        // Window List cap sets. Off ⇒ byte-identical to today's desktop client.
+        enable_remote_apps,
     }
 }
 

@@ -19,6 +19,8 @@ ironrdp = { git = "https://github.com/Devolutions/IronRDP.git", branch = "master
 ] }
 ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", branch = "master" }
 ironrdp-cliprdr-format = { git = "https://github.com/Devolutions/IronRDP.git", branch = "master" }
+# Vendored RAIL (RemoteApp) channel + window-order parser (MS-RDPERP).
+ironrdp-rail = { path = "../crates/ironrdp-rail" }
 
 # Auth
 sspi = "0.19"

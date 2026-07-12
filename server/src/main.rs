@@ -58,6 +58,19 @@ struct Args {
     #[arg(long, default_value_t = false, env = "IB_FILE_CLIPBOARD_SYNC")]
     enable_file_clipboard_sync: bool,
 
+    /// Enable RemoteApp (RAIL) publishing — the login page gains an optional
+    /// Application picker; empty selection stays a full-desktop session.
+    /// Windows hosts only. Default: disabled. Also via IB_ENABLE_REMOTE_APP (CLI wins).
+    #[arg(long, default_value_t = false, env = "IB_ENABLE_REMOTE_APP")]
+    enable_remote_app: bool,
+
+    /// Published RemoteApp catalog entries, `"Name=||alias"` or `"Name=C:\\path.exe"`,
+    /// shown as a dropdown when --enable-remote-app is set. Repeatable, or a
+    /// `;`-separated list via IB_REMOTE_APPS. Purely a UI convenience (the host
+    /// still gates what may launch via TSAppAllowList).
+    #[arg(long = "app", env = "IB_REMOTE_APPS", value_delimiter = ';')]
+    apps: Vec<String>,
+
     /// Print version
     #[arg(short = 'v', short_alias = 'V', long = "version", action = clap::ArgAction::Version)]
     version: (),
@@ -70,6 +83,9 @@ struct AppConfig {
     app_name: Option<String>,
     enable_text_clipboard: bool,
     enable_file_clipboard: bool,
+    enable_remote_app: bool,
+    /// Raw `"Name=program"` catalog entries; parsed to JSON at injection.
+    remote_apps: Vec<String>,
 }
 
 #[tokio::main]
@@ -98,6 +114,8 @@ async fn run_server(args: Args) {
         app_name: args.app_name.clone(),
         enable_text_clipboard: args.enable_text_clipboard_sync,
         enable_file_clipboard: args.enable_file_clipboard_sync,
+        enable_remote_app: args.enable_remote_app,
+        remote_apps: args.apps.clone(),
     };
 
     if let Some(name) = &config.app_name {
@@ -105,6 +123,10 @@ async fn run_server(args: Args) {
     }
     info!("Text clipboard sync: {}", if config.enable_text_clipboard { "enabled" } else { "disabled" });
     info!("File clipboard sync: {}", if config.enable_file_clipboard { "enabled" } else { "disabled" });
+    info!("RemoteApp publishing: {}", if config.enable_remote_app { "enabled" } else { "disabled" });
+    if config.enable_remote_app && !config.remote_apps.is_empty() {
+        info!("RemoteApp catalog: {} app(s)", config.remote_apps.len());
+    }
 
     let base = args.base_path.trim_end_matches('/').to_string();
 
@@ -154,6 +176,23 @@ async fn run_server(args: Args) {
 }
 
 /// Serve files from the embedded `WebAssets`.
+/// Build a JSON array of `{name, program}` from `"Name=program"` catalog entries
+/// for injection as `window.__IB_REMOTE_APPS`. Malformed entries (no `=`) are
+/// skipped. Hand-rolled escaping keeps the server free of a JSON dependency.
+fn remote_apps_json(entries: &[String]) -> String {
+    fn esc(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+    let items: Vec<String> = entries
+        .iter()
+        .filter_map(|e| e.split_once('='))
+        .map(|(name, program)| {
+            format!(r#"{{"name":"{}","program":"{}"}}"#, esc(name.trim()), esc(program.trim()))
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
 /// For `index.html`, injects `window.__APP_NAME` when `--app-name` was given so
 /// JS can brand the login page title, heading, and popup titles without a rebuild.
 async fn embedded_handler(uri: Uri, State(config): State<AppConfig>) -> impl IntoResponse {
@@ -181,6 +220,11 @@ async fn embedded_handler(uri: Uri, State(config): State<AppConfig>) -> impl Int
                         let safe = name.replace('\\', "\\\\").replace('"', "\\\"");
                         vars.push_str(&format!(r#"window.__APP_NAME="{safe}";"#));
                     }
+                    vars.push_str(&format!("window.__IB_REMOTE_APP={};", config.enable_remote_app));
+                    vars.push_str(&format!(
+                        "window.__IB_REMOTE_APPS={};",
+                        remote_apps_json(&config.remote_apps)
+                    ));
                     let script = format!("<script>{vars}</script>");
                     let patched = html.replace("</head>", &format!("{script}</head>"));
                     Body::from(patched.into_bytes())
