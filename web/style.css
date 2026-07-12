@@ -282,6 +282,43 @@ html, body {
     color: rgba(255,255,255,0.2);
 }
 
+/* RemoteApp picker — match the text inputs' geometry, with the accent chevron
+   and dark option list from .settings-row select (native chrome removed). */
+.form-group select {
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    appearance: none;
+    width: 100%;
+    padding: 10px 36px 10px 14px;
+    background-color: rgba(255,255,255,0.05);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23a9a6ff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    font-family: var(--font);
+    font-size: 0.9rem;
+    cursor: pointer;
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.form-group select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.form-group select option {
+    background: #141023;
+    color: var(--text-primary);
+}
+
+/* free-text path field reveals below the picker on "Custom path…" */
+#rail-app-custom {
+    margin-top: 8px;
+}
+
 .form-row {
     margin-bottom: 20px;
 }
