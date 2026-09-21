@@ -422,6 +422,121 @@ html, body {
     display: block;
 }
 
+/* ── RemoteApp taskbar (auto-hide, bottom) ─────────────── */
+.rail-taskbar-zone {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 6px;
+    z-index: 3999; /* above RAIL windows (1000+n), below top chrome (5000) */
+}
+.rail-taskbar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 44px;
+    padding: 0 8px;
+    background: rgba(18, 16, 34, 0.92);
+    border-top: 1px solid var(--glass-border);
+    backdrop-filter: blur(12px);
+    transform: translateY(100%);
+    transition: transform 0.2s ease;
+    z-index: 4000;
+}
+.rail-taskbar.visible {
+    transform: translateY(0);
+}
+.rail-launcher {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+}
+.rail-launcher:hover {
+    filter: brightness(1.1);
+}
+.rail-taskbar-items {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow-x: auto;
+    flex: 1 1 auto;
+}
+.rail-task-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 200px;
+    height: 34px;
+    padding: 0 10px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.rail-task-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+.rail-task-btn.active {
+    border-color: var(--accent);
+    background: rgba(124, 109, 255, 0.18);
+}
+.rail-task-btn.minimized {
+    opacity: 0.55;
+}
+.rail-task-icon {
+    width: 18px;
+    height: 18px;
+    flex: 0 0 auto;
+    object-fit: contain;
+}
+.rail-task-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.rail-launcher-menu {
+    position: fixed;
+    left: 8px;
+    bottom: 52px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 180px;
+    padding: 6px;
+    background: rgba(18, 16, 34, 0.98);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    z-index: 4001;
+}
+.rail-launcher-item {
+    text-align: left;
+    padding: 8px 10px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 0.82rem;
+    cursor: pointer;
+}
+.rail-launcher-item:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
 /* ── Transient toast ───────────────────────────────────── */
 .toast {
     position: fixed;

@@ -289,6 +289,45 @@ pub(crate) fn notify_avc420_frame(
     });
 }
 
+/// Called from session.rs once the Display Control channel has been opened and
+/// the server's capabilities have arrived — i.e. the moment `encode_resize`
+/// starts working. JS uses it to light up the HUD and to re-send a resize that
+/// was requested before the channel existed (GNOME Remote Desktop's headless
+/// handoff opens it several seconds after connect, so that race is routine).
+pub(crate) fn notify_display_control_ready() {
+    if let Some(window) = web_sys::window() {
+        if let Ok(func) = js_sys::Reflect::get(
+            &wasm_bindgen::JsValue::from(window),
+            &wasm_bindgen::JsValue::from_str("__rdp_display_control_ready"),
+        ) {
+            if let Some(func) = func.dyn_ref::<js_sys::Function>() {
+                let _ = func.call0(&wasm_bindgen::JsValue::NULL);
+            }
+        }
+    }
+}
+
+/// Called from session.rs when the server has applied a new desktop size —
+/// either an EGFX `ResetGraphics` or a completed Deactivation-Reactivation.
+/// JS uses it to drop any interim client-side scaling back to 1:1 and refresh
+/// the resolution readout.
+pub(crate) fn notify_desktop_resized(width: u16, height: u16) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(func) = js_sys::Reflect::get(
+            &wasm_bindgen::JsValue::from(window),
+            &wasm_bindgen::JsValue::from_str("__rdp_desktop_resized"),
+        ) {
+            if let Some(func) = func.dyn_ref::<js_sys::Function>() {
+                let _ = func.call2(
+                    &wasm_bindgen::JsValue::NULL,
+                    &wasm_bindgen::JsValue::from(width),
+                    &wasm_bindgen::JsValue::from(height),
+                );
+            }
+        }
+    }
+}
+
 /// Called from session.rs when an EGFX surface carrying AVC420 is deleted, or
 /// on ResetGraphics (once per surviving surface) — tells JS to close and
 /// discard that surface's `VideoDecoder`, if one exists.

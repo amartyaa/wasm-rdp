@@ -190,6 +190,24 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
     }
 
     fn on_reset_graphics(&mut self, width: u32, height: u32) {
+        // This is also how a *resize* arrives on an EGFX session: xrdp and GNOME
+        // Remote Desktop answer a DisplayControl layout request with an in-band
+        // ResetGraphics carrying the new size, and never run a
+        // Deactivation-Reactivation. The core RDP desktop size stays at whatever
+        // capability exchange negotiated, so the size here — not `DecodedImage`
+        // — is the authoritative geometry for an EGFX session.
+        let (w, h) = (width.min(u32::from(u16::MAX)) as u16, height.min(u32::from(u16::MAX)) as u16);
+        {
+            let mut canvases = self.surfaces.borrow_mut();
+            // Multi-monitor assigns each canvas its own sub-rect of the combined
+            // desktop; that layout is owned by apply_monitor_layout, so only the
+            // single-surface case is resized from here.
+            if canvases.len() == 1 {
+                canvases[0].resize(w, h);
+            }
+        }
+        crate::notify_desktop_resized(w, h);
+
         let mut gfx = self.gfx.borrow_mut();
         log(&format!("[EGFX] reset graphics {width}x{height} — clearing {} surface(s)", gfx.len()));
         // Tell JS to close any per-surface AVC420 decoders — their H.264 decode
@@ -763,6 +781,8 @@ pub(crate) enum InputEvent {
     RailActivate { window_id: u32, enabled: bool },
     /// RAIL: window system command — minimize/restore/close (Client SysCommand PDU).
     RailSysCommand { window_id: u32, command: u16 },
+    /// RAIL: launch another app in the running session (Client Execute PDU) — multi-app.
+    RailExec { program: String, args: String, dir: String },
     /// RAIL: re-blit the current framebuffer into all surfaces after JS rebuilds
     /// the per-window canvases on a geometry change.
     Repaint,
@@ -960,6 +980,20 @@ impl Session {
                     Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac)),
                 ));
             }
+            // Display Control (MS-RDPEDISP) — dynamic desktop resize. Always
+            // registered: the server only opens the channel if it supports the
+            // protocol, and without a registered handler `encode_resize` has no
+            // channel to write to — the cause of the long-standing
+            // "displaycontrol not available" dead end (xrdp was offering us the
+            // channel and we were declining it). Supported by Windows 8.1+,
+            // xrdp 0.9.16+, and GNOME Remote Desktop 43+ in extend mode.
+            drdynvc = drdynvc.with_dynamic_channel(
+                ironrdp::displaycontrol::client::DisplayControlClient::new(|caps| {
+                    log(&format!("[DISP] display control ready — {caps:?}"));
+                    crate::notify_display_control_ready();
+                    Ok(Vec::new())
+                }),
+            );
             connector.with_static_channel(drdynvc)
         } else {
             connector
@@ -1157,6 +1191,14 @@ impl Session {
                     Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac)),
                 ));
             }
+            // Display Control — see connect() for why this is unconditional.
+            drdynvc = drdynvc.with_dynamic_channel(
+                ironrdp::displaycontrol::client::DisplayControlClient::new(|caps| {
+                    log(&format!("[DISP] display control ready — {caps:?}"));
+                    crate::notify_display_control_ready();
+                    Ok(Vec::new())
+                }),
+            );
             connector.with_static_channel(drdynvc)
         } else {
             connector
@@ -1422,6 +1464,15 @@ impl Session {
         let _ = self
             .input_tx
             .unbounded_send(InputEvent::RailSysCommand { window_id, command });
+    }
+
+    /// RAIL: launch another application in the running session ([MS-RDPERP]
+    /// Client Execute PDU) — the multi-app launcher. `args`/`dir` may be empty.
+    #[wasm_bindgen]
+    pub fn rail_exec(&self, program: String, args: String, dir: String) {
+        let _ = self
+            .input_tx
+            .unbounded_send(InputEvent::RailExec { program, args, dir });
     }
 
     /// RAIL: repaint every window canvas after JS rebuilds the surface list on a
@@ -2091,6 +2142,9 @@ async fn run_session(
                     Some(InputEvent::RailSysCommand { window_id, command }) => {
                         rail_svc_messages(&mut active_stage, |rail| rail.sys_command(window_id, command))?
                     }
+                    Some(InputEvent::RailExec { program, args, dir }) => {
+                        rail_svc_messages(&mut active_stage, |rail| rail.exec(program, dir, args))?
+                    }
                     Some(InputEvent::Repaint) => {
                         // Re-blit the whole framebuffer after JS repositions the
                         // per-window canvases. In EGFX mode the DecodedImage is
@@ -2229,6 +2283,16 @@ async fn run_session(
                                 desktop_size.width,
                                 desktop_size.height,
                             );
+                            // Legacy counterpart of the EGFX ResetGraphics path:
+                            // a resize accepted without GFX comes back as a full
+                            // reactivation, so the canvas has to follow too.
+                            {
+                                let mut canvases = surfaces.borrow_mut();
+                                if canvases.len() == 1 {
+                                    canvases[0].resize(desktop_size.width, desktop_size.height);
+                                }
+                            }
+                            crate::notify_desktop_resized(desktop_size.width, desktop_size.height);
                             active_stage.set_fastpath_processor(
                                 ironrdp::session::fast_path::ProcessorBuilder {
                                     io_channel_id,

@@ -56,6 +56,9 @@ pub fn dispatch_window_events(data: &[u8]) {
                 );
             }
             WindowEvent::Deleted(id) => notify_rail_window_deleted(id),
+            WindowEvent::Icon { window_id, width, height, rgba } => {
+                notify_rail_icon(window_id, width, height, &rgba);
+            }
             WindowEvent::ZOrder(ids) => notify_rail_zorder(&ids),
             // Forwarded to JS: the ACTIVE_WND desktop order is the server's
             // "window is fully created and foreground" signal — JS uses it to
@@ -130,6 +133,22 @@ fn notify_rail_active(id: u32) {
     }
     if let Some(func) = cached_fn(&CACHED_FN, "__rdp_rail_active") {
         let _ = func.call1(&JsValue::NULL, &JsValue::from(id));
+    }
+}
+
+/// `window.__rdp_rail_icon(id, width, height, rgba)` — top-down RGBA for the
+/// taskbar; JS blits it to a small canvas → data URL.
+fn notify_rail_icon(id: u32, width: u16, height: u16, rgba: &[u8]) {
+    thread_local! {
+        static CACHED_FN: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
+    }
+    if let Some(func) = cached_fn(&CACHED_FN, "__rdp_rail_icon") {
+        let args = js_sys::Array::new();
+        args.push(&JsValue::from(id));
+        args.push(&JsValue::from(width));
+        args.push(&JsValue::from(height));
+        args.push(&js_sys::Uint8Array::from(rgba).into());
+        let _ = func.apply(&JsValue::NULL, &args);
     }
 }
 

@@ -257,6 +257,22 @@ impl Canvas {
         Ok(())
     }
 
+    /// Resize the backing store after a server-side desktop resize (EGFX
+    /// `ResetGraphics`, or a Deactivation-Reactivation). Assigning
+    /// `canvas.width`/`height` resets the 2D context to its defaults, so the
+    /// smoothing flag has to be re-applied or the next blit is interpolated.
+    pub fn resize(&mut self, width: u16, height: u16) {
+        if self.width == width && self.height == height {
+            return;
+        }
+        self.canvas.set_width(u32::from(width));
+        self.canvas.set_height(u32::from(height));
+        self.ctx.set_image_smoothing_enabled(false);
+        self.width = width;
+        self.height = height;
+        self.rgba_buf.clear();
+    }
+
     pub fn set_cursor(&self, style: &str) {
         let element: &web_sys::HtmlElement = self.canvas.unchecked_ref();
         let _ = element.style().set_property("cursor", style);

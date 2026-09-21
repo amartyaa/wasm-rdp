@@ -81,6 +81,13 @@ pub enum WindowEvent {
     /// Actively-monitored desktop z-order, top-most first.
     ZOrder(Vec<u32>),
     ActiveWindow(u32),
+    /// Decoded window icon (top-down RGBA) for the taskbar.
+    Icon {
+        window_id: u32,
+        width: u16,
+        height: u16,
+        rgba: Vec<u8>,
+    },
 }
 
 /// Panic-free forward reader over an untrusted byte slice.
@@ -120,6 +127,11 @@ impl<'a> Reader<'a> {
         }
         self.pos += n;
         Some(())
+    }
+    fn bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.buf.get(self.pos..self.pos + n)?;
+        self.pos += n;
+        Some(s)
     }
     /// RAIL_UNICODE_STRING: cbString (u16) + UTF-16LE bytes.
     fn unicode_string(&mut self) -> Option<String> {
@@ -205,8 +217,12 @@ fn parse_window_order(r: &mut Reader<'_>, field_flags: u32, order_end: usize, ev
     }
     let Some(window_id) = r.u32() else { return };
 
-    if field_flags & (WINDOW_ORDER_ICON | WINDOW_ORDER_CACHED_ICON) != 0 {
-        return; // icon order — skipped via orderSize by caller
+    if field_flags & WINDOW_ORDER_ICON != 0 {
+        parse_icon_order(r, window_id, events); // tail skipped via orderSize by caller
+        return;
+    }
+    if field_flags & WINDOW_ORDER_CACHED_ICON != 0 {
+        return; // references a previously-sent icon by cache id; we don't cache — skip
     }
     if field_flags & WINDOW_ORDER_TYPE_NOTIFY != 0 {
         return; // systray notify icon — not supported (v1), skipped via orderSize
@@ -297,6 +313,103 @@ fn parse_window_state(r: &mut Reader<'_>, ff: u32, window_id: u32, order_end: us
 
     let _ = order_end; // remaining fields skipped by caller via orderSize
     Some(info)
+}
+
+/// TS_WINDOW_ICON_ORDER body ([MS-RDPERP] 2.2.1.3.1.2.2): windowId (already read)
+/// + TS_ICON_INFO. Field order ported from FreeRDP `update_read_icon_info`
+/// (libfreerdp/core/window.c). Only 24/32-bpp color bitmaps are decoded (the
+/// modern-Windows common case); palettized/16-bpp icons are skipped (rare).
+fn parse_icon_order(r: &mut Reader<'_>, window_id: u32, events: &mut Vec<WindowEvent>) {
+    let (_cache_entry, _cache_id) = (r.u16(), r.u8());
+    let Some(bpp) = r.u8() else { return };
+    let Some(width) = r.u16() else { return };
+    let Some(height) = r.u16() else { return };
+    // cbColorTable present only for palettized depths ([MS-RDPERP] 2.2.1.2.3).
+    let cb_color_table = if matches!(bpp, 1 | 4 | 8) {
+        match r.u16() {
+            Some(v) => v as usize,
+            None => return,
+        }
+    } else {
+        0
+    };
+    let Some(cb_bits_mask) = r.u16().map(usize::from) else { return };
+    let Some(cb_bits_color) = r.u16().map(usize::from) else { return };
+    let Some(bits_mask) = r.bytes(cb_bits_mask) else { return };
+    let Some(_color_table) = r.bytes(cb_color_table) else { return };
+    let Some(bits_color) = r.bytes(cb_bits_color) else { return };
+
+    if let Some(rgba) = decode_icon(bpp, width, height, bits_color, bits_mask) {
+        events.push(WindowEvent::Icon { window_id, width, height, rgba });
+    }
+}
+
+/// AND-mask bit for pixel (x, row): 1 = transparent. 1-bpp, MSB-first, rows are
+/// 32-bit aligned and bottom-up (same orientation as the color bitmap).
+fn mask_bit(mask: &[u8], stride: usize, x: usize, row: usize) -> bool {
+    mask.get(row * stride + x / 8)
+        .map(|b| (b >> (7 - (x % 8))) & 1 == 1)
+        .unwrap_or(false)
+}
+
+/// Decode a bottom-up icon DIB to top-down RGBA. 32-bpp uses the alpha channel
+/// when present, else the AND mask; 24-bpp uses the AND mask; other depths are
+/// unsupported (returns None).
+fn decode_icon(bpp: u8, width: u16, height: u16, color: &[u8], mask: &[u8]) -> Option<Vec<u8>> {
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || w > 256 || h > 256 {
+        return None;
+    }
+    let mask_stride = w.div_ceil(32) * 4; // 1-bpp rows, 32-bit aligned
+    let have_mask = mask.len() >= mask_stride * h;
+    let mut out = vec![0u8; w * h * 4];
+
+    match bpp {
+        32 => {
+            if color.len() < w * h * 4 {
+                return None;
+            }
+            let any_alpha = color.chunks_exact(4).any(|px| px[3] != 0);
+            for y in 0..h {
+                let src = h - 1 - y; // bottom-up → top-down
+                for x in 0..w {
+                    let s = (src * w + x) * 4;
+                    let d = (y * w + x) * 4;
+                    let a = if any_alpha {
+                        color[s + 3]
+                    } else if have_mask && mask_bit(mask, mask_stride, x, src) {
+                        0
+                    } else {
+                        255
+                    };
+                    out[d] = color[s + 2]; // R (from BGRA)
+                    out[d + 1] = color[s + 1]; // G
+                    out[d + 2] = color[s]; // B
+                    out[d + 3] = a;
+                }
+            }
+        }
+        24 => {
+            let stride = (w * 3).div_ceil(4) * 4;
+            if color.len() < stride * h {
+                return None;
+            }
+            for y in 0..h {
+                let src = h - 1 - y;
+                for x in 0..w {
+                    let s = src * stride + x * 3;
+                    let d = (y * w + x) * 4;
+                    let a = if have_mask && mask_bit(mask, mask_stride, x, src) { 0 } else { 255 };
+                    out[d] = color[s + 2]; // R (from BGR)
+                    out[d + 1] = color[s + 1]; // G
+                    out[d + 2] = color[s]; // B
+                    out[d + 3] = a;
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
 }
 
 fn parse_desktop_order(r: &mut Reader<'_>, ff: u32, events: &mut Vec<WindowEvent>) {
@@ -421,6 +534,40 @@ mod tests {
         assert_eq!(ev.len(), 2);
         assert!(matches!(&ev[0], WindowEvent::NewOrUpdate(w) if w.show_state == Some(SW_SHOWMINIMIZED)));
         assert_eq!(ev[1], WindowEvent::Deleted(8));
+    }
+
+    #[test]
+    fn icon_32bpp_decoded_bottom_up_to_rgba() {
+        // 2x2 32-bpp icon, bottom-up BGRA, alpha present (no AND mask).
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x55u32.to_le_bytes()); // windowId
+        // TS_ICON_INFO
+        body.extend_from_slice(&0u16.to_le_bytes()); // cacheEntry
+        body.push(0); // cacheId
+        body.push(32); // bpp
+        body.extend_from_slice(&2u16.to_le_bytes()); // width
+        body.extend_from_slice(&2u16.to_le_bytes()); // height
+        body.extend_from_slice(&0u16.to_le_bytes()); // cbBitsMask (no mask)
+        body.extend_from_slice(&16u16.to_le_bytes()); // cbBitsColor = 2*2*4
+        // bitsColor, bottom-up, BGRA: src row0 (bottom), then src row1 (top)
+        body.extend_from_slice(&[10, 20, 30, 255, 40, 50, 60, 255]); // bottom row
+        body.extend_from_slice(&[70, 80, 90, 255, 100, 110, 120, 255]); // top row
+
+        let ff = WINDOW_ORDER_TYPE_WINDOW | WINDOW_ORDER_STATE_NEW | WINDOW_ORDER_ICON;
+        let ev = parse(&payload(&[window_order(ff, &body)]));
+        assert_eq!(ev.len(), 1);
+        match &ev[0] {
+            WindowEvent::Icon { window_id, width, height, rgba } => {
+                assert_eq!(*window_id, 0x55);
+                assert_eq!((*width, *height), (2, 2));
+                // Top-down RGBA: out row0 = src top row (BGRA→RGBA), row1 = src bottom.
+                assert_eq!(
+                    rgba,
+                    &[90, 80, 70, 255, 120, 110, 100, 255, 30, 20, 10, 255, 60, 50, 40, 255]
+                );
+            }
+            other => panic!("expected Icon, got {other:?}"),
+        }
     }
 
     #[test]

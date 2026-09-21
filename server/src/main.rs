@@ -71,6 +71,13 @@ struct Args {
     #[arg(long = "app", env = "IB_REMOTE_APPS", value_delimiter = ';')]
     apps: Vec<String>,
 
+    /// Live RemoteApp catalog file (one `Name=path` per line, `#` comments).
+    /// Read on every login-page render, so admins publish/unpublish by editing
+    /// the file — no flags, no restart. Defaults to `remote-apps.txt` beside the
+    /// binary. Also via IB_REMOTE_APPS_FILE (CLI wins).
+    #[arg(long, env = "IB_REMOTE_APPS_FILE")]
+    apps_file: Option<PathBuf>,
+
     /// Print version
     #[arg(short = 'v', short_alias = 'V', long = "version", action = clap::ArgAction::Version)]
     version: (),
@@ -84,8 +91,11 @@ struct AppConfig {
     enable_text_clipboard: bool,
     enable_file_clipboard: bool,
     enable_remote_app: bool,
-    /// Raw `"Name=program"` catalog entries; parsed to JSON at injection.
+    /// Raw `"Name=program"` catalog entries from CLI/env; the seed/fallback when
+    /// `apps_file` is absent or empty.
     remote_apps: Vec<String>,
+    /// Live catalog file, read per request (see `load_remote_apps`).
+    apps_file: PathBuf,
 }
 
 #[tokio::main]
@@ -109,6 +119,15 @@ async fn run_server(args: Args) {
         )
         .init();
 
+    // Default the live catalog file to `remote-apps.txt` beside the binary, so the
+    // Windows service (CWD = system32) still finds it.
+    let apps_file = args.apps_file.clone().unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("remote-apps.txt")))
+            .unwrap_or_else(|| PathBuf::from("remote-apps.txt"))
+    });
+
     let config = AppConfig {
         rdp_target: args.rdp_target.clone(),
         app_name: args.app_name.clone(),
@@ -116,6 +135,7 @@ async fn run_server(args: Args) {
         enable_file_clipboard: args.enable_file_clipboard_sync,
         enable_remote_app: args.enable_remote_app,
         remote_apps: args.apps.clone(),
+        apps_file,
     };
 
     if let Some(name) = &config.app_name {
@@ -123,9 +143,10 @@ async fn run_server(args: Args) {
     }
     info!("Text clipboard sync: {}", if config.enable_text_clipboard { "enabled" } else { "disabled" });
     info!("File clipboard sync: {}", if config.enable_file_clipboard { "enabled" } else { "disabled" });
-    info!("RemoteApp publishing: {}", if config.enable_remote_app { "enabled" } else { "disabled" });
-    if config.enable_remote_app && !config.remote_apps.is_empty() {
-        info!("RemoteApp catalog: {} app(s)", config.remote_apps.len());
+    let (rail_enabled, rail_apps) = load_remote_apps(&config);
+    info!("RemoteApp publishing: {}", if rail_enabled { "enabled" } else { "disabled" });
+    if rail_enabled {
+        info!("RemoteApp catalog: {} app(s) (live file: {})", rail_apps.len(), config.apps_file.display());
     }
 
     let base = args.base_path.trim_end_matches('/').to_string();
@@ -175,6 +196,26 @@ async fn run_server(args: Args) {
     axum::serve(listener, app).await.unwrap();
 }
 
+/// Resolve the effective RemoteApp catalog for this request. A `remote-apps.txt`
+/// beside the binary (one `Name=path` per line, `#` comments) is read live, so
+/// admins publish/unpublish by editing the file — no flags, no restart. Present
+/// with ≥1 valid entry ⇒ it *is* the catalog and enables RemoteApp; otherwise
+/// fall back to the CLI/env catalog. Returns `(enabled, entries)`.
+fn load_remote_apps(config: &AppConfig) -> (bool, Vec<String>) {
+    if let Ok(text) = std::fs::read_to_string(&config.apps_file) {
+        let entries: Vec<String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && l.contains('='))
+            .map(String::from)
+            .collect();
+        if !entries.is_empty() {
+            return (true, entries);
+        }
+    }
+    (config.enable_remote_app, config.remote_apps.clone())
+}
+
 /// Serve files from the embedded `WebAssets`.
 /// Build a JSON array of `{name, program}` from `"Name=program"` catalog entries
 /// for injection as `window.__IB_REMOTE_APPS`. Malformed entries (no `=`) are
@@ -220,10 +261,13 @@ async fn embedded_handler(uri: Uri, State(config): State<AppConfig>) -> impl Int
                         let safe = name.replace('\\', "\\\\").replace('"', "\\\"");
                         vars.push_str(&format!(r#"window.__APP_NAME="{safe}";"#));
                     }
-                    vars.push_str(&format!("window.__IB_REMOTE_APP={};", config.enable_remote_app));
+                    // Live catalog: read remote-apps.txt per request so publishing
+                    // needs no flags or restart (falls back to CLI/env entries).
+                    let (enable_remote_app, remote_apps) = load_remote_apps(&config);
+                    vars.push_str(&format!("window.__IB_REMOTE_APP={};", enable_remote_app));
                     vars.push_str(&format!(
                         "window.__IB_REMOTE_APPS={};",
-                        remote_apps_json(&config.remote_apps)
+                        remote_apps_json(&remote_apps)
                     ));
                     let script = format!("<script>{vars}</script>");
                     let patched = html.replace("</head>", &format!("{script}</head>"));
