@@ -3,9 +3,10 @@ param(
     [string]$BinaryPath = "C:\Users\amart\Downloads\web-rdp-rust\target\release\server.exe",
     [int]$Port = 6081,
     [string]$RdpTarget = "localhost:3389",
-    # Optional RemoteApp (RAIL) catalog: "Name=path" entries, ';'-separated.
-    # Empty (default) = plain full-desktop proxy. Paths with spaces are fine —
-    # they're double-quoted in the ImagePath below. Example:
+    # Optional RemoteApp (RAIL) catalog to seed. ';'-separated "Name=path" entries.
+    # Written to remote-apps.txt beside the binary (NOT baked into the service
+    # ImagePath), so you can publish/unpublish later by editing that file — no
+    # reinstall, no restart. Empty = plain full-desktop proxy. Example:
     #   -RemoteApps "Microsoft Edge=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
     [string]$RemoteApps = "Microsoft Edge=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe;Chrome=C:\Program Files\Google\Chrome\Application\chrome.exe"
 )
@@ -16,19 +17,21 @@ $Description = "Browser-native RDP client powered by IronRDP"
 
 $AbsPath = (Resolve-Path $BinaryPath).Path
 
-# Build the service ImagePath. Windows launches the service by parsing this
-# string with CommandLineToArgvW, which honors ONLY double quotes — single
-# quotes are literal characters. So any path with spaces (the exe, or a RemoteApp
-# path) MUST be wrapped in double quotes, or the SCM splits it into stray args,
-# clap rejects them, and the process exits before signaling RUNNING — surfacing
-# as SCM error 1053 ("did not respond in a timely fashion"). New-Service passes
-# this string straight to the CreateService API, so the embedded `"` land
-# verbatim in the registry (no native-exe command-line re-escaping to fight,
-# unlike `sc.exe create binPath=`).
-$BinArgs = "`"$AbsPath`" --service --port $Port --rdp-target $RdpTarget"
+# Phase-1 dynamic publishing: seed the live catalog file next to the binary, one
+# "Name=path" per line (UTF-8, no BOM). The server reads it on every login-page
+# render, so the catalog is editable without touching the service. Line-delimited
+# means paths with spaces need NO quoting — this sidesteps the ImagePath /
+# CommandLineToArgvW quoting trap entirely (no --app in the ImagePath at all).
 if ($RemoteApps) {
-    $BinArgs += " --enable-remote-app --app `"$RemoteApps`""
+    $AppsFile = Join-Path (Split-Path $AbsPath) "remote-apps.txt"
+    $lines = $RemoteApps.Split(';') | Where-Object { $_ -match '=' } | ForEach-Object { $_.Trim() }
+    [System.IO.File]::WriteAllLines($AppsFile, $lines)
+    Write-Host "Seeded RemoteApp catalog: $AppsFile ($($lines.Count) app(s))" -ForegroundColor DarkGray
 }
+
+# Service ImagePath: no RemoteApp flags — the catalog file above drives publishing.
+# The exe path is still double-quoted so an install path with spaces is safe.
+$BinArgs = "`"$AbsPath`" --service --port $Port --rdp-target $RdpTarget"
 
 Write-Host "Installing $DisplayName..." -ForegroundColor Cyan
 
@@ -51,7 +54,7 @@ Write-Host "  Binary: $AbsPath"
 Write-Host "  Port:   $Port"
 Write-Host "  Target: $RdpTarget"
 if ($RemoteApps) {
-    Write-Host "  Apps:   $RemoteApps"
+    Write-Host "  Apps:   edit $AppsFile to publish/unpublish (no restart)"
 }
 Write-Host ""
 Write-Host "Commands:" -ForegroundColor Cyan

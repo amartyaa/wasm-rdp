@@ -85,6 +85,11 @@
                         <input type="checkbox" id="adv-allow-animations">
                     </div>
                     <p class="settings-note">Wallpaper/themes/animations increase bandwidth. Leave unchecked on slow connections.</p>
+                    <div class="settings-row">
+                        <label for="adv-hidpi">High-DPI (crisp text)</label>
+                        <input type="checkbox" id="adv-hidpi">
+                    </div>
+                    <p class="settings-note">Renders at your display's pixel density for sharp text — uses more bandwidth. Single-monitor only.</p>
                 </details>
             </div>
             <form id="login-form" autocomplete="off">
@@ -172,6 +177,8 @@
                 <span id="hud-codec" class="perf-hud-value">RFX</span>
                 <span class="perf-hud-label">Audio</span>
                 <span id="hud-audio-codec" class="perf-hud-value">--</span>
+                <span class="perf-hud-label">Resize</span>
+                <span id="hud-resize" class="perf-hud-value">--</span>
                 <span class="perf-hud-label">Version</span>
                 <span id="hud-version" class="perf-hud-value">--</span>
             </div>
@@ -214,6 +221,18 @@
             </div>
         </div>
     </div>
+
+    <!-- RemoteApp taskbar (auto-hide, bottom edge) -->
+    <div id="rail-taskbar-zone" class="rail-taskbar-zone" hidden></div>
+    <div id="rail-taskbar" class="rail-taskbar" hidden>
+        <button id="rail-launcher" class="rail-launcher" title="Launch application" hidden>
+            <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16">
+                <path d="M3 3h6v6H3V3zm8 0h6v6h-6V3zM3 11h6v6H3v-6zm8 0h6v6h-6v-6z" />
+            </svg>
+        </button>
+        <div id="rail-taskbar-items" class="rail-taskbar-items"></div>
+    </div>
+    <div id="rail-launcher-menu" class="rail-launcher-menu" hidden></div>
 
     <span id="app-version" class="app-version"></span>
     <script type="module" src="app.js"></script>

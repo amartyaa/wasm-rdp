@@ -96,6 +96,17 @@ impl Rail {
         vec![Self::msg(ClientRailOrder::SysCommand { window_id, command })]
     }
 
+    /// Launch another application in the running session ([MS-RDPERP] 2.2.2.3.1
+    /// Client Execute PDU) — the basis for multi-app. Same PDU as the initial
+    /// launch in `client_init`, sent on demand instead of at handshake.
+    pub fn exec(&self, program: String, working_dir: String, arguments: String) -> Vec<SvcMessage> {
+        vec![Self::msg(ClientRailOrder::Exec {
+            exe_or_file: program,
+            working_dir,
+            arguments,
+        })]
+    }
+
     fn handle_pdu(&mut self, payload: &[u8]) -> PduResult<Vec<ClientRailOrder>> {
         let mut src = ReadCursor::new(payload);
         match ServerRailOrder::decode(&mut src).map_err(|e| decode_err!(e))? {

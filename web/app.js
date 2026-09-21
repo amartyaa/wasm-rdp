@@ -130,6 +130,12 @@ async function loadWasm() {
         advAllowAnimations = advAnimations.checked;
         localStorage.setItem('rdp_adv_animations', advAllowAnimations ? '1' : '0');
     });
+    const advHidpiEl = document.getElementById('adv-hidpi');
+    advHidpiEl.checked = advHidpi;
+    advHidpiEl.addEventListener('change', () => {
+        advHidpi = advHidpiEl.checked;
+        localStorage.setItem('rdp_hidpi', advHidpi ? '1' : '0');
+    });
 
     // Settings gear toggle
     const btnSettings = document.getElementById('btn-settings');
@@ -217,8 +223,21 @@ let advDisableCursorEffects = localStorage.getItem('rdp_adv_cursor_fx') === '1';
 let advAllowWallpaper  = localStorage.getItem('rdp_adv_wallpaper') === '1';
 let advAllowThemes     = localStorage.getItem('rdp_adv_themes') === '1';
 let advAllowAnimations = localStorage.getItem('rdp_adv_animations') === '1';
+let advHidpi           = localStorage.getItem('rdp_hidpi') === '1';
 const MOUSE_THROTTLE_MS = 16; // ~60fps cap on mouse events
-const RESIZE_DEBOUNCE_MS = 250;
+// Trailing debounce before a resize is sent, so a drag produces one layout PDU
+// at the end instead of one per frame. Matches FreeRDP's RESIZE_MIN_DELAY_NS
+// (500 ms) — on a GPU-less host every accepted resize costs a full-surface
+// repaint, and on the legacy path an entire capability re-exchange.
+const RESIZE_DEBOUNCE_MS = 500;
+// Upscale cap for client-side scaling. The canvas is CSS-fitted to the viewport
+// (instantly while a resize is in flight, and permanently as the fallback when a
+// server has no DisplayControl channel). Shrinking is unbounded — it keeps the
+// whole desktop visible and costs no sharpness — but stretching stops at 1.5x,
+// past which a GPU-less host's output goes visibly soft; beyond that the canvas
+// is letterboxed instead. Note the cap must never apply downward: clamping the
+// shrink direction would crop the desktop out of the window rather than fit it.
+const SCALE_MAX = 1.5;
 // Local→remote paste: delay before replaying the Ctrl+V keystroke so the remote
 // registers our clipboard Format List first (covers OS clipboard registration,
 // not network RTT — both PDUs share one ordered stream).
@@ -266,6 +285,21 @@ let monitorPopups = [];      // secondary displays: [{ win, canvas, monitor }]
 let screenDetailsObj = null; // ScreenDetails handle (source of 'screenschange')
 let multimonInUse = false;   // true while a multi-monitor session is active
 let railInUse = false;       // true while a RemoteApp (RAIL) session is active
+// Dynamic resize state: the last desktop size the server confirmed (backing-store
+// pixels), the dpr it was requested at, and the pending debounce timer.
+let negotiatedDesktop = null;
+let sessionDpr = 1;
+let resizeTimer = null;
+// DisplayControl availability, the size we last asked for, and a watchdog that
+// notices a request the server never answers. Reported in the HUD so a dead
+// resize path is visible at a glance instead of needing console archaeology.
+let dispReady = false;
+let desiredSize = null;
+let resizeWatchdog = null;
+let resizeStatus = '--';
+// How long to wait for the server to apply a layout before calling it ignored.
+// Generous: a legacy-path resize runs a whole capability re-exchange first.
+const RESIZE_ACK_TIMEOUT_MS = 5000;
 // RAIL window manager: windowId → { el, canvas, x, y, w, h }.
 const railWindows = new Map();
 
@@ -359,9 +393,16 @@ loginForm.addEventListener('submit', async (e) => {
             }
         }
 
-        // Pre-connect fullscreen
-        if (fullscreenCheckbox.checked) {
-            try { await document.documentElement.requestFullscreen(); } catch (_) {}
+        // Pre-connect fullscreen. Skipped when already fullscreen (dimensions
+        // are correct then, and nothing would change to wait for).
+        if (fullscreenCheckbox.checked && !document.fullscreenElement) {
+            const before = `${window.innerWidth}x${window.innerHeight}`;
+            try {
+                await document.documentElement.requestFullscreen();
+                // Must land before doConnect reads innerWidth/innerHeight —
+                // see waitForViewportSettled.
+                await waitForViewportSettled(before);
+            } catch (_) {}
         }
 
         await doConnect(username, password, domain);
@@ -429,9 +470,65 @@ function getRailSelection() {
     return raw.replace(/[​-‏‪-‮⁦-⁩﻿]/g, '').trim();
 }
 
+// Wait until the viewport metrics actually reflect a pending fullscreen
+// transition, i.e. they have changed from `before` AND held steady for a frame.
+//
+// Chromium resolves requestFullscreen() *racily* with respect to the resize it
+// triggers: measured on Chrome 153 the promise resolved at 184ms still
+// reporting the windowed 1084x549, while the real resize (and fullscreenchange)
+// only landed at 428ms — but on other runs the resize wins. That race is why
+// the black-bezel bug was intermittent: whenever the read lost, the desktop got
+// negotiated at the windowed size and the canvas rendered inside black bezels.
+// Firefox resizes before resolving, so it never reproduced there.
+//
+// Polling state (rather than awaiting resize/fullscreenchange) is race-free in
+// both directions: it cannot miss an edge that already fired, and requiring the
+// value to repeat absorbs a transition that lands in more than one step.
+// Bounded, so a window that is already the target size can't stall connect.
+function waitForViewportSettled(before, deadlineMs = 700) {
+    return new Promise((resolve) => {
+        const start = performance.now();
+        let last = null;
+        const check = () => {
+            const now = `${window.innerWidth}x${window.innerHeight}`;
+            if (now !== before && now === last) return resolve(true);
+            last = now;
+            if (performance.now() - start >= deadlineMs) return resolve(false);
+            requestAnimationFrame(check);
+        };
+        requestAnimationFrame(check);
+    });
+}
+
+// CSS-size the main canvas to logical pixels when the backing store is high-DPI
+// (dpr>1) so the browser downscales the crisp framebuffer; clear the override at
+// dpr=1 so a later non-HiDPI session renders 1:1. The backing store itself is set
+// inside wasm from the negotiated (already-scaled) desktop size.
+function applyCanvasDpr(dpr) {
+    const c = document.getElementById('rdp-canvas');
+    if (!c) return;
+    if (dpr > 1) {
+        c.style.width = window.innerWidth + 'px';
+        c.style.height = window.innerHeight + 'px';
+    } else {
+        c.style.width = '';
+        c.style.height = '';
+    }
+}
+
 async function doConnect(username, password, domain) {
-    const width = window.innerWidth;
-    const height = window.innerHeight;
+    // High-DPI (opt-in, single-monitor only): request the framebuffer at the
+    // display's pixel density so remote text is crisp, then CSS-downscale the
+    // canvas to logical size (applyCanvasDpr). Capped at 2x to bound decode/
+    // bandwidth on the GPU-less charter targets. Mouse coords already scale by
+    // backing/CSS in attachCanvasMouse, so input needs no extra work. dpr=1
+    // keeps today's behavior byte-identical.
+    const dpr = (advHidpi && !(multimonEnabled && multimonSupported()))
+        ? Math.min(2, window.devicePixelRatio || 1) : 1;
+    sessionDpr = dpr;
+    const width = Math.round(window.innerWidth * dpr);
+    const height = Math.round(window.innerHeight * dpr);
+    applyCanvasDpr(dpr);
 
     // Build WebSocket URL for the proxy
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -506,6 +603,12 @@ async function doConnect(username, password, domain) {
     localStorage.setItem('rdp_username', username);
 
     resBadge.textContent = `${session.width}×${session.height}`;
+    negotiatedDesktop = { w: session.width, h: session.height };
+    // Fresh session (including the one after a redirect handoff): the
+    // DisplayControl channel has to be re-negotiated before resize works.
+    dispReady = false; desiredSize = null;
+    clearTimeout(resizeWatchdog); resizeWatchdog = null;
+    setResizeStatus('Negotiating…');
     // RemoteApp: hide the full-desktop canvas and reveal the window host, sized
     // to the negotiated desktop (windows are placed at server coordinates).
     if (railInUse) {
@@ -513,6 +616,7 @@ async function doConnect(username, password, domain) {
         railDesktop.style.height = `${session.height}px`;
         railDesktop.hidden = false;
         canvas.hidden = true;
+        initRailTaskbar();
     }
     setupInputHandlers();
     if (multimonInUse) {
@@ -575,6 +679,12 @@ async function doConnectRedirected() {
     toolbar.hidden = false;
 
     resBadge.textContent = `${session.width}×${session.height}`;
+    negotiatedDesktop = { w: session.width, h: session.height };
+    // Fresh session (including the one after a redirect handoff): the
+    // DisplayControl channel has to be re-negotiated before resize works.
+    dispReady = false; desiredSize = null;
+    clearTimeout(resizeWatchdog); resizeWatchdog = null;
+    setResizeStatus('Negotiating…');
     setupInputHandlers();
     setupResizeHandler();
     startStatsInterval();
@@ -930,13 +1040,115 @@ function onCopy(e) {
     }
 }
 
-// ── Resize Handler ───────────────────────────────────────
-// Disabled: xrdp does not support the Display Control Virtual Channel,
-// so dynamic resize causes a black screen. Canvas stays fixed at the
-// negotiated RDP resolution.
+// ── Dynamic desktop resize (MS-RDPEDISP) ─────────────────
+// The desktop follows the browser viewport. Both the toolbar/Ctrl+Shift+F
+// fullscreen toggle and F11 land here: F11 fires no fullscreenchange, but it
+// does fire resize, so listening to both covers every route in one place.
+//
+// Every server we target supports this — Windows 8.1+, xrdp 0.9.16+, and GNOME
+// Remote Desktop 43+ in extend mode (its mirror/screen-share mode never opens
+// the channel, and rides on the client-side scaling below instead).
 function setupResizeHandler() {
-    // no-op: keep canvas at the server-negotiated size
+    window.addEventListener('resize', onViewportChanged);
+    document.addEventListener('fullscreenchange', onViewportChanged);
 }
+
+function onViewportChanged() {
+    if (!session) return;
+    applyBridgeScale();              // track the window immediately...
+    clearTimeout(resizeTimer);       // ...and ask the server once the gesture stops
+    resizeTimer = setTimeout(sendResize, RESIZE_DEBOUNCE_MS);
+}
+
+// CSS-size the canvas toward the viewport without touching the backing store.
+// Costs nothing on the RDP path (compositor only) and needs no input fix-ups:
+// getCanvasCoords divides by el.width/rect.width, so mouse mapping follows.
+function applyBridgeScale() {
+    const c = document.getElementById('rdp-canvas');
+    if (!c || !negotiatedDesktop) return;
+    // Logical size = backing store as it is meant to appear on screen; with the
+    // High-DPI toggle the backing store is deliberately dpr times larger.
+    const logicalW = negotiatedDesktop.w / sessionDpr;
+    const logicalH = negotiatedDesktop.h / sessionDpr;
+    const fit = Math.min(window.innerWidth / logicalW, window.innerHeight / logicalH);
+    const scale = Math.min(SCALE_MAX, fit);
+    c.style.width = Math.round(logicalW * scale) + 'px';
+    c.style.height = Math.round(logicalH * scale) + 'px';
+}
+
+function setResizeStatus(text) {
+    resizeStatus = text;
+    const el = document.getElementById('hud-resize');
+    if (el) el.textContent = text;
+}
+
+// The DisplayControl channel is open and the server's caps have arrived, so
+// encode_resize works from now on. GNOME Remote Desktop's headless Remote Login
+// redirects to a second daemon and only opens this channel seconds after the
+// first frame, so a resize requested before now was dropped on the floor —
+// re-send it rather than leaving the desktop at the stale size.
+window.__rdp_display_control_ready = function() {
+    dispReady = true;
+    setResizeStatus('Ready');
+    if (desiredSize && negotiatedDesktop &&
+        (desiredSize.w !== negotiatedDesktop.w || desiredSize.h !== negotiatedDesktop.h)) {
+        console.log('[resize] display control became ready — re-sending pending size');
+        sendResize();
+    }
+};
+
+function sendResize() {
+    resizeTimer = null;
+    if (!session) return;
+    // Multi-monitor drives DisplayControl through apply_monitor_layout, and RAIL
+    // sizes windows rather than a desktop — neither wants a single-monitor layout.
+    if (multimonInUse || railInUse) return;
+
+    let w = Math.round(window.innerWidth * sessionDpr);
+    let h = Math.round(window.innerHeight * sessionDpr);
+    // MS-RDPEDISP 2.2.2.2.1: 200..8192 on both axes, width MUST NOT be odd.
+    // The spec's monitor-area cap is deliberately not enforced — read literally
+    // (MaxNumMonitors * FactorA * FactorB) it yields ~1600 square pixels, and
+    // neither FreeRDP nor IronRDP enforces it either.
+    w = Math.max(200, Math.min(8192, w));
+    h = Math.max(200, Math.min(8192, h));
+    if (w % 2 !== 0) w -= 1;
+
+    if (negotiatedDesktop && negotiatedDesktop.w === w && negotiatedDesktop.h === h) return;
+
+    desiredSize = { w, h };
+    if (!dispReady) {
+        // Channel not up yet — __rdp_display_control_ready will flush this.
+        console.log(`[resize] deferring ${w}x${h} until display control is ready`);
+        setResizeStatus('Waiting for channel');
+        return;
+    }
+
+    console.log(`[resize] requesting ${w}x${h}`);
+    setResizeStatus(`Requesting ${w}×${h}`);
+    session.resize(w, h);
+    clearTimeout(resizeWatchdog);
+    resizeWatchdog = setTimeout(() => {
+        // The PDU went out but nothing came back. Seen on servers that accept
+        // the channel and then ignore the layout; distinguishes "our request
+        // never left" from "the server dropped it".
+        console.warn(`[resize] no response to ${w}x${h} after ${RESIZE_ACK_TIMEOUT_MS}ms`);
+        setResizeStatus('Ignored by server');
+    }, RESIZE_ACK_TIMEOUT_MS);
+}
+
+// The server applied a new size — either an EGFX ResetGraphics or a completed
+// Deactivation-Reactivation. The canvas backing store has already been resized
+// in wasm; drop the interim scaling back to 1:1 and refresh the readout.
+window.__rdp_desktop_resized = function(w, h) {
+    console.log(`[resize] server applied ${w}x${h}`);
+    clearTimeout(resizeWatchdog);
+    resizeWatchdog = null;
+    negotiatedDesktop = { w, h };
+    if (resBadge) resBadge.textContent = `${w}×${h}`;
+    setResizeStatus(`OK ${w}×${h}`);
+    applyBridgeScale();
+};
 
 // ── Multi-Monitor (Window Management API) ────────────────
 // One WASM session drives N same-origin windows: the main page shows the primary
@@ -1207,6 +1419,12 @@ function cleanupSession() {
         audioWorkletReady = false;
         audioFormat = null;
     }
+    dispReady = false;
+    desiredSize = null;
+    negotiatedDesktop = null;
+    clearTimeout(resizeTimer); resizeTimer = null;
+    clearTimeout(resizeWatchdog); resizeWatchdog = null;
+    setResizeStatus('--');
     // Close any per-surface AVC420 decoders left over from the ended session.
     for (const entry of avc420Decoders.values()) {
         try { entry.decoder.close(); } catch (_) {}
@@ -1435,11 +1653,16 @@ window.__rdp_frame = function() {
 // #rail-desktop. WASM paints each via its own surface (framebuffer region at the
 // window's server coordinates), so windows composite with correct overlap.
 const SW_HIDE = 0, SW_SHOWMINIMIZED = 2;
-const SC_MAXIMIZE = 0xF030;
+const SC_MAXIMIZE = 0xF030, SC_RESTORE = 0xF120;
+// Multi-app: when the admin published more than one app, run a windowed desktop
+// with a taskbar + launcher (no auto-maximize). A single published app keeps the
+// fill-the-canvas maximize behavior.
+const railWindowedMode = remoteAppCatalog.length > 1;
 let railMaximizedFirst = false; // one-shot: auto-maximize the app's main window
 let railMainWindowId = null;    // the maximized window; its close = app exit
 let railHadWindows = false;     // guards startup's initial 0-window state
 let railExitTimer = null;       // debounce for app-closed → session end
+let railTaskbarInit = false;
 
 // Rebuild the WASM surface list from the currently-visible windows, then repaint.
 // Called on any geometry/visibility/set change — low-rate (server-throttled), so
@@ -1452,6 +1675,91 @@ function rebuildRailSurfaces() {
         session.add_surface(w.canvas, w.x, w.y, w.w, w.h);
     }
     session.repaint();
+}
+
+// ── RemoteApp taskbar (auto-hide, bottom edge) ───────────
+// Lists titled top-level windows (icon + title, click to focus/restore) and, in
+// multi-app mode, a launcher that Client-Execs catalog apps into the session.
+// Auto-hidden so a maximized app fills the canvas; revealed on bottom-edge hover.
+const railTaskbar = document.getElementById('rail-taskbar');
+const railTaskbarZone = document.getElementById('rail-taskbar-zone');
+const railTaskbarItems = document.getElementById('rail-taskbar-items');
+const railLauncher = document.getElementById('rail-launcher');
+const railLauncherMenu = document.getElementById('rail-launcher-menu');
+let railTaskbarFlashTimer = null;
+
+function initRailTaskbar() {
+    railTaskbar.hidden = false;
+    railTaskbarZone.hidden = false;
+    if (railTaskbarInit) return;
+    railTaskbarInit = true;
+    railTaskbarZone.addEventListener('mouseenter', () => railTaskbar.classList.add('visible'));
+    railTaskbar.addEventListener('mouseenter', () => railTaskbar.classList.add('visible'));
+    railTaskbar.addEventListener('mouseleave', () => { railTaskbar.classList.remove('visible'); railLauncherMenu.hidden = true; });
+    if (remoteAppCatalog.length >= 1) {
+        railLauncher.hidden = false;
+        railLauncher.addEventListener('click', () => {
+            if (!railLauncherMenu.hidden) { railLauncherMenu.hidden = true; return; }
+            railLauncherMenu.innerHTML = '';
+            for (const app of remoteAppCatalog) {
+                const b = document.createElement('button');
+                b.className = 'rail-launcher-item';
+                b.textContent = app.name;
+                b.addEventListener('click', () => {
+                    if (session) session.rail_exec(app.program, '', '');
+                    railLauncherMenu.hidden = true;
+                });
+                railLauncherMenu.appendChild(b);
+            }
+            railLauncherMenu.hidden = false;
+        });
+    }
+}
+
+// Briefly reveal the taskbar (e.g. when a window minimizes, so the user sees
+// where it went).
+function flashRailTaskbar() {
+    railTaskbar.classList.add('visible');
+    clearTimeout(railTaskbarFlashTimer);
+    railTaskbarFlashTimer = setTimeout(() => railTaskbar.classList.remove('visible'), 2200);
+}
+
+// Create/update the taskbar button for a titled window. Untitled windows
+// (menus, tooltips) get no button, keeping the taskbar to real app windows.
+function railTaskbarUpsert(id, title) {
+    const win = railWindows.get(id);
+    if (!win) return;
+    if (!win.taskBtn) {
+        if (!title) return;
+        const btn = document.createElement('button');
+        btn.className = 'rail-task-btn';
+        const img = document.createElement('img');
+        img.className = 'rail-task-icon';
+        img.alt = '';
+        if (win.iconUrl) img.src = win.iconUrl;
+        const span = document.createElement('span');
+        span.className = 'rail-task-label';
+        btn.append(img, span);
+        btn.addEventListener('click', () => {
+            if (!session) return;
+            session.rail_activate(id >>> 0);
+            if (win.hidden) session.rail_sys_command(id >>> 0, SC_RESTORE);
+        });
+        railTaskbarItems.appendChild(btn);
+        win.taskBtn = btn;
+        win.taskIcon = img;
+        win.taskLabel = span;
+    }
+    if (title) {
+        win.taskLabel.textContent = title;
+        win.taskBtn.title = title;
+    }
+}
+
+function railTaskbarSetActive(id) {
+    for (const [wid, w] of railWindows) {
+        if (w.taskBtn) w.taskBtn.classList.toggle('active', wid === (id >>> 0));
+    }
 }
 
 // window.__rdp_rail_window(id, isNew, hasPos, x, y, hasSize, w, h, showState, title, visRects)
@@ -1500,6 +1808,8 @@ window.__rdp_rail_window = function(id, isNew, hasPos, x, y, hasSize, w, h, show
             win.hidden = nowHidden;
             win.el.hidden = nowHidden;
             structural = true;
+            if (win.taskBtn) win.taskBtn.classList.toggle('minimized', nowHidden);
+            if (nowHidden && showState === SW_SHOWMINIMIZED) flashRailTaskbar();
         }
     }
 
@@ -1518,6 +1828,7 @@ window.__rdp_rail_window = function(id, isNew, hasPos, x, y, hasSize, w, h, show
     }
 
     if (title != null) win.el.title = title;
+    railTaskbarUpsert(id, title);
 
     if (structural) rebuildRailSurfaces();
 };
@@ -1529,6 +1840,10 @@ window.__rdp_rail_window = function(id, isNew, hasPos, x, y, hasSize, w, h, show
 // The window must already exist locally (has() filters the 0xFFFFFFFF "desktop
 // deactivated" order); dialogs/child windows keep their natural size.
 function maximizeFirstRailWindow(id) {
+    // Multi-app runs windowed (taskbar + launcher), so never auto-maximize —
+    // leaving railMainWindowId null routes session-end to the all-windows-gone
+    // path, which is correct when several apps share the session.
+    if (railWindowedMode) return;
     if (railMaximizedFirst || !session || !railWindows.has(id)) return;
     railMaximizedFirst = true;
     railMainWindowId = id >>> 0;
@@ -1544,12 +1859,29 @@ function maximizeFirstRailWindow(id) {
 // 0xFFFFFFFF for "no active window"; maximizeFirstRailWindow filters that out.
 window.__rdp_rail_active = function(id) {
     maximizeFirstRailWindow(id);
+    railTaskbarSetActive(id);
+};
+
+// window.__rdp_rail_icon(id, w, h, rgba) — top-down RGBA → data URL for the
+// taskbar button. Stored on the window so it applies even if the button (which
+// needs a title) is created later.
+window.__rdp_rail_icon = function(id, width, height, rgba) {
+    const win = railWindows.get(id);
+    if (!win) return;
+    try {
+        const cv = document.createElement('canvas');
+        cv.width = width; cv.height = height;
+        cv.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
+        win.iconUrl = cv.toDataURL('image/png');
+        if (win.taskIcon) win.taskIcon.src = win.iconUrl;
+    } catch (_) { /* ignore malformed icon */ }
 };
 
 window.__rdp_rail_window_deleted = function(id) {
     const win = railWindows.get(id);
     if (!win) return;
     win.el.remove();
+    if (win.taskBtn) win.taskBtn.remove();
     railWindows.delete(id);
     rebuildRailSurfaces();
     console.log(`[RAIL] window deleted 0x${(id >>> 0).toString(16)} (${railWindows.size} left)`);
@@ -1611,6 +1943,10 @@ function teardownRailWindows() {
     railMainWindowId = null;
     railHadWindows = false;
     if (railExitTimer) { clearTimeout(railExitTimer); railExitTimer = null; }
+    if (railTaskbarItems) railTaskbarItems.innerHTML = '';
+    if (railTaskbar) { railTaskbar.hidden = true; railTaskbar.classList.remove('visible'); }
+    if (railTaskbarZone) railTaskbarZone.hidden = true;
+    if (railLauncherMenu) railLauncherMenu.hidden = true;
     if (railDesktop) railDesktop.hidden = true;
     canvas.hidden = false;
     railInUse = false;
