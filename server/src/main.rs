@@ -5,14 +5,16 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::{HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use rust_embed::Embed;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tower::Layer;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{error, info};
 
 /// Embedded web assets (compiled into the binary).
@@ -153,7 +155,14 @@ async fn run_server(args: Args) {
 
     let app = if let Some(web_dir) = &args.web_dir {
         info!("Serving web assets from disk: {}", web_dir.display());
-        let serve_dir = ServeDir::new(web_dir);
+        // ServeDir sends Last-Modified and answers If-Modified-Since, but with
+        // no Cache-Control a browser still caches heuristically; force a
+        // revalidation so an edited asset shows up on a plain reload.
+        let serve_dir = SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        )
+        .layer(ServeDir::new(web_dir));
 
         if base.is_empty() {
             Router::new()
@@ -234,9 +243,25 @@ fn remote_apps_json(entries: &[String]) -> String {
     format!("[{}]", items.join(","))
 }
 
+/// Quoted hex of the embedded file's sha256, used as the asset's ETag.
+fn etag_for(content: &rust_embed::EmbeddedFile) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(66);
+    s.push('"');
+    for b in content.metadata.sha256_hash() {
+        let _ = write!(s, "{b:02x}");
+    }
+    s.push('"');
+    s
+}
+
 /// For `index.html`, injects `window.__APP_NAME` when `--app-name` was given so
 /// JS can brand the login page title, heading, and popup titles without a rebuild.
-async fn embedded_handler(uri: Uri, State(config): State<AppConfig>) -> impl IntoResponse {
+async fn embedded_handler(
+    uri: Uri,
+    headers: HeaderMap,
+    State(config): State<AppConfig>,
+) -> impl IntoResponse {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
@@ -245,6 +270,29 @@ async fn embedded_handler(uri: Uri, State(config): State<AppConfig>) -> impl Int
             let mime = mime_guess::from_path(path)
                 .first_or_octet_stream()
                 .to_string();
+
+            // Without a validator a browser heuristically caches app.js and the
+            // wasm, so a rebuilt server keeps serving the previous build until
+            // someone hard-refreshes. `no-cache` means "revalidate", not "don't
+            // store": the ETag turns an unchanged asset into a cheap 304 and a
+            // rebuilt one into fresh bytes. index.html is exempt because it is
+            // rewritten per request (feature flags + the live RemoteApp
+            // catalog), so the embedded file's hash would not track its body.
+            let etag = (path != "index.html").then(|| etag_for(&content));
+            if let Some(tag) = &etag {
+                let matched = headers
+                    .get(header::IF_NONE_MATCH)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.split(',').any(|c| c.trim() == tag));
+                if matched {
+                    return Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .header(header::ETAG, tag.as_str())
+                        .body(Body::empty())
+                        .unwrap();
+                }
+            }
 
             // Config injection: patch index.html with a <script> that sets
             // feature-flag globals so JS can gate clipboard and branding at
@@ -279,11 +327,16 @@ async fn embedded_handler(uri: Uri, State(config): State<AppConfig>) -> impl Int
                 Body::from(content.data.to_vec())
             };
 
-            Response::builder()
+            let res = Response::builder()
                 .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, HeaderValue::from_str(&mime).unwrap())
-                .body(body)
-                .unwrap()
+                .header(header::CONTENT_TYPE, HeaderValue::from_str(&mime).unwrap());
+            let res = match &etag {
+                Some(tag) => res
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .header(header::ETAG, tag.as_str()),
+                None => res.header(header::CACHE_CONTROL, "no-store"),
+            };
+            res.body(body).unwrap()
         }
         None => Response::builder()
             .status(StatusCode::NOT_FOUND)

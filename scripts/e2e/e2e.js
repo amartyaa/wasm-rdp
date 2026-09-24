@@ -278,9 +278,21 @@ function finish() {
   // cannot be driven here: app.js maps F11 to RDP scancode 0x57 and forwards
   // it to the remote, and CDP synthetic keys never reach browser chrome.
   const note = (late) => late > 0 ? ` (black ${late}s then recovered)` : late < 0 ? ' STILL BLACK' : '';
+
+  // In fullscreen the toolbar hides itself after 3s and only comes back when
+  // the pointer reaches the top edge (clientY < 10), so reveal it before
+  // clicking or the button is not a click target.
+  const clickFullscreenBtn = async () => {
+    const r = await probe();
+    await page.mouse.move(Math.round(r.vw / 2), 400);
+    await page.mouse.move(Math.round(r.vw / 2), 3);
+    await sleep(800);
+    await page.click('#btn-fullscreen');
+  };
+
   for (let k = 1; k <= (flag('quick') ? 1 : 3); k++) {
     let j = mark();
-    await page.click('#btn-fullscreen');
+    await clickFullscreenBtn();
     await sleep(8000);
     let { r, late } = await settle();
     let want = r.vw * (flag('hidpi') ? r.dpr : 1);
@@ -289,7 +301,7 @@ function finish() {
     else bad(`fullscreen-${k}`, `fs=${r.fs} ${d1}`);
 
     j = mark();
-    await page.click('#btn-fullscreen');
+    await clickFullscreenBtn();
     await sleep(8000);
     ({ r, late } = await settle());
     want = r.vw * (flag('hidpi') ? r.dpr : 1);

@@ -2917,6 +2917,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-native-tls",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
