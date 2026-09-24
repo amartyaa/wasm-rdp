@@ -53,4 +53,23 @@ Mouse coordinates are taken directly from the canvas's client rect. In a single-
 
 ## Display control / resize
 
-The `session.resize(width, height)` method exists and encodes a DisplayControl `MonitorLayout` PDU (`encode_resize`), but the `setupResizeHandler` in `app.js` is intentionally a no-op. Dynamic resize is not hooked up because xrdp does not support the DisplayControl virtual channel, and sending it to xrdp causes a blank screen. If you're targeting Windows-only and want dynamic resize, you'd need to feature-detect the target OS or gate on user opt-in.
+Dynamic resize is wired up and works on all three targets. This section previously said it was "intentionally a no-op because xrdp does not support the DisplayControl virtual channel" — **that premise was wrong**: xrdp has shipped MS-RDPEDISP since 0.9.16 (2021), and the client simply never registered `DisplayControlClient` on DRDYNVC.
+
+`resize` and `fullscreenchange` feed a single trailing **500 ms** debounce (matching FreeRDP's `RESIZE_MIN_DELAY_NS`) into `session.resize(width, height)`, which encodes a DisplayControl `MonitorLayout` PDU. The debounce is what keeps a window drag from firing hundreds of layout PDUs at the host. F11 is covered even though it raises no `fullscreenchange`, because it still raises `resize`.
+
+Between the gesture and the server's answer, `applyBridgeScale` CSS-fits the canvas to the viewport so nothing is clipped or bezelled. Input needs no correction for this: `getCanvasCoords` divides by `el.width / rect.width`, so mouse mapping follows any CSS scale for free. The same property is why canvas surfaces must be **letterboxed rather than stretched** — `object-fit: contain` would keep the element box larger than the drawn image and silently offset every click.
+
+The host answers in one of two ways, and it is not simply "EGFX or not":
+
+| Host | Response |
+|---|---|
+| Windows Server 2025, GNOME Remote Desktop | in-band EGFX `RDPGFX_RESET_GRAPHICS` |
+| xrdp | full **Deactivation-Reactivation**, even with EGFX up |
+
+Both arms resize the canvas and call `__rdp_desktop_resized`. The HUD's "Resize" row reports progress (`Ready` → `Requesting WxH` → `OK WxH`, or `Ignored by server` / `Waiting for channel`), which is the quickest way to tell a dropped request from a server that refused.
+
+Sizes are clamped to 200–8192 with an even width per MS-RDPEDISP 2.2.2.2.1. The spec's monitor-area cap is deliberately **not** enforced — read literally it yields about 1600 square pixels, and neither FreeRDP nor IronRDP honours it.
+
+Resize is skipped in multi-monitor sessions (the layout is owned by `apply_monitor_layout`) and in RAIL mode (windows are sized individually).
+
+**Known limitation:** DisplayControl must stay registered via `with_dynamic_channel`, because `ActiveStage::encode_resize` locates it by TypeId and the public `with_listener` path does not support that lookup. Unlike EGFX and RDPSND, it is therefore *not* re-created after a reactivation.

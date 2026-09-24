@@ -9,7 +9,12 @@
 > LTSR 2507).
 >
 > **This document supersedes the overlapping (and now partly stale) claims in
-> `PERFORMANCE_ANALYSIS.md` and `AUDIO_COMPARISON.md` — see §9.**
+> `PERFORMANCE_ANALYSIS.md`, `AUDIO_COMPARISON.md` and parts of `CLAUDE.md` — see §9.**
+>
+> **Revised 2026-09-25** after an end-to-end feature sweep across all three targets
+> (`scripts/e2e/`). Dynamic resize and HiDPI moved from "missing" to shipped; multi-monitor was
+> re-verified on real mixed-resolution hardware and two aspect-ratio bugs fixed. Frame pacing
+> (§1.2 #2) was re-checked and is **still** absent.
 
 ---
 
@@ -41,8 +46,8 @@ Legend: ✅ parity/competitive · 🟡 partial · 🔴 missing · ⚪ deliberate
 | Graphics datapath (codecs) | ✅ | ✅ | 🟡 | AVC420/WebCodecs HW decode; no AV1/H.265 (GPU-only anyway) — §4.1 |
 | Adaptive display / frame pacing | 🔴 | 🟡 | 🔴 | FPS cap **inert**, no rAF coalescing — §4.1, §7 Tier 0 |
 | Multi-monitor | ✅ | ✅ | ✅ | getScreenDetails + popup-per-monitor — §4.1 |
-| HiDPI / display scaling | 🔴 | 🟡 | ✅ | `desktop_scale_factor: 0` — §4.1 |
-| Dynamic resize | 🔴 | ✅ | ✅ | deliberate no-op (xrdp limitation) — §4.1 |
+| HiDPI / display scaling | 🟡 | 🟡 | ✅ | shipped, opt-in, capped 2×, single-monitor — §4.1 |
+| Dynamic resize | ✅ | ✅ | ✅ | shipped on all three targets (MS-RDPEDISP) — §4.1 |
 | Seamless published apps | 🟡 | ✅ | ✅ | RAIL v1 shipped; classic-only, single-app — §4.2 |
 | Keyboard | ✅ | ✅ | ✅ | full scancode map + extended keys — §4.3 |
 | IME / CJK / unicode input | 🔴 | ✅ | ✅ | no composition events — §4.3, §7 Tier 1 |
@@ -68,8 +73,9 @@ Legend: ✅ parity/competitive · 🟡 partial · 🔴 missing · ⚪ deliberate
    host itself. Citrix's entire access story (Gateway, adaptive auth, MFA, SmartAccess) sits in
    front of the datapath. This is IronBridge's single largest gap for any deployment outside a
    trusted network — see §4.8 and §7 Tier 0.
-2. **The "60 FPS" setting is a no-op.** The FPS-cap dropdown is plumbed all the way to
-   `run_session`, where it lands as the unused `_fps_cap` ([session.rs:1946](wasm/src/session.rs#L1946)),
+2. **The "60 FPS" setting is a no-op.** (Re-verified 2026-09-25 — still true.) The FPS-cap dropdown
+   is plumbed all the way to `run_session`, where it lands as the unused `_fps_cap`
+   ([session.rs:2078](wasm/src/session.rs#L2078)),
    and there is no `requestAnimationFrame` coalescing anywhere in the render path (0 grep hits) —
    every dirty region paints synchronously. IronBridge is *faster to first pixel* than an
    rAF-batched client but has *no frame pacing and no overdraw control*, which is exactly the
@@ -202,26 +208,45 @@ for decode.
    Consequence vs. Citrix Adaptive Display: IronBridge cannot cap frame rate to save bandwidth,
    cannot coalesce a burst of dirty rects into one composite paint, and has no quality/FPS knob.
    `PERFORMANCE_ANALYSIS.md §3` still flags this as open — it is (§9).
-2. **No HiDPI / display scaling.** `desktop_scale_factor: 0` ([session.rs:2407](wasm/src/session.rs#L2407))
-   and no `devicePixelRatio` use anywhere. On a 4K/Retina display the remote desktop renders at CSS
-   pixels, not device pixels — text is soft. Citrix supports DPI matching and per-monitor scaling.
+2. **HiDPI is shipped but deliberately narrow.** The `adv-hidpi` toggle requests the desktop at
+   `logical × devicePixelRatio`, capped at 2×, then CSS-downscales the canvas back to logical size
+   ([app.js:527](web/app.js#L527)). Verified 2026-09-25 against xrdp on a forced 2× display:
+   backing `1914x802` for a `957x401` viewport, exactly 2.00×. Three caveats keep this 🟡 rather
+   than ✅: it is **off by default** (≈4× the pixels, which the GPU-less charter cannot afford
+   silently), **single-monitor only** (mutually exclusive with multi-monitor at
+   [app.js:526](web/app.js#L526)), and it scales the *framebuffer* rather than negotiating
+   `DesktopScaleFactor` — that field is still `0` ([session.rs:2552](wasm/src/session.rs#L2552)),
+   so the remote session's own DPI is untouched and Windows still renders 96-DPI UI, just at more
+   pixels. Citrix's DPI matching makes the *guest* DPI-aware; IronBridge supersamples instead.
 
 **Multi-monitor: parity, and genuinely nice.** IronBridge uses the Window Management API
-`getScreenDetails()` ([app.js:947](web/app.js#L947)), opens one popup window per secondary display
-([app.js:1001-1020](web/app.js#L1001)), maps N one-per-monitor surfaces
-([session.rs:1358](wasm/src/session.rs#L1358)), computes the combined desktop as the bounding box
-([session.rs:2301](wasm/src/session.rs#L2301)), and relayouts live on `screenschange` via
-DisplayControl ([app.js:1069](web/app.js#L1069), [session.rs:2313](wasm/src/session.rs#L2313)).
-CWA-HTML5 caps at two external monitors and Chrome/Edge-only; IronBridge has no hard cap (bounded by
-u16 desktop dims) but shares the Chromium-only constraint. **Even here IronBridge matches its fair
-comparator.**
+`getScreenDetails()`, opens one popup window per secondary display
+([app.js:1213](web/app.js#L1213)), maps N one-per-monitor surfaces, computes the combined desktop as
+the bounding box, and relayouts live on `screenschange` via DisplayControl
+([app.js:1279](web/app.js#L1279)). CWA-HTML5 caps at two external monitors and Chrome/Edge-only;
+IronBridge has no hard cap (bounded by u16 desktop dims) but shares the Chromium-only constraint.
 
-**Dynamic resize: deliberate no-op.** `setupResizeHandler()` intentionally keeps the canvas at the
-server-negotiated size ([app.js:937-939](web/app.js#L937)) because xrdp lacks the Display Control VC
-and would black-screen; `encode_resize` exists ([session.rs:1983](wasm/src/session.rs#L1983)) but
-nothing drives it on browser resize. This is a charter-driven choice (xrdp is a first-class target),
-not an oversight — but it is a real UX gap on Windows hosts, which *do* support RDPEDISP. §7 Tier 1
-proposes making it conditional.
+Verified 2026-09-25 on a real 2560×1440 + 1920×1080 pair against both xrdp and Server 2025. Two
+sizing bugs found and fixed in the process, both of which stretched a monitor out of aspect: the
+primary canvas was being fitted to the *combined* bounding box rather than its own surface, and the
+secondary popup's canvas was `width:100vw;height:100vh` so it filled a viewport whose aspect is the
+work area minus browser chrome. Both now letterbox. Worth knowing: **the server picks the primary,
+not us.** MS-RDPBCGR requires the primary monitor at (0,0), but `buildMonitorLayout` normalizes the
+bounding box to remove negative coordinates, which can shift the monitor we flagged as primary off
+the origin — Windows then silently promotes whichever monitor landed at (0,0), so the taskbar can
+appear on the wrong physical screen. Also note the two server families differ: **xrdp sends one EGFX
+surface per monitor; Windows sends a single combined surface** that the client clips per canvas.
+
+**Dynamic resize: shipped, and on all three targets.** This section previously described it as a
+deliberate no-op justified by "xrdp lacks the Display Control VC" — **that premise was simply
+wrong**: xrdp has shipped MS-RDPEDISP since 0.9.16 (2021) and we had merely never registered
+`DisplayControlClient` on DRDYNVC. Now `resize` + `fullscreenchange` feed one trailing 500 ms
+debounce (FreeRDP's `RESIZE_MIN_DELAY_NS`) into DisplayControl, while `applyBridgeScale` CSS-fits the
+canvas in the meantime so nothing is clipped or bezelled mid-gesture ([app.js:1066](web/app.js#L1066)).
+The apply mechanism splits by server: **EGFX up → in-band `RDPGFX_RESET_GRAPHICS`** (Windows, grd);
+**xrdp → a full Deactivation-Reactivation**, which took three client fixes to survive (a header-only
+Deactivate All that failed to decode, a latched `egfx_active`, and one-shot DVC listeners). Verified
+2026-09-25: 10 resize/fullscreen transitions per target, all three clean.
 
 **Fullscreen & cursor:** Fullscreen API with pre-connect + Ctrl+Shift+F + per-monitor-popup
 fullscreen ([app.js:363,704,1047](web/app.js#L363)); custom hardware cursors via `PointerBitmap` →
@@ -231,9 +256,13 @@ into the framebuffer ([session.rs:2405](wasm/src/session.rs#L2405)). This is com
 
 > **Per-target impact.** Win11 headless GPU-less: AVC420 client-decode works without a server GPU
 > (the whole charter) ✅; frame-pacing gap hurts most here (a headless host can flood updates).
-> GRD/xrdp: RFX-Progressive/legacy path carries them; HiDPI + resize gaps apply equally; xrdp is the
-> reason resize is disabled. **Perf note:** the missing rAF coalescing is a *latency win* (no
-> deferral) but an *efficiency loss* (overdraw, no batching) — §7 Tier 0 must preserve the former.
+> GRD/xrdp: RFX-Progressive/legacy path carries them. Resize now works everywhere, but the two
+> Linux targets pay for it differently — xrdp takes a full Deactivation-Reactivation per resize,
+> and on a GPU-less box llvmpipe can take **seconds** to repaint a large desktop afterwards (one
+> measured case: an all-black frame at 1920×1024 followed by 7.5 s of silence before real content,
+> `errors=0`, self-healing). That is a server-side repaint stall, not a client defect, but it is
+> what a user sees. **Perf note:** the missing rAF coalescing is a *latency win* (no deferral) but
+> an *efficiency loss* (overdraw, no batching) — §7 Tier 0 must preserve the former.
 
 ### 4.2 App & desktop delivery (seamless published apps)
 
@@ -551,10 +580,10 @@ Workspace app for HTML5 (the fair comparator). Evidence column = IronBridge.
 | 3 | H.264/AVC420 (HW decode) | ✅ | ✅ | ✅ | = | session.rs:1394, app.js:1922 |
 | 4 | AVC444 | ✅ | 🟡 | 🔴 | − | enum session.rs:73 |
 | 5 | H.265 / AV1 | ✅(GPU) | 🟡 | 🔴 | − | GPU-only; ⚪ for GPU-less charter |
-| 6 | Adaptive display / frame pacing | ✅ | 🟡 | 🔴 | − | `_fps_cap` unused session.rs:1946 |
-| 7 | Multi-monitor | ✅ | ✅(≤2) | ✅ | = / + | app.js:947, session.rs:1358 |
-| 8 | HiDPI scaling | ✅ | 🟡 | 🔴 | − | scale_factor 0 session.rs:2407 |
-| 9 | Dynamic resize | ✅ | ✅ | 🔴 | − | no-op app.js:937 |
+| 6 | Adaptive display / frame pacing | ✅ | 🟡 | 🔴 | − | `_fps_cap` unused session.rs:2078 |
+| 7 | Multi-monitor | ✅ | ✅(≤2) | ✅ | = / + | app.js:1213,1279 |
+| 8 | HiDPI scaling | ✅ | 🟡 | 🟡 | − | opt-in, 2× cap, single-monitor app.js:527 |
+| 9 | Dynamic resize | ✅ | ✅ | ✅ | = | MS-RDPEDISP, all 3 targets app.js:1056 |
 | 10 | Custom cursors | ✅ | ✅ | ✅ | = | session.rs:2152, canvas.rs:269 |
 | 11 | Seamless published apps | ✅ | ✅ | 🟡 | ~ | crates/ironrdp-rail, app.js:1458 |
 | 12 | App icons / taskbar | ✅ | ✅ | 🔴 | − | window.rs:208-213 |
@@ -654,15 +683,15 @@ uses ([session.rs:958](wasm/src/session.rs#L958)) and the vendored rdpsnd crate 
 - *Interplay:* pairs with the audio HUD row; needs a mic permission UX; respects the existing audio
   enable flag.
 
-**T1.2 — Dynamic resize on capable hosts (RDPEDISP).** Make `setupResizeHandler` conditional instead of a
-blanket no-op: drive `encode_resize`/DisplayControl ([session.rs:1983,2313](wasm/src/session.rs#L1983))
-on browser resize/fullscreen **when the host advertises the Display Control VC**, falling back to the
-current fixed-canvas behavior when it doesn't.
-- *Compat:* **Win11 ✅** (supports RDPEDISP); **xrdp 🔴** (the exact reason it's disabled today — keep the
-  fallback); GRD 🟡 (verify).
-- *Perf:* resize is a rare event → a re-negotiation + framebuffer realloc; negligible steady-state cost.
-- *Interplay:* **directly interacts with multi-monitor** (both drive DisplayControl — unify the layout
-  path, [app.js:1069](web/app.js#L1069)) and with HiDPI (T1.4); reconnect must re-apply the last size.
+**T1.2 — Dynamic resize on capable hosts (RDPEDISP). — ✅ DONE (2026-09-25).** Shipped for all three
+targets, not just the "capable" ones: the premise that xrdp couldn't do this was wrong (it has had
+RDPEDISP since 0.9.16). Trailing 500 ms debounce → DisplayControl, with `applyBridgeScale` CSS-fitting
+the canvas in between. What remains open from this item:
+- **DisplayControl is still one-shot.** It must stay on `with_dynamic_channel` because
+  `ActiveStage::encode_resize` finds it via `get_dvc_by_type_id`, which the public `with_listener`
+  path doesn't support. EGFX and RDPSND moved to a re-creating listener; DisplayControl couldn't.
+  Fixing it needs a fork change (listener registration carrying a TypeId).
+- **Reconnect does not re-apply the last requested size** — it comes back at the server's size.
 
 **T1.3 — IME / unicode input.** Add `compositionstart/update/end` + `beforeinput` handling and send
 composed text via Unicode keyboard events; enable client keyboard-layout signaling
@@ -673,12 +702,14 @@ composed text via Unicode keyboard events; enable client keyboard-layout signali
 - *Interplay:* must not fight the Ctrl+V deferred-paste replay ([app.js:736](web/app.js#L736)) or the
   scancode fast path (composition bypasses scancodes).
 
-**T1.4 — HiDPI / display scaling.** Honor `devicePixelRatio`: negotiate `desktop_scale_factor` and/or
-render the canvas at device pixels ([session.rs:2407](wasm/src/session.rs#L2407)).
-- *Compat:* Win11 ✅ (DPI-aware); GRD/xrdp 🟡 (scale client-side if the host won't).
-- *Perf:* larger framebuffer = more decode/paint/bandwidth — make it opt-in or DPI-capped; interacts with
-  the T0.2 frame-pacing work (more pixels per frame).
-- *Interplay:* multi-monitor (per-monitor DPI), dynamic resize (T1.2).
+**T1.4 — HiDPI / display scaling. — 🟡 PARTLY DONE (2026-09-25).** The client-side half shipped:
+opt-in `adv-hidpi`, desktop requested at `logical × devicePixelRatio` capped 2×, canvas CSS-downscaled
+([app.js:527](web/app.js#L527)). The perf worry was well-founded, which is why it defaults off. Still
+open:
+- **`DesktopScaleFactor` is never negotiated** ([session.rs:2552](wasm/src/session.rs#L2552)), so the
+  guest stays 96-DPI and only gets more pixels — sharp, but not Citrix-style DPI matching.
+- **Single-monitor only** — explicitly disabled when multi-monitor is active
+  ([app.js:526](web/app.js#L526)); per-monitor DPI is unhandled.
 
 **T1.5 — RAIL polish → Enhanced RAIL.** Sequence: window **icons** + **taskbar** UI
 ([window.rs:208-213](crates/ironrdp-rail/src/window.rs#L208)) → **Enhanced/HIDEF RAIL** (per-window EGFX
@@ -771,10 +802,16 @@ to WebSocket/TCP for loss resilience, with TCP fallback (mirrors Citrix Adaptive
 1. **T0.1 web-tier auth** (unblocks real deployment; largest risk retired).
 2. **T0.2 frame pacing / real FPS cap** (fixes a claimed-but-fake feature + the open perf item).
 3. **T1.1 microphone** and **T1.3 IME** (highest user-visible datapath gaps; both browser-native).
-4. **T1.2 dynamic resize** + **T1.4 HiDPI** (unify with multi-monitor's DisplayControl path).
+4. ~~T1.2 dynamic resize~~ **done**; **T1.4 HiDPI** remains half-done (no `DesktopScaleFactor`, no
+   per-monitor DPI).
 5. **T1.5 RAIL polish → Enhanced RAIL** (deepens the category IronBridge just entered).
 6. **T0.3 cert pinning**, **T1.6 Kerberos** (security hardening, handshake-only).
 7. **T2.x** as demand dictates (drives/printing/watermark/mini-broker/WebTransport).
+
+Two smaller items surfaced by the 2026-09-25 test sweep, worth slotting before T2.x:
+- **Multi-monitor primary designation** — keep the flagged primary at (0,0) on the wire so the host
+  doesn't promote a different physical screen (§4.1).
+- **DisplayControl re-creation across a reactivation** — needs the fork-side TypeId change (T1.2).
 
 ---
 
@@ -828,6 +865,20 @@ report is authoritative where they conflict):
   sync** ([audio.rs:71](wasm/src/audio.rs#L71)), and a **pull-based AudioWorklet ring buffer**
   ([audio-worklet.js:37](web/audio-worklet.js#L37)). The audio stack it recommends building **has been
   built**.
+
+**`CLAUDE.md`:**
+- §4.3 and §6 describe **"rAF-batched dirty-region coalescing (one `putImageData` per display frame)"**
+  with a `pending` rect and a scheduled `requestAnimationFrame`. **No such code exists.** There is no
+  `request_animation_frame` call anywhere in `wasm/src/`, and `ActiveStageOutput::GraphicsUpdate`
+  paints synchronously then calls `notify_frame()` ([session.rs:2251-2275](wasm/src/session.rs#L2251)).
+  The `fps_cap` plumbed in from the UI is still the unused `_fps_cap`
+  ([session.rs:2078](wasm/src/session.rs#L2078)). This is a documentation bug, not a regression —
+  §7 T0.2 remains fully open.
+- §5's "xrdp lacks the DisplayControl VC" has already been corrected in-file; resize now ships.
+
+**This document's own superseded claims (corrected 2026-09-25):** §4.1 previously called dynamic
+resize a "deliberate no-op" and HiDPI "absent". Both shipped; the scorecards in §1.1 and §6 are
+updated to match.
 
 **Net:** treat §4 + §6 of this document as the current-state source of truth; the older docs remain useful
 for their reasoning/history but not for their status claims.

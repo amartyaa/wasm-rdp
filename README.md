@@ -39,10 +39,15 @@ Open `http://localhost:8080` in Chrome or Edge. `--rdp-target` is where the rela
 
 ## Features
 
-- RemoteFX graphics decoded in the browser
+- RemoteFX, RFX-Progressive and H.264/AVC420 graphics decoded in the browser
+  (AVC420 goes straight to the GPU's hardware decoder via WebCodecs)
+- Dynamic resize — the remote desktop follows the browser window and fullscreen,
+  on Windows, GNOME Remote Desktop and xrdp alike (MS-RDPEDISP)
 - Multi-monitor support using the Window Management API
+- Optional High-DPI mode for crisp remote text on scaled displays
+- RemoteApp / RAIL — publish a single Windows app instead of a whole desktop
 - Audio over RDPSND — PCM, Opus, and AAC
-- Bidirectional clipboard (text and images)
+- Bidirectional clipboard (text, images and files)
 - NLA authentication via NTLM/CredSSP
 
 ## How it works
@@ -67,7 +72,9 @@ For more detail on individual subsystems, see the `docs/` folder:
 | `wasm/` | IronRDP state machine compiled to WASM |
 | `web/` | HTML, JS, CSS frontend |
 | `crates/ironrdp-rdpsnd/` | Vendored audio crate with Opus and AAC support |
+| `crates/ironrdp-rail/` | Vendored RAIL/RemoteApp crate (MS-RDPERP) |
 | `scripts/` | Build scripts for Windows and Linux |
+| `scripts/e2e/` | End-to-end feature sweep (Puppeteer) — see its README |
 
 ## Common build and runtime issues
 
