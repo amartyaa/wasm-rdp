@@ -1065,11 +1065,15 @@ function onViewportChanged() {
 // getCanvasCoords divides by el.width/rect.width, so mouse mapping follows.
 function applyBridgeScale() {
     const c = document.getElementById('rdp-canvas');
-    if (!c || !negotiatedDesktop) return;
+    if (!c || !c.width || !c.height) return;
     // Logical size = backing store as it is meant to appear on screen; with the
     // High-DPI toggle the backing store is deliberately dpr times larger.
-    const logicalW = negotiatedDesktop.w / sessionDpr;
-    const logicalH = negotiatedDesktop.h / sessionDpr;
+    // Measure the canvas itself rather than negotiatedDesktop: under
+    // multi-monitor the negotiated desktop is the *combined* bounding box while
+    // this canvas only holds the primary monitor, and fitting one to the other
+    // squashes it (4480x1440 shape forced onto a 1920x1080 surface).
+    const logicalW = c.width / sessionDpr;
+    const logicalH = c.height / sessionDpr;
     const fit = Math.min(window.innerWidth / logicalW, window.innerHeight / logicalH);
     const scale = Math.min(SCALE_MAX, fit);
     c.style.width = Math.round(logicalW * scale) + 'px';
@@ -1223,7 +1227,8 @@ function openSecondaryPopups(layout) {
         }
         win.document.title = window.__APP_NAME || 'Remote Display';
         const style = win.document.createElement('style');
-        style.textContent = 'html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:none}canvas{display:block;width:100vw;height:100vh}';
+        style.textContent = 'html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:none}'
+            + 'body{display:grid;place-items:center}canvas{display:block}';
         win.document.head.appendChild(style);
         const c = win.document.createElement('canvas');
         win.document.body.appendChild(c);
@@ -1246,10 +1251,25 @@ function setupMonitorSurfaces(layout) {
     for (const p of monitorPopups) {
         const m = p.monitor;
         session.add_surface(p.canvas, m.left, m.top, m.width, m.height);
+        fitPopupCanvas(p);
+        p.win.addEventListener('resize', () => fitPopupCanvas(p));
         attachCanvasMouse(p.canvas, m.left, m.top);
         setupDocInput(p.win.document, p.win);
         enableClickFullscreen(p.win, m.screen);
     }
+}
+
+// Letterbox a popup's canvas to its monitor's aspect ratio. Until the first
+// click fullscreens it the popup viewport is the screen's work area minus
+// browser chrome, so stretching to 100vw/100vh squashes the image. The CSS box
+// must equal the drawn image because getCanvasCoords maps input through
+// el.width / rect.width.
+function fitPopupCanvas(p) {
+    const c = p.canvas;
+    if (!c.width || !c.height) return;
+    const fit = Math.min(p.win.innerWidth / c.width, p.win.innerHeight / c.height);
+    c.style.width = Math.round(c.width * fit) + 'px';
+    c.style.height = Math.round(c.height * fit) + 'px';
 }
 
 // Fullscreen a popup on its screen on first interaction. requestFullscreen needs
