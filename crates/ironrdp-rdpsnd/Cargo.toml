@@ -22,7 +22,7 @@ tracing = { version = "0.1", features = ["log"] }
 # Cargo SourceIds, which duplicates ironrdp-svc/-dvc/-core/-pdu in the
 # dependency graph and breaks trait bounds (SvcClientProcessor/DvcProcessor
 # "not satisfied" errors). Update this rev whenever the root pin changes.
-ironrdp-svc = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f", version = "0.6" }
-ironrdp-dvc = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f", version = "0.5" }
-ironrdp-core = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f", version = "0.1", features = ["alloc"] }
-ironrdp-pdu = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f", version = "0.7", features = ["alloc"] }
+ironrdp-svc = { git = "https://github.com/amartyaa/IronRDP.git", rev = "4fafafe801f90980d5502232b370e089c74b03ea", version = "0.6" }
+ironrdp-dvc = { git = "https://github.com/amartyaa/IronRDP.git", rev = "4fafafe801f90980d5502232b370e089c74b03ea", version = "0.5" }
+ironrdp-core = { git = "https://github.com/amartyaa/IronRDP.git", rev = "4fafafe801f90980d5502232b370e089c74b03ea", version = "0.1", features = ["alloc"] }
+ironrdp-pdu = { git = "https://github.com/amartyaa/IronRDP.git", rev = "4fafafe801f90980d5502232b370e089c74b03ea", version = "0.7", features = ["alloc"] }

@@ -16,10 +16,10 @@ panic = "abort"
 # builds off this machine (e.g. the Windows VM). To iterate on the fork
 # locally instead, comment these out and use the local-path patch below
 # (see ../rdp-reference/IronRDP-fork and scripts/ dev notes).
-ironrdp-session = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f" }
-ironrdp         = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f" }
-ironrdp-core    = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f" }
-ironrdp-cliprdr-format = { git = "https://github.com/amartyaa/IronRDP.git", rev = "bf5b017d41cfce4003e0aa01a20c834e75f3f29f" }
+ironrdp-session = { git = "https://github.com/amartyaa/IronRDP.git", rev = "4fafafe801f90980d5502232b370e089c74b03ea" }
+ironrdp         = { git = "https://github.com/amartyaa/IronRDP.git", rev = "4fafafe801f90980d5502232b370e089c74b03ea" }
+ironrdp-core    = { git = "https://github.com/amartyaa/IronRDP.git", rev = "4fafafe801f90980d5502232b370e089c74b03ea" }
+ironrdp-cliprdr-format = { git = "https://github.com/amartyaa/IronRDP.git", rev = "4fafafe801f90980d5502232b370e089c74b03ea" }
 # Local-path patch (fork dev):
 # ironrdp-session = { path = "../rdp-reference/IronRDP-fork/crates/ironrdp-session" }
 # ironrdp = { path = "../rdp-reference/IronRDP-fork/crates/ironrdp" }

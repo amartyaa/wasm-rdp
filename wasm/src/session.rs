@@ -217,6 +217,9 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
             crate::notify_avc420_surface_closed(id);
         }
         gfx.clear();
+        // Same reasoning as on_surface_deleted: with no surfaces, EGFX is not
+        // rendering, so the legacy path must not stay suppressed.
+        self.egfx_active.set(false);
     }
 
     fn on_surface_created(&mut self, surface: &ironrdp::egfx::client::Surface) {
@@ -245,8 +248,22 @@ impl ironrdp::egfx::client::GraphicsPipelineHandler for WasmGfxHandler {
 
     fn on_surface_deleted(&mut self, surface_id: u16) {
         log(&format!("[EGFX] surface deleted id={surface_id}"));
-        self.gfx.borrow_mut().remove(&surface_id);
+        let remaining = {
+            let mut gfx = self.gfx.borrow_mut();
+            gfx.remove(&surface_id);
+            gfx.len()
+        };
         crate::notify_avc420_surface_closed(surface_id);
+        if remaining == 0 {
+            // EGFX no longer owns rendering. xrdp answers a resize by deleting
+            // the surface and running a Deactivation-Reactivation, and does not
+            // always bring EGFX back afterwards — leaving this latched true
+            // suppressed every legacy GraphicsUpdate from then on, so the
+            // session froze until the user reconnected. A new CreateSurface
+            // sets it again.
+            log("[EGFX] no surfaces left — legacy rendering re-enabled");
+            self.egfx_active.set(false);
+        }
     }
 
     fn on_surface_mapped(&mut self, surface_id: u16, origin_x: u32, origin_y: u32) {
@@ -740,6 +757,38 @@ fn avc_to_annexb(data: &[u8]) -> (Vec<u8>, bool) {
     }
     (out, is_keyframe)
 }
+/// A DVC listener that builds a **fresh** processor for every create request.
+///
+/// `DrdynvcClient::with_dynamic_channel` registers a one-shot listener — it
+/// `take()`s the processor — so a channel can be opened only once per
+/// connection. xrdp answers a DisplayControl resize with a
+/// Deactivation-Reactivation and then re-opens the graphics channel; the
+/// one-shot listener rejects that second request with NO_LISTENER, leaving the
+/// session with no EGFX channel and a permanently frozen picture (recoverable
+/// only by reconnecting). Re-creating the processor is also the correct
+/// semantics: after a reactivation the channel renegotiates from scratch.
+///
+/// Note this registration path doesn't support `get_dvc_by_type_id`, so it
+/// can't be used for DisplayControl, which `encode_resize` looks up by type.
+struct RecreatingDvc {
+    name: &'static str,
+    make: Box<dyn FnMut() -> Box<dyn ironrdp::dvc::DvcProcessor>>,
+}
+
+// SAFETY: same rationale as `WasmGfxHandler` above — the factory captures `Rc`
+// state that isn't `Send`, but the wasm32 `--target web` build is strictly
+// single-threaded and this is only ever invoked on that one thread.
+unsafe impl Send for RecreatingDvc {}
+
+impl ironrdp::dvc::DvcChannelListener for RecreatingDvc {
+    fn channel_name(&self) -> &str {
+        self.name
+    }
+
+    fn create(&mut self) -> Option<Box<dyn ironrdp::dvc::DvcProcessor>> {
+        Some((self.make)())
+    }
+}
 // ===== END EGFX graphics pipeline =====
 
 /// An active RDP session handle exposed to JavaScript.
@@ -962,23 +1011,39 @@ impl Session {
                 // decoded asynchronously by JS WebCodecs (see `on_avc420_raw`).
                 // Advertisement of AVC420 itself is still gated by `enable_avc420`
                 // inside `WasmGfxHandler::capabilities()`.
-                drdynvc = drdynvc.with_dynamic_channel(
-                    ironrdp::egfx::client::GraphicsPipelineClient::new_passthrough(
-                        Box::new(WasmGfxHandler::new(
-                            surfaces.clone(),
-                            gfx_surfaces.clone(),
-                            egfx_active.clone(),
-                            video_codec.clone(),
-                            enable_avc420,
-                        )),
-                    ),
+                // Re-creatable: xrdp re-opens this channel after the
+                // Deactivation-Reactivation it runs in answer to a resize.
+                let (sf, gs, ea, vc) = (
+                    surfaces.clone(),
+                    gfx_surfaces.clone(),
+                    egfx_active.clone(),
+                    video_codec.clone(),
                 );
+                drdynvc = drdynvc.with_listener(RecreatingDvc {
+                    name: ironrdp::egfx::CHANNEL_NAME,
+                    make: Box::new(move || {
+                        Box::new(ironrdp::egfx::client::GraphicsPipelineClient::new_passthrough(
+                            Box::new(WasmGfxHandler::new(
+                                sf.clone(),
+                                gs.clone(),
+                                ea.clone(),
+                                vc.clone(),
+                                enable_avc420,
+                            )),
+                        ))
+                    }),
+                });
             }
             if enable_audio {
                 log("[RDPSND] attaching audio DVC (AUDIO_PLAYBACK_DVC)");
-                drdynvc = drdynvc.with_dynamic_channel(ironrdp::rdpsnd::client::RdpsndDvcClient::new(
-                    Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac)),
-                ));
+                drdynvc = drdynvc.with_listener(RecreatingDvc {
+                    name: ironrdp::rdpsnd::client::RdpsndDvcClient::CHANNEL_NAME,
+                    make: Box::new(move || {
+                        Box::new(ironrdp::rdpsnd::client::RdpsndDvcClient::new(Box::new(
+                            crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac),
+                        )))
+                    }),
+                });
             }
             // Display Control (MS-RDPEDISP) — dynamic desktop resize. Always
             // registered: the server only opens the channel if it supports the
@@ -1174,22 +1239,38 @@ impl Session {
         let connector = if enable_gfx || enable_audio {
             let mut drdynvc = ironrdp::dvc::DrdynvcClient::new();
             if enable_gfx {
-                drdynvc = drdynvc.with_dynamic_channel(
-                    ironrdp::egfx::client::GraphicsPipelineClient::new_passthrough(
-                        Box::new(WasmGfxHandler::new(
-                            surfaces.clone(),
-                            gfx_surfaces.clone(),
-                            egfx_active.clone(),
-                            video_codec.clone(),
-                            enable_avc420,
-                        )),
-                    ),
+                // Re-creatable: xrdp re-opens this channel after the
+                // Deactivation-Reactivation it runs in answer to a resize.
+                let (sf, gs, ea, vc) = (
+                    surfaces.clone(),
+                    gfx_surfaces.clone(),
+                    egfx_active.clone(),
+                    video_codec.clone(),
                 );
+                drdynvc = drdynvc.with_listener(RecreatingDvc {
+                    name: ironrdp::egfx::CHANNEL_NAME,
+                    make: Box::new(move || {
+                        Box::new(ironrdp::egfx::client::GraphicsPipelineClient::new_passthrough(
+                            Box::new(WasmGfxHandler::new(
+                                sf.clone(),
+                                gs.clone(),
+                                ea.clone(),
+                                vc.clone(),
+                                enable_avc420,
+                            )),
+                        ))
+                    }),
+                });
             }
             if enable_audio {
-                drdynvc = drdynvc.with_dynamic_channel(ironrdp::rdpsnd::client::RdpsndDvcClient::new(
-                    Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac)),
-                ));
+                drdynvc = drdynvc.with_listener(RecreatingDvc {
+                    name: ironrdp::rdpsnd::client::RdpsndDvcClient::CHANNEL_NAME,
+                    make: Box::new(move || {
+                        Box::new(ironrdp::rdpsnd::client::RdpsndDvcClient::new(Box::new(
+                            crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac),
+                        )))
+                    }),
+                });
             }
             // Display Control — see connect() for why this is unconditional.
             drdynvc = drdynvc.with_dynamic_channel(
