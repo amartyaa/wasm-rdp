@@ -1,0 +1,10 @@
+{
+  "name": "ironbridge-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "End-to-end feature sweep for the IronBridge web RDP client",
+  "type": "commonjs",
+  "dependencies": {
+    "puppeteer-core": "^25.11.0"
+  }
+}

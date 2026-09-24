@@ -22,3 +22,8 @@ desktop.ini
 # Logs
 *.log
 *.md
+# e2e harness deps
+/scripts/e2e/node_modules/
+/scripts/e2e/e2e-*.json
+/scripts/e2e/e2e-*.txt
+/scripts/e2e/*.png
