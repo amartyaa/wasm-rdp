@@ -27,6 +27,7 @@ node rail.js  http://localhost:8091 <user> <pass>      # Windows only
 | `e2e.js` | connect/NLA, first paint, HUD rows, keyboard (incl. Super), mouse, CLIPRDR, 4 resizes, 3 toolbar fullscreen cycles, 2 browser-fullscreen cycles, hi-dpi ratio, liveness, disconnect |
 | `hover.js` | pointer motion specifically — hovers a window close button and watches it change colour |
 | `rail.js` | RemoteApp: catalog, published window paints, keyboard and Shift into it |
+| `clip.js` | Clipboard ownership — reads the *remote session's* clipboard before and after a real Ctrl+V, in both directions |
 
 Results land in `e2e-<label>.json` plus a console log dump and a final
 screenshot. A non-zero exit means at least one check failed.

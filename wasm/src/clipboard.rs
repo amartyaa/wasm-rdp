@@ -93,6 +93,19 @@ extern "C" {
     fn notify_remote_clipboard_has_files();
 }
 
+/// Notify JS whether the remote's clipboard now holds files. Only a file copy
+/// needs protecting: advertising the host's clipboard over the top of it
+/// discards the in-session copy, and unlike text we never mirror remote files
+/// locally, so the user would have no way back to them.
+#[wasm_bindgen(inline_js = "
+export function notify_remote_clipboard_owner(has_files) {
+    window.__rdp_remote_clipboard_owner && window.__rdp_remote_clipboard_owner(has_files);
+}
+")]
+extern "C" {
+    fn notify_remote_clipboard_owner(has_files: bool);
+}
+
 /// Trigger a browser file download for a file received from the remote.
 #[wasm_bindgen(inline_js = "
 export function download_file(name, bytes) {
@@ -330,10 +343,21 @@ impl CliprdrBackend for WasmCliprdrBackend {
 
     fn on_process_negotiated_capabilities(
         &mut self,
-        _capabilities: ClipboardGeneralCapabilityFlags,
-    ) {}
+        capabilities: ClipboardGeneralCapabilityFlags,
+    ) {
+        crate::log(&format!("Clipboard: negotiated caps {capabilities:?}"));
+    }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
+        // Both xrdp and Windows advertise their clipboard as soon as the
+        // channel comes up, so "the remote sent a Format List" does not mean
+        // the user copied anything in-session. Only a file list is worth
+        // protecting a later Ctrl+V from.
+        let remote_has_files = available_formats
+            .iter()
+            .any(|f| f.name().map(|n| n.value()) == Some(FORMAT_NAME_FILE_LIST));
+        notify_remote_clipboard_owner(remote_has_files);
+
         if self.enable_text {
             let has_text = available_formats
                 .iter()
