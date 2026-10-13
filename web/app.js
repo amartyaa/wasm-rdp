@@ -187,6 +187,8 @@ const btnPin = document.getElementById('btn-pin');
 const toolbarGrip = document.getElementById('toolbar-grip');
 const toolbarHint = document.getElementById('toolbar-hint');
 const btnToolbarHintDismiss = document.getElementById('btn-toolbar-hint-dismiss');
+const fullscreenHint = document.getElementById('fullscreen-hint');
+const btnFullscreenHintDismiss = document.getElementById('btn-fullscreen-hint-dismiss');
 const btnDisconnect = document.getElementById('btn-disconnect');
 const fullscreenCheckbox = document.getElementById('fullscreen-preconnect');
 const reconnectOverlay = document.getElementById('reconnect-overlay');
@@ -223,6 +225,7 @@ let toolbarTimeout = null;
 let toolbarPos = null;          // {x, y} once dragged; null = default top centre
 let toolbarPinned = localStorage.getItem('rdp_toolbar_pinned') === '1';
 let toolbarForcedHidden = false;
+let altTabHolding = false;   // Alt held down on the remote for the app switcher
 let lastMouseTime = 0;
 let resizeTimeout = null;
 let fpsCap = parseInt(localStorage.getItem('rdp_fps_cap') || '60', 10);
@@ -850,6 +853,7 @@ function attachFileDrop(el) {
 // Called on blur to prevent stuck Ctrl/Alt/Shift when focus leaves the browser.
 function releaseAllModifiers() {
     if (!session) return;
+    altTabHolding = false;
     session.send_keyboard(0x1D, false, false);  // Ctrl left up
     session.send_keyboard(0x1D, false, true);   // Ctrl right up
     session.send_keyboard(0x2A, false, false);  // Shift left up
@@ -884,12 +888,10 @@ function onKeyDown(e) {
         disconnect();
         return;
     }
-    // Remap Ctrl+Tab → Alt+Tab
-    // Release Ctrl first so the remote sees pure Alt+Tab, not Ctrl+Alt+Tab
+    // Remap Ctrl+Tab → Alt+Tab, holding Alt until Ctrl is released (see altTabStep)
     if (e.ctrlKey && e.code === 'Tab') {
         e.preventDefault();
-        session.send_keyboard(0x1D, false, false); // Ctrl up
-        sendAltTab();
+        altTabStep(e.shiftKey);
         return;
     }
 
@@ -927,6 +929,10 @@ function onKeyDown(e) {
 function onKeyUp(e) {
     if (!session) return;
     e.preventDefault();
+    // Letting go of Ctrl commits the app-switcher selection (see altTabStep).
+    if (altTabHolding && (e.code === 'ControlLeft' || e.code === 'ControlRight')) {
+        endAltTab();
+    }
     // Swallow the V keyup that pairs with a deferred paste (see onKeyDown).
     if (suppressVUp && e.code === 'KeyV') {
         suppressVUp = false;
@@ -1411,12 +1417,38 @@ function sendCtrlAltDel() {
     session.send_keyboard(0x1D, false, false); // Ctrl up
 }
 
+// One-shot: the switcher flashes and Windows drops straight to the previous
+// window. That is what the toolbar button should do — a click cannot hold Alt.
 function sendAltTab() {
     if (!session) return;
     session.send_keyboard(0x38, true, false);  // Alt down
     session.send_keyboard(0x0F, true, false);  // Tab down
     session.send_keyboard(0x0F, false, false); // Tab up
     session.send_keyboard(0x38, false, false); // Alt up
+}
+
+// Held: Windows only draws the app switcher while Alt stays down, so releasing
+// it with the Tab press (as the one-shot does) just toggles the last two
+// windows. Keep Alt down for as long as the user holds Ctrl, and send a Tab
+// press per Ctrl+Tab, which is exactly what a real Alt+Tab does.
+function altTabStep(shift) {
+    if (!session) return;
+    if (!altTabHolding) {
+        session.send_keyboard(0x1D, false, false); // Ctrl up — the remote must see pure Alt+Tab
+        session.send_keyboard(0x1D, false, true);  // ...both of them
+        session.send_keyboard(0x38, true, false);  // Alt down, and it stays down
+        altTabHolding = true;
+    }
+    if (shift) session.send_keyboard(0x2A, true, false);   // Shift down — step backwards
+    session.send_keyboard(0x0F, true, false);  // Tab down
+    session.send_keyboard(0x0F, false, false); // Tab up
+    if (shift) session.send_keyboard(0x2A, false, false);
+}
+
+function endAltTab() {
+    if (!altTabHolding) return;
+    altTabHolding = false;
+    if (session) session.send_keyboard(0x38, false, false); // Alt up — commits the selection
 }
 
 // ── Toolbar ──────────────────────────────────────────────
@@ -1580,6 +1612,45 @@ function toggleFullscreen() {
     }
 }
 
+// ── Keyboard Lock ────────────────────────────────────────
+// In fullscreen, route the shortcuts the browser would otherwise eat — Escape,
+// Alt+Tab, Ctrl+W/T/N — to the session instead, which is what a remote desktop
+// is expected to do. Requires a secure context, so over plain HTTP on a LAN
+// `navigator.keyboard` is simply undefined and we carry on without it.
+// Escape still leaves fullscreen, but the user has to hold it rather than tap
+// it; that escape hatch is guaranteed by the browser and cannot be removed.
+async function applyKeyboardLock() {
+    if (!navigator.keyboard || !navigator.keyboard.lock) return;
+    try {
+        if (document.fullscreenElement) {
+            await navigator.keyboard.lock();   // no argument = every capturable key
+            maybeShowFullscreenHint();
+        } else {
+            navigator.keyboard.unlock();
+        }
+    } catch (_) { /* best effort — an unlocked fullscreen is still usable */ }
+}
+
+document.addEventListener('fullscreenchange', applyKeyboardLock);
+
+// One-time, like the toolbar hint: the behaviour change (Alt+Tab/Ctrl+W go to
+// the remote, Escape needs a hold) is invisible until it surprises someone, so
+// say so once on the first fullscreen entry that actually captured the
+// keyboard — not at connect, since nothing has changed yet at that point.
+function maybeShowFullscreenHint() {
+    if (localStorage.getItem('rdp_fullscreen_hint_seen') === '1') return;
+    fullscreenHint.hidden = false;
+}
+
+function dismissFullscreenHint() {
+    fullscreenHint.hidden = true;
+    try {
+        localStorage.setItem('rdp_fullscreen_hint_seen', '1');
+    } catch (_) { /* private mode — worst case they see it again next time */ }
+}
+
+btnFullscreenHintDismiss.addEventListener('click', dismissFullscreenHint);
+
 function disconnect() {
     isUserDisconnect = true;
     cancelReconnect();
@@ -1600,6 +1671,10 @@ function cleanupSession() {
     toolbar.classList.remove('visible');
     toolbarForcedHidden = false;
     toolbarHint.hidden = true;
+    fullscreenHint.hidden = true;
+    if (navigator.keyboard && navigator.keyboard.unlock) {
+        try { navigator.keyboard.unlock(); } catch (_) { /* nothing held */ }
+    }
     loginScreen.hidden = false;
     setConnecting(false);
     if (document.fullscreenElement) {
@@ -1632,6 +1707,7 @@ function cleanupSession() {
     if (pasteReplayTimer) { clearTimeout(pasteReplayTimer); pasteReplayTimer = null; }
     suppressVUp = false;
     pasteKeystrokeSent = false;
+    altTabHolding = false;
     remoteOwnsClipboard = false;
     pasteGuardUsed = false;
     lastHostClipboardText = null;

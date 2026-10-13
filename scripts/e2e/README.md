@@ -17,6 +17,7 @@ node e2e.js http://localhost:8092 <user> <pass> <label>-hidpi --hidpi --quick
 node hover.js http://localhost:8092 <user> <pass> <label>
 node rail.js  http://localhost:8091 <user> <pass>      # Windows only
 node toolbar.js http://localhost:8092 <user> <pass>
+node fshint.js   http://localhost:8092 <user> <pass>
 ```
 
 `CHROME=/path/to/chrome` overrides the browser location.
@@ -30,6 +31,8 @@ node toolbar.js http://localhost:8092 <user> <pass>
 | `rail.js` | RemoteApp: catalog, published window paints, keyboard and Shift into it |
 | `clip.js` | Clipboard ownership — reads the *remote session's* clipboard before and after a real Ctrl+V, in both directions |
 | `toolbar.js` | Toolbar drag/pin/hide, the one-time hint, and that dragging sends no mouse input to the session |
+| `altcapture.js` | Whether Keyboard Lock really captures a **real** OS-level Alt+Tab (see the caveat below) |
+| `fshint.js` | The one-time fullscreen-shortcuts hint — shown once, dismissible, never comes back |
 
 Results land in `e2e-<label>.json` plus a console log dump and a final
 screenshot. A non-zero exit means at least one check failed.
@@ -50,6 +53,14 @@ screenshot. A non-zero exit means at least one check failed.
   black screen that looks exactly like a client bug.
 
 ## Known probe limitations
+
+- `altcapture.js` **needs an unlocked, interactive desktop.** It injects Alt+Tab
+  with `keybd_event`, which feeds the same input queue as real hardware — CDP
+  synthetic keys never reach the OS shortcut handler, so nothing else can test
+  this. While the workstation is locked, input goes to the secure desktop and
+  the result is meaningless: check `FG_BEFORE` in the output, and if it says
+  `Windows Default Lock Screen`, the run proved nothing. It also moves real
+  focus around, so don't run it while using the machine.
 
 - `F11` cannot be driven: the client maps it to RDP scancode 0x57 and forwards
   it to the remote, and CDP synthetic keys never reach browser chrome. The

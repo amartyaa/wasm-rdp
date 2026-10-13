@@ -244,6 +244,17 @@
         <button id="btn-toolbar-hint-dismiss" class="toolbar-hint-dismiss">Got it</button>
     </div>
 
+    <!-- One-time fullscreen-shortcuts hint: Keyboard Lock silently changes what
+         Escape/Alt+Tab/Ctrl+W do, so say so once on the first time it applies. -->
+    <div id="fullscreen-hint" class="toolbar-hint fullscreen-hint" hidden>
+        <div class="toolbar-hint-title">Shortcuts now go to the remote session</div>
+        <ul class="toolbar-hint-list">
+            <li>Alt+Tab, Ctrl+W/T/N and friends reach the remote instead of your browser.</li>
+            <li>Hold <kbd>Esc</kbd> (not a tap) to leave fullscreen.</li>
+        </ul>
+        <button id="btn-fullscreen-hint-dismiss" class="toolbar-hint-dismiss">Got it</button>
+    </div>
+
     <!-- RemoteApp taskbar (auto-hide, bottom edge) -->
     <div id="rail-taskbar-zone" class="rail-taskbar-zone" hidden></div>
     <div id="rail-taskbar" class="rail-taskbar" hidden>
