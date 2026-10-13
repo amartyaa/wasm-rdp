@@ -253,21 +253,21 @@ let lastSyncedClipboardText = '';
 // Explorer, press Ctrl+V, and the host's stale text replaced it, so nothing
 // pasted. Measured against Server 2025: the remote clipboard went from
 // `files=payload.txt` to `text=HOST-TEXT-MARKER` on the keystroke.
-// Only a remote *file* list is held back from, though: both xrdp and Windows
-// advertise their clipboard the moment the channel is up, so treating any
-// Format List as a user copy made Ctrl+V a passthrough for the whole session
-// and no host content ever reached the remote. Remote text is safe to override
-// because we mirror it locally, so the user still has it either way.
-let remoteHoldsFiles = false;
+// While the remote owns the clipboard, Ctrl+V is a pure passthrough. The list's
+// *contents* are no guide to whether it matters: Windows signals an in-session
+// copy with an empty Format List naming no formats, so only its arrival counts.
+let remoteOwnsClipboard = false;
 let lastHostClipboardText = null;   // last host text we observed, for focus-time change detection
+// Lets the guard yield after one paste. Without it a host clipboard that never
+// changes can never be advertised again, so a session that opened with a remote
+// Format List (both xrdp and Windows send one immediately) swallowed every
+// paste for its whole life.
+let pasteGuardUsed = false;
 
-// Called from WASM for every remote Format List, with whether it offered files.
-// Latched, not level-triggered: xrdp follows a file list with a text-only one
-// while the selection still holds the file, so clearing on a non-file list
-// would drop the protection a moment after earning it. Released only when the
-// host clipboard is seen to change (onWindowFocus, or onPaste below).
-window.__rdp_remote_clipboard_owner = function(hasFiles) {
-    if (hasFiles) remoteHoldsFiles = true;
+// Called from WASM when the remote sends a Format List.
+window.__rdp_remote_clipboard_owner = function() {
+    remoteOwnsClipboard = true;
+    pasteGuardUsed = false;
 };
 
 // Cheap identity for whatever the host clipboard just handed us in a paste.
@@ -994,7 +994,7 @@ async function onWindowFocus() {
             lastHostClipboardText = 't:' + text;
             // The host clipboard genuinely changed, so the user copied outside
             // the session: we take ownership back from the remote.
-            remoteHoldsFiles = false;
+            remoteOwnsClipboard = false;
             wasm.set_pending_clipboard(text, session);
         }
     } catch (_) {}
@@ -1007,15 +1007,20 @@ function onPaste(e) {
     // own clipboard is what they mean to paste. Advertising ours here would
     // take ownership away and discard it. Just deliver the keystroke.
     const hostNow = hostPasteFingerprint(e);
-    if (remoteHoldsFiles) {
+    if (remoteOwnsClipboard) {
         // ...unless the host clipboard has demonstrably changed since the last
         // paste, which means the user copied something outside the session
         // after all. The browser gives no clipboard-change event on plain HTTP,
-        // so this comparison is the fallback; onWindowFocusClipboardCheck below
-        // catches it a paste earlier wherever the async Clipboard API works.
+        // so this comparison is the fallback; onWindowFocus above catches it a
+        // paste earlier wherever the async Clipboard API works.
         if (lastHostClipboardText !== null && hostNow !== lastHostClipboardText) {
-            remoteHoldsFiles = false;
+            remoteOwnsClipboard = false;
+        } else if (pasteGuardUsed) {
+            // Second press with the same host clipboard: the first one already
+            // delivered the remote's own copy, so take them at their word.
+            remoteOwnsClipboard = false;
         } else {
+            pasteGuardUsed = true;
             lastHostClipboardText = hostNow;
             sendPasteKeystrokeOnce();
             return;
@@ -1478,7 +1483,8 @@ function cleanupSession() {
     if (pasteReplayTimer) { clearTimeout(pasteReplayTimer); pasteReplayTimer = null; }
     suppressVUp = false;
     pasteKeystrokeSent = false;
-    remoteHoldsFiles = false;
+    remoteOwnsClipboard = false;
+    pasteGuardUsed = false;
     lastHostClipboardText = null;
     const fileToast = document.getElementById('rdp-file-toast');
     if (fileToast) fileToast.hidden = true;

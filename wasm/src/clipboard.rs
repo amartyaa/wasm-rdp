@@ -93,17 +93,17 @@ extern "C" {
     fn notify_remote_clipboard_has_files();
 }
 
-/// Notify JS whether the remote's clipboard now holds files. Only a file copy
-/// needs protecting: advertising the host's clipboard over the top of it
-/// discards the in-session copy, and unlike text we never mirror remote files
-/// locally, so the user would have no way back to them.
+/// Notify JS that the remote's clipboard changed (it sent a Format List).
+/// Windows signals an in-session copy with an *empty* list and names no
+/// formats at all, so the arrival of the list is the only usable signal —
+/// anything that inspects its contents misses the Windows case entirely.
 #[wasm_bindgen(inline_js = "
-export function notify_remote_clipboard_owner(has_files) {
-    window.__rdp_remote_clipboard_owner && window.__rdp_remote_clipboard_owner(has_files);
+export function notify_remote_clipboard_owner() {
+    window.__rdp_remote_clipboard_owner && window.__rdp_remote_clipboard_owner();
 }
 ")]
 extern "C" {
-    fn notify_remote_clipboard_owner(has_files: bool);
+    fn notify_remote_clipboard_owner();
 }
 
 /// Trigger a browser file download for a file received from the remote.
@@ -353,10 +353,15 @@ impl CliprdrBackend for WasmCliprdrBackend {
         // channel comes up, so "the remote sent a Format List" does not mean
         // the user copied anything in-session. Only a file list is worth
         // protecting a later Ctrl+V from.
-        let remote_has_files = available_formats
-            .iter()
-            .any(|f| f.name().map(|n| n.value()) == Some(FORMAT_NAME_FILE_LIST));
-        notify_remote_clipboard_owner(remote_has_files);
+        crate::log(&format!(
+            "Clipboard: remote format list, {} formats {:?}",
+            available_formats.len(),
+            available_formats
+                .iter()
+                .map(|f| f.name().map(|n| n.value().to_string()).unwrap_or_else(|| format!("{:?}", f.id())))
+                .collect::<Vec<_>>()
+        ));
+        notify_remote_clipboard_owner();
 
         if self.enable_text {
             let has_text = available_formats
