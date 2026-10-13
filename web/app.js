@@ -183,6 +183,10 @@ const codecBadge = document.getElementById('codec-badge');
 const btnCad = document.getElementById('btn-cad');
 const btnAltTab = document.getElementById('btn-alttab');
 const btnFullscreen = document.getElementById('btn-fullscreen');
+const btnPin = document.getElementById('btn-pin');
+const toolbarGrip = document.getElementById('toolbar-grip');
+const toolbarHint = document.getElementById('toolbar-hint');
+const btnToolbarHintDismiss = document.getElementById('btn-toolbar-hint-dismiss');
 const btnDisconnect = document.getElementById('btn-disconnect');
 const fullscreenCheckbox = document.getElementById('fullscreen-preconnect');
 const reconnectOverlay = document.getElementById('reconnect-overlay');
@@ -213,6 +217,12 @@ let frameCount = 0;
 let lastFpsUpdate = performance.now();
 let lastFrameTimestamp = 0;
 let toolbarTimeout = null;
+// Toolbar placement. Position and pin survive reloads (they are a preference);
+// the Ctrl+Shift+H hide does not, so a session never starts with no toolbar and
+// no obvious way back to it.
+let toolbarPos = null;          // {x, y} once dragged; null = default top centre
+let toolbarPinned = localStorage.getItem('rdp_toolbar_pinned') === '1';
+let toolbarForcedHidden = false;
 let lastMouseTime = 0;
 let resizeTimeout = null;
 let fpsCap = parseInt(localStorage.getItem('rdp_fps_cap') || '60', 10);
@@ -636,6 +646,8 @@ async function doConnect(username, password, domain) {
     canvasContainer.hidden = false;
     reconnectOverlay.hidden = true;
     toolbar.hidden = false;
+    applyToolbarPos();
+    maybeShowToolbarHint();
 
     // Cache credentials for next session (not password)
     localStorage.setItem('rdp_domain', domain);
@@ -716,6 +728,8 @@ async function doConnectRedirected() {
     canvasContainer.hidden = false;
     reconnectOverlay.hidden = true;
     toolbar.hidden = false;
+    applyToolbarPos();
+    maybeShowToolbarHint();
 
     resBadge.textContent = `${session.width}×${session.height}`;
     negotiatedDesktop = { w: session.width, h: session.height };
@@ -854,6 +868,13 @@ function onKeyDown(e) {
         e.preventDefault();
         releaseAllModifiers();
         toggleFullscreen();
+        return;
+    }
+    // Intercept Ctrl+Shift+H → hide/show the toolbar
+    if (e.ctrlKey && e.shiftKey && e.code === 'KeyH') {
+        e.preventDefault();
+        releaseAllModifiers();
+        toggleToolbarHidden();
         return;
     }
     // Intercept Ctrl+Shift+D → disconnect
@@ -1405,18 +1426,144 @@ btnFullscreen.addEventListener('click', toggleFullscreen);
 btnDisconnect.addEventListener('click', disconnect);
 
 function showToolbar() {
+    if (toolbarForcedHidden) return;
     toolbar.classList.add('visible');
     resetToolbarHide();
 }
 
 function resetToolbarHide() {
     clearTimeout(toolbarTimeout);
+    if (toolbarPinned) return;
     toolbarTimeout = setTimeout(() => {
         if (document.fullscreenElement) {
             toolbar.classList.remove('visible');
         }
     }, 3000);
 }
+
+// ── Toolbar placement ────────────────────────────────────
+try {
+    const saved = JSON.parse(localStorage.getItem('rdp_toolbar_pos') || 'null');
+    if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) toolbarPos = saved;
+} catch (_) { /* malformed entry — fall back to the default position */ }
+
+// Keep the bar fully on screen. Re-run on resize and fullscreen changes, or a
+// bar parked near an edge ends up unreachable on a smaller viewport.
+function applyToolbarPos() {
+    if (!toolbarPos) {
+        toolbar.classList.remove('moved');
+        toolbar.style.left = '';
+        toolbar.style.top = '';
+        return;
+    }
+    toolbar.classList.add('moved');
+    const r = toolbar.getBoundingClientRect();
+    if (r.width) {   // zero while display:none — clamp on the next show instead
+        toolbarPos = {
+            x: Math.min(Math.max(0, toolbarPos.x), Math.max(0, window.innerWidth - r.width)),
+            y: Math.min(Math.max(0, toolbarPos.y), Math.max(0, window.innerHeight - r.height)),
+        };
+    }
+    toolbar.style.left = `${toolbarPos.x}px`;
+    toolbar.style.top = `${toolbarPos.y}px`;
+}
+
+let dragPointerId = null;
+let dragOffsetX = 0;
+let dragOffsetY = 0;
+
+toolbarGrip.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    const r = toolbar.getBoundingClientRect();
+    dragOffsetX = e.clientX - r.left;
+    dragOffsetY = e.clientY - r.top;
+    dragPointerId = e.pointerId;
+    // Capture the pointer on the grip: without it the move/up events land on
+    // the canvas underneath and are forwarded as remote mouse input, so
+    // dragging the bar would also drag something inside the session.
+    toolbarGrip.setPointerCapture(e.pointerId);
+    toolbar.classList.add('dragging');
+});
+
+toolbarGrip.addEventListener('pointermove', (e) => {
+    if (dragPointerId !== e.pointerId) return;
+    e.preventDefault();
+    toolbarPos = { x: e.clientX - dragOffsetX, y: e.clientY - dragOffsetY };
+    applyToolbarPos();
+    resetToolbarHide();
+});
+
+function endToolbarDrag(e) {
+    if (dragPointerId !== e.pointerId) return;
+    dragPointerId = null;
+    toolbar.classList.remove('dragging');
+    try { toolbarGrip.releasePointerCapture(e.pointerId); } catch (_) { /* already released */ }
+    if (toolbarPos) localStorage.setItem('rdp_toolbar_pos', JSON.stringify(toolbarPos));
+}
+toolbarGrip.addEventListener('pointerup', endToolbarDrag);
+toolbarGrip.addEventListener('pointercancel', endToolbarDrag);
+
+// Double-click the grip to put the bar back where it started.
+toolbarGrip.addEventListener('dblclick', () => {
+    toolbarPos = null;
+    localStorage.removeItem('rdp_toolbar_pos');
+    applyToolbarPos();
+    showToolbar();
+});
+
+function applyToolbarPinned() {
+    btnPin.setAttribute('aria-pressed', toolbarPinned ? 'true' : 'false');
+    btnPin.title = toolbarPinned ? 'Unpin toolbar (allow auto-hide)' : 'Pin toolbar (stops auto-hide)';
+    if (toolbarPinned) {
+        clearTimeout(toolbarTimeout);
+        showToolbar();
+    } else {
+        resetToolbarHide();
+    }
+}
+
+btnPin.addEventListener('click', () => {
+    toolbarPinned = !toolbarPinned;
+    localStorage.setItem('rdp_toolbar_pinned', toolbarPinned ? '1' : '0');
+    applyToolbarPinned();
+});
+
+function toggleToolbarHidden() {
+    toolbarForcedHidden = !toolbarForcedHidden;
+    if (toolbarForcedHidden) {
+        clearTimeout(toolbarTimeout);
+        toolbar.classList.remove('visible');
+    } else {
+        showToolbar();
+    }
+}
+
+// Shown on the first connected session only. Dragging and Ctrl+Shift+H leave no
+// trace in the UI, so without this they are features nobody finds.
+function maybeShowToolbarHint() {
+    if (localStorage.getItem('rdp_toolbar_hint_seen') === '1') return;
+    if (toolbarPos) {            // already moved it, so they found it themselves
+        dismissToolbarHint();
+        return;
+    }
+    toolbarHint.hidden = false;
+    showToolbar();               // the hint points at the bar, so show the bar
+}
+
+function dismissToolbarHint() {
+    toolbarHint.hidden = true;
+    try {
+        localStorage.setItem('rdp_toolbar_hint_seen', '1');
+    } catch (_) { /* private mode — worst case they see it again next time */ }
+}
+
+btnToolbarHintDismiss.addEventListener('click', dismissToolbarHint);
+
+window.addEventListener('resize', applyToolbarPos);
+document.addEventListener('fullscreenchange', applyToolbarPos);
+applyToolbarPos();
+applyToolbarPinned();
 
 // Show toolbar when mouse is near top edge
 document.addEventListener('mousemove', (e) => {
@@ -1451,6 +1598,8 @@ function cleanupSession() {
     hudVisible = false;
     toolbar.hidden = true;
     toolbar.classList.remove('visible');
+    toolbarForcedHidden = false;
+    toolbarHint.hidden = true;
     loginScreen.hidden = false;
     setConnecting(false);
     if (document.fullscreenElement) {

@@ -569,6 +569,51 @@ html, body {
     transform: translateX(-50%) translateY(0);
 }
 
+/* Dragged away from the top centre: position comes from inline left/top, so the
+   centring transform must go. Sliding up to hide makes no sense once the bar is
+   somewhere else, so it fades instead. */
+.toolbar.moved {
+    left: 0;
+    transform: none;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+}
+
+.toolbar.moved.visible {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.toolbar.dragging,
+.toolbar.dragging .toolbar-inner {
+    transition: none;
+}
+
+.toolbar-grip {
+    display: flex;
+    align-items: center;
+    color: var(--text-secondary);
+    opacity: 0.45;
+    cursor: grab;
+    touch-action: none;       /* we handle the drag; stop the browser panning */
+    margin-right: -4px;
+}
+
+.toolbar-grip:hover {
+    opacity: 0.9;
+}
+
+.toolbar.dragging .toolbar-grip {
+    cursor: grabbing;
+}
+
+.toolbar-btn[aria-pressed="true"] {
+    background: var(--accent-glow);
+    color: #c4bfff;
+    border-color: rgba(124, 108, 255, 0.4);
+}
+
 .toolbar-inner {
     display: flex;
     align-items: center;
@@ -641,6 +686,70 @@ html, body {
     background: rgba(255,79,109,0.15);
     color: var(--danger);
     border-color: rgba(255,79,109,0.3);
+}
+
+/* ── One-time toolbar hint ──────────────────────────────── */
+.toolbar-hint {
+    position: fixed;
+    top: 64px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 5001; /* just above the toolbar it points at */
+    max-width: min(420px, 92vw);
+    padding: 14px 16px 12px;
+    background: rgba(10, 14, 26, 0.94);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.55);
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    line-height: 1.5;
+}
+
+.toolbar-hint[hidden] { display: none; }
+
+.toolbar-hint-title {
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+
+.toolbar-hint-list {
+    margin: 0 0 12px;
+    padding-left: 18px;
+    color: var(--text-secondary);
+}
+
+.toolbar-hint-list li + li {
+    margin-top: 4px;
+}
+
+.toolbar-hint kbd {
+    display: inline-block;
+    padding: 1px 5px;
+    background: rgba(255,255,255,0.1);
+    border: 1px solid var(--glass-border);
+    border-radius: 4px;
+    font-family: var(--font);
+    font-size: 0.7rem;
+    color: var(--text-primary);
+}
+
+.toolbar-hint-dismiss {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-family: var(--font);
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.toolbar-hint-dismiss:hover {
+    filter: brightness(1.1);
 }
 
 /* ── Toolbar hover zone ─────────────────────────────────── */

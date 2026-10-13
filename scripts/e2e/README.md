@@ -16,6 +16,7 @@ node e2e.js http://localhost:8092 <user> <pass> <label> --clip
 node e2e.js http://localhost:8092 <user> <pass> <label>-hidpi --hidpi --quick
 node hover.js http://localhost:8092 <user> <pass> <label>
 node rail.js  http://localhost:8091 <user> <pass>      # Windows only
+node toolbar.js http://localhost:8092 <user> <pass>
 ```
 
 `CHROME=/path/to/chrome` overrides the browser location.
@@ -28,6 +29,7 @@ node rail.js  http://localhost:8091 <user> <pass>      # Windows only
 | `hover.js` | pointer motion specifically — hovers a window close button and watches it change colour |
 | `rail.js` | RemoteApp: catalog, published window paints, keyboard and Shift into it |
 | `clip.js` | Clipboard ownership — reads the *remote session's* clipboard before and after a real Ctrl+V, in both directions |
+| `toolbar.js` | Toolbar drag/pin/hide, the one-time hint, and that dragging sends no mouse input to the session |
 
 Results land in `e2e-<label>.json` plus a console log dump and a final
 screenshot. A non-zero exit means at least one check failed.

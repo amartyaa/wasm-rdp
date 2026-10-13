@@ -188,6 +188,11 @@
     <!-- Floating Toolbar -->
     <div id="toolbar" class="toolbar" hidden>
         <div class="toolbar-inner">
+            <div id="toolbar-grip" class="toolbar-grip" title="Drag to move">
+                <svg viewBox="0 0 20 20" fill="currentColor" width="12" height="16">
+                    <path d="M7 3a1.2 1.2 0 110 2.4A1.2 1.2 0 017 3zm6 0a1.2 1.2 0 110 2.4A1.2 1.2 0 0113 3zM7 8.8a1.2 1.2 0 110 2.4 1.2 1.2 0 010-2.4zm6 0a1.2 1.2 0 110 2.4 1.2 1.2 0 010-2.4zM7 14.6a1.2 1.2 0 110 2.4 1.2 1.2 0 010-2.4zm6 0a1.2 1.2 0 110 2.4 1.2 1.2 0 010-2.4z" />
+                </svg>
+            </div>
             <div class="toolbar-group">
                 <span id="fps-badge" class="badge badge-clickable" title="Toggle Performance HUD">0 FPS</span>
                 <span id="resolution-badge" class="badge" title="Desktop resolution">--</span>
@@ -207,6 +212,11 @@
                     </svg>
                     <span>Alt+Tab</span>
                 </button>
+                <button id="btn-pin" class="toolbar-btn" title="Pin toolbar (stops auto-hide)" aria-pressed="false">
+                    <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16">
+                        <path d="M12.6 2.1a1 1 0 00-1.5.2L8.4 6.2 4.6 7.5a1 1 0 00-.4 1.6l2.7 2.7-3.2 4.5a.6.6 0 00.8.8l4.5-3.2 2.7 2.7a1 1 0 001.6-.4l1.3-3.8 3.9-2.7a1 1 0 00.2-1.5L12.6 2.1z" />
+                    </svg>
+                </button>
                 <button id="btn-fullscreen" class="toolbar-btn" title="Toggle fullscreen">
                     <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16">
                         <path d="M3 3h5v2H5v3H3V3zm9 0h5v5h-2V5h-3V3zM3 12h2v3h3v2H3v-5zm12 3h-3v2h5v-5h-2v3z" />
@@ -220,6 +230,18 @@
                 </button>
             </div>
         </div>
+    </div>
+
+    <!-- One-time toolbar hint: the drag handle and the hide shortcut are not
+         discoverable on their own, so say so once and never again. -->
+    <div id="toolbar-hint" class="toolbar-hint" hidden>
+        <div class="toolbar-hint-title">Your toolbar can move</div>
+        <ul class="toolbar-hint-list">
+            <li>Drag the handle on its left to put it anywhere; double-click the handle to recentre it.</li>
+            <li>Pin it to stop it hiding itself in fullscreen.</li>
+            <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd> hides and shows it.</li>
+        </ul>
+        <button id="btn-toolbar-hint-dismiss" class="toolbar-hint-dismiss">Got it</button>
     </div>
 
     <!-- RemoteApp taskbar (auto-hide, bottom edge) -->
