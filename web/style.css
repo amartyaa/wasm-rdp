@@ -752,6 +752,14 @@ html, body {
     filter: brightness(1.1);
 }
 
+/* Fullscreen-shortcuts hint reuses .toolbar-hint's look but sits bottom-centre
+   instead of top-centre — pre-connect fullscreen can land both hints on
+   screen in the same instant, and they must not overlap. */
+.fullscreen-hint {
+    top: auto;
+    bottom: 24px;
+}
+
 /* ── Toolbar hover zone ─────────────────────────────────── */
 .toolbar-hover-zone {
     position: fixed;
