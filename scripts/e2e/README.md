@@ -32,6 +32,7 @@ node fshint.js   http://localhost:8092 <user> <pass>
 | `clip.js` | Clipboard ownership — reads the *remote session's* clipboard before and after a real Ctrl+V, in both directions |
 | `clipsync.js` | Windows clipboard sync per permission state (`grant`/`prompt`/`deny`): first paste after connect, 10 single presses after a host copy, Shift+Insert / Ctrl+Shift+V / Edit-menu paste, no echo of session copies, rich and file clips surviving pastes |
 | `clipsync-xrdp.js` | The same model on xrdp, judged by the session's X clipboard |
+| `cliphud.js` | HUD clipboard rows — mode per permission state, last-sync direction and age, and that copied content never shows (kind + size only, masked) |
 | `toolbar.js` | Toolbar drag/pin/hide, the one-time hint, and that dragging sends no mouse input to the session |
 | `altcapture.js` | Whether Keyboard Lock really captures a **real** OS-level Alt+Tab (see the caveat below) |
 | `fshint.js` | The one-time fullscreen-shortcuts hint — shown once, dismissible, never comes back |

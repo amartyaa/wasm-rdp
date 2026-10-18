@@ -288,10 +288,24 @@ let syncedHostFp = null;
 // matched; the first host image seen after writing one is taken as that echo.
 let remoteImageEcho = false;
 
-// Called from WASM once session content has landed on the host clipboard.
-window.__rdp_host_clip_from_remote = function(text) {
-    if (text == null) remoteImageEcho = true;
-    else syncedHostFp = 't:' + text;
+// Last transfer, for the HUD: direction, kind and size only — never content,
+// since the HUD is on screen during screen-shares and clipboards hold secrets.
+let lastClipSync = null;   // { toSession, kind: 'Text'|'Image'|'File', size, at }
+function noteClipSync(toSession, kind, size) {
+    lastClipSync = { toSession, kind, size, at: Date.now() };
+    if (hudVisible) updateClipboardHud();
+}
+
+// Called from WASM once session content has landed on the host clipboard
+// (text, or null plus its byte size for an image).
+window.__rdp_host_clip_from_remote = function(text, imageBytes) {
+    if (text == null) {
+        remoteImageEcho = true;
+        noteClipSync(false, 'Image', imageBytes || 0);
+    } else {
+        syncedHostFp = 't:' + text;
+        noteClipSync(false, 'Text', text.length);
+    }
 };
 
 function hostClipKnown(fp) {
@@ -305,12 +319,13 @@ function hostClipKnown(fp) {
 }
 
 // Send a Format List and count it, so a held paste key waits for its answer.
-function advertise(send) {
+function advertise(send, kind, size) {
     try { send(); } catch (err) {
         console.warn('Clipboard advertise failed:', err);
         sendHeldPaste();
         return;
     }
+    noteClipSync(true, kind, size);
     advertsInFlight++;
     if (heldPaste) {
         clearTimeout(pasteReplayTimer);
@@ -368,6 +383,7 @@ async function checkHostClipboard(withImages) {
             await navigator.clipboard.writeText(t);
             window.__rdp_remote_clipboard_pending = false;
             syncedHostFp = 't:' + t;
+            noteClipSync(false, 'Text', t.length);
             return;
         }
         if (clipReadState !== 'granted') return;
@@ -380,14 +396,14 @@ async function checkHostClipboard(withImages) {
                 const bytes = new Uint8Array(await png.arrayBuffer());
                 if (!session) return;
                 syncedHostFp = fp;
-                advertise(() => wasm.set_pending_clipboard_image(bytes, session));
+                advertise(() => wasm.set_pending_clipboard_image(bytes, session), 'Image', bytes.length);
                 return;
             }
         }
         const text = await navigator.clipboard.readText();
         if (!text || !session || hostClipKnown('t:' + text)) return;
         syncedHostFp = 't:' + text;
-        advertise(() => wasm.set_pending_clipboard(text, session));
+        advertise(() => wasm.set_pending_clipboard(text, session), 'Text', text.length);
     } catch (_) {
         // Unfocused, or permission revoked mid-session: try again next tick.
     } finally {
@@ -413,6 +429,39 @@ function resetClipboardState() {
     keysDown.clear();
     syncedHostFp = null;
     remoteImageEcho = false;
+    lastClipSync = null;
+}
+
+const hudClipMode = document.getElementById('hud-clip-mode');
+const hudClipSync = document.getElementById('hud-clip-sync');
+const hudClipContent = document.getElementById('hud-clip-content');
+
+function updateClipboardHud() {
+    if (!hudClipMode) return;
+    let mode, why;
+    if (!textClipboardEnabled && !fileClipboardEnabled) {
+        mode = 'Off'; why = 'Clipboard sync is disabled on this server.';
+    } else if (!textClipboardEnabled) {
+        mode = 'Files only'; why = 'Text and image sync is disabled on this server.';
+    } else if (clipReadState === 'granted') {
+        mode = 'Auto'; why = 'Copies on this computer reach the session on their own; any paste method works.';
+    } else {
+        mode = clipReadState === 'denied' ? 'Paste keys (blocked)'
+            : clipReadState === 'prompt' ? 'Paste keys (ask)' : 'Paste keys';
+        why = 'Only Ctrl+V, Ctrl+Shift+V and Shift+Insert paste from this computer. '
+            + 'Allow Clipboard for this site to sync automatically.';
+    }
+    hudClipMode.textContent = mode;
+    hudClipMode.title = why;
+
+    const s = lastClipSync;
+    if (!s) { hudClipSync.textContent = '--'; hudClipContent.textContent = '--'; return; }
+    const secs = Math.max(0, Math.round((Date.now() - s.at) / 1000));
+    const ago = secs < 60 ? `${secs} s ago` : secs < 3600 ? `${Math.floor(secs / 60)} min ago`
+        : `${Math.floor(secs / 3600)} h ago`;
+    hudClipSync.textContent = `${s.toSession ? '↑ to session' : '↓ to this PC'} · ${ago}`;
+    const size = s.kind === 'Text' ? `${s.size} chars` : formatSize(s.size);
+    hudClipContent.textContent = `${s.kind} · ${size} · ••••••••`;
 }
 // Wheel scroll state: accumulate delta between throttle ticks
 let lastWheelTime = 0;
@@ -1168,13 +1217,13 @@ function onPaste(e) {
     if (!fp || hostClipKnown(fp)) { sendHeldPaste(); return; }
     syncedHostFp = fp;
 
-    if (text) { advertise(() => wasm.set_pending_clipboard(text, session)); return; }
+    if (text) { advertise(() => wasm.set_pending_clipboard(text, session), 'Text', text.length); return; }
     (file || image).arrayBuffer().then(buf => {
         if (!session) return;
         const bytes = new Uint8Array(buf);
         advertise(() => file
             ? wasm.set_pending_clipboard_file(file.name, bytes, session)
-            : wasm.set_pending_clipboard_image(bytes, session));
+            : wasm.set_pending_clipboard_image(bytes, session), file ? 'File' : 'Image', bytes.length);
     }).catch(err => {
         console.warn('Clipboard paste to WASM failed:', err);
         sendHeldPaste();
@@ -1986,6 +2035,7 @@ function startStatsInterval() {
             ? `${session.width}×${session.height} (${monitorPopups.length + 1} mon)`
             : `${session.width}×${session.height}`;
         hudCodec.textContent = session.video_codec;
+        updateClipboardHud();
 
         // Proxy latency (browser ↔ Rust server HTTP)
         const pingStart = performance.now();
@@ -2381,6 +2431,7 @@ window.addEventListener('pagehide', (e) => {
 fpsBadge.addEventListener('click', () => {
     hudVisible = !hudVisible;
     perfHud.hidden = !hudVisible;
+    if (hudVisible) updateClipboardHud();
 });
 btnCloseHud.addEventListener('click', () => {
     hudVisible = false;

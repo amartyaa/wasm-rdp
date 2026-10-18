@@ -86,7 +86,7 @@ export function write_clipboard_image(pngBytes) {
         const blob = new Blob([pngBytes], { type: 'image/png' });
         const item = new ClipboardItem({ 'image/png': blob });
         navigator.clipboard.write([item])
-            .then(() => window.__rdp_host_clip_from_remote && window.__rdp_host_clip_from_remote(null))
+            .then(() => window.__rdp_host_clip_from_remote && window.__rdp_host_clip_from_remote(null, pngBytes.length))
             .catch(e => console.warn('Clipboard image write failed:', e));
     } catch (e) {
         console.warn('ClipboardItem not supported, image cached for Ctrl+C:', e);
