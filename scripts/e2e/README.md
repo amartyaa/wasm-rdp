@@ -30,6 +30,8 @@ node fshint.js   http://localhost:8092 <user> <pass>
 | `hover.js` | pointer motion specifically — hovers a window close button and watches it change colour |
 | `rail.js` | RemoteApp: catalog, published window paints, keyboard and Shift into it |
 | `clip.js` | Clipboard ownership — reads the *remote session's* clipboard before and after a real Ctrl+V, in both directions |
+| `clipsync.js` | Windows clipboard sync per permission state (`grant`/`prompt`/`deny`): first paste after connect, 10 single presses after a host copy, Shift+Insert / Ctrl+Shift+V / Edit-menu paste, no echo of session copies, rich and file clips surviving pastes |
+| `clipsync-xrdp.js` | The same model on xrdp, judged by the session's X clipboard |
 | `toolbar.js` | Toolbar drag/pin/hide, the one-time hint, and that dragging sends no mouse input to the session |
 | `altcapture.js` | Whether Keyboard Lock really captures a **real** OS-level Alt+Tab (see the caveat below) |
 | `fshint.js` | The one-time fullscreen-shortcuts hint — shown once, dismissible, never comes back |
@@ -55,6 +57,25 @@ screenshot. A non-zero exit means at least one check failed.
   After switching away from grd, run `loginctl terminate-user <user>`; a
   lingering GNOME session makes `startwm.sh` exit in 0 s and the client shows a
   black screen that looks exactly like a client bug.
+
+## Clipboard probes
+
+`clipsync.js` judges by what Notepad in the session saves, so the Windows VM
+needs these helpers in `C:\Windows` (bare names, so the Run dialog can start
+them without typing `:` or `\`): `npad` (opens Notepad on an emptied
+`C:\cliptest\paste.txt`), `cfmt` (writes the clipboard's format names and
+text to `C:\cliptest\dump.txt`), `csettext`, `csethtml`, `csetrich` (HTML
+*and* text, like Word) and `cset` (a file), which put that content on the
+session clipboard. Log the test user off between runs so each starts fresh.
+
+- **Puppeteer's `overridePermissions` cannot deny clipboard-read**: granting
+  only `clipboard-write` still reports read as `granted`. `deny` uses CDP
+  `Browser.setPermission` instead.
+- **Keep WSL alive** for `clipsync-xrdp.js` (`wsl -d <distro> -- sleep 1500 &`).
+  A WSL VM restart mid-run empties every clipboard read and looks like a
+  client failure.
+- Edit-menu paste fails in `prompt`/`deny` by design: without the read
+  permission the browser only hands its clipboard over in a paste-key event.
 
 ## Known probe limitations
 

@@ -40,14 +40,19 @@ thread_local! {
 export function write_clipboard_text(text) {
     window.__rdp_remote_clipboard_text = text;
     window.__rdp_remote_clipboard_image = null;
+    // A write fails while the tab is unfocused; app.js retries on focus.
+    window.__rdp_remote_clipboard_pending = false;
     if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).catch(() => { _fallbackCopyText(text); });
+        navigator.clipboard.writeText(text)
+            .then(() => _landed(text))
+            .catch(() => { _fallbackCopyText(text); });
     } else {
         _fallbackCopyText(text);
     }
 }
 
 function _fallbackCopyText(text) {
+    let ok = false;
     try {
         const ta = document.createElement('textarea');
         ta.value = text;
@@ -55,11 +60,18 @@ function _fallbackCopyText(text) {
         ta.style.left = '-9999px';
         document.body.appendChild(ta);
         ta.select();
-        document.execCommand('copy');
+        ok = document.execCommand('copy');
         document.body.removeChild(ta);
     } catch (e) {
         console.warn('Clipboard write failed, data cached for Ctrl+C:', e);
     }
+    if (ok) _landed(text); else window.__rdp_remote_clipboard_pending = true;
+}
+
+// Tell app.js the host clipboard now holds session content, so it is not
+// advertised straight back as a 'new' host copy (null = an image).
+function _landed(text) {
+    window.__rdp_host_clip_from_remote && window.__rdp_host_clip_from_remote(text);
 }
 ")]
 extern "C" {
@@ -73,7 +85,9 @@ export function write_clipboard_image(pngBytes) {
     try {
         const blob = new Blob([pngBytes], { type: 'image/png' });
         const item = new ClipboardItem({ 'image/png': blob });
-        navigator.clipboard.write([item]).catch(e => console.warn('Clipboard image write failed:', e));
+        navigator.clipboard.write([item])
+            .then(() => window.__rdp_host_clip_from_remote && window.__rdp_host_clip_from_remote(null))
+            .catch(e => console.warn('Clipboard image write failed:', e));
     } catch (e) {
         console.warn('ClipboardItem not supported, image cached for Ctrl+C:', e);
     }
@@ -93,18 +107,60 @@ extern "C" {
     fn notify_remote_clipboard_has_files();
 }
 
-/// Notify JS that the remote's clipboard changed (it sent a Format List).
-/// Windows signals an in-session copy with an *empty* list and names no
-/// formats at all, so the arrival of the list is the only usable signal —
-/// anything that inspects its contents misses the Windows case entirely.
+/// Notify JS that the remote answered our Format List — the point after which a
+/// paste on the remote reads our data rather than whatever it held before.
 #[wasm_bindgen(inline_js = "
-export function notify_remote_clipboard_owner() {
-    window.__rdp_remote_clipboard_owner && window.__rdp_remote_clipboard_owner();
+export function notify_format_list_ack() {
+    window.__rdp_format_list_ack && window.__rdp_format_list_ack();
 }
 ")]
 extern "C" {
-    fn notify_remote_clipboard_owner();
+    fn notify_format_list_ack();
 }
+
+/// CLIPRDR with one addition: it reports the remote's Format List Response.
+///
+/// Sending a Format List and the paste keystroke back to back races on
+/// Windows — rdpclip registers the list asynchronously while the keystroke
+/// goes straight to the app, which then pastes the previous clipboard (measured
+/// 3/10 single presses landing). The response is the spec's "registered" signal
+/// ([MS-RDPECLIP] 3.1.5.2.3), but the cliprdr backend has no hook for it, so we
+/// peek at the header here and delegate everything else untouched.
+#[derive(Debug)]
+pub struct AckCliprdr(pub ironrdp::cliprdr::CliprdrClient);
+
+ironrdp_core::impl_as_any!(AckCliprdr);
+
+impl ironrdp::svc::SvcProcessor for AckCliprdr {
+    fn channel_name(&self) -> ironrdp::pdu::gcc::ChannelName {
+        self.0.channel_name()
+    }
+
+    fn compression_condition(&self) -> ironrdp::svc::CompressionCondition {
+        self.0.compression_condition()
+    }
+
+    fn channel_options(&self) -> ironrdp::pdu::gcc::ChannelOptions {
+        self.0.channel_options()
+    }
+
+    fn start(&mut self) -> ironrdp::pdu::PduResult<Vec<ironrdp::svc::SvcMessage>> {
+        self.0.start()
+    }
+
+    fn process(&mut self, payload: &[u8]) -> ironrdp::pdu::PduResult<Vec<ironrdp::svc::SvcMessage>> {
+        // CLIPRDR_HEADER ([MS-RDPECLIP] 2.2.1) starts with msgType (u16 LE);
+        // CB_FORMAT_LIST_RESPONSE is 0x0003 (2.2.3.2). OK or FAIL, the remote is
+        // done with our list either way, so the keystroke can go.
+        let out = self.0.process(payload);
+        if payload.starts_with(&[0x03, 0x00]) {
+            notify_format_list_ack();
+        }
+        out
+    }
+}
+
+impl ironrdp::svc::SvcClientProcessor for AckCliprdr {}
 
 /// Trigger a browser file download for a file received from the remote.
 #[wasm_bindgen(inline_js = "
@@ -349,10 +405,6 @@ impl CliprdrBackend for WasmCliprdrBackend {
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
-        // Both xrdp and Windows advertise their clipboard as soon as the
-        // channel comes up, so "the remote sent a Format List" does not mean
-        // the user copied anything in-session. Only a file list is worth
-        // protecting a later Ctrl+V from.
         crate::log(&format!(
             "Clipboard: remote format list, {} formats {:?}",
             available_formats.len(),
@@ -361,7 +413,6 @@ impl CliprdrBackend for WasmCliprdrBackend {
                 .map(|f| f.name().map(|n| n.value().to_string()).unwrap_or_else(|| format!("{:?}", f.id())))
                 .collect::<Vec<_>>()
         ));
-        notify_remote_clipboard_owner();
 
         if self.enable_text {
             let has_text = available_formats

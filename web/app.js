@@ -251,53 +251,169 @@ const RESIZE_DEBOUNCE_MS = 500;
 // is letterboxed instead. Note the cap must never apply downward: clamping the
 // shrink direction would crop the desktop out of the window rather than fit it.
 const SCALE_MAX = 1.5;
-// Local→remote paste: delay before replaying the Ctrl+V keystroke so the remote
-// registers our clipboard Format List first (covers OS clipboard registration,
-// not network RTT — both PDUs share one ordered stream).
-const PASTE_KEYSTROKE_DELAY_MS = 100;
-let suppressVUp = false;       // swallow the keyup of a deferred paste
+// ── Clipboard sync model (IronRDP web client's, plus a paste-key fallback) ──
+// Sync follows *content*, never keys. With clipboard-read granted, the host
+// clipboard is advertised the moment it changes (checkHostClipboard), so the
+// remote already holds it before the user pastes — and every paste gesture
+// works untouched: Ctrl+V, Ctrl+Shift+V, Shift+Insert, the remote app's menu.
+// Without the permission (plain HTTP, Firefox, not granted) the browser only
+// hands us its clipboard inside a 'paste' event, so its paste keys are held
+// back: onPaste advertises new content and the key is released once the remote
+// acknowledges the Format List. Releasing it earlier races rdpclip on Windows —
+// measured 3/10 single presses pasting the right text, 10/10 when held back.
+const PASTE_KEYSTROKE_DELAY_MS = 100;  // fallback when no 'paste' event fires
+const PASTE_ACK_TIMEOUT_MS = 1000;     // fallback when the remote never answers
+const CLIP_WATCH_MS = 250;
+const MODIFIER_CODES = ['ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight',
+    'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight'];
+let heldPaste = null;           // { mapping, mods } — a paste key waiting to be sent
+let pasteKeyUp = null;          // code whose keyup is swallowed (sendHeldPaste sends it)
 let pasteReplayTimer = null;
-let pasteKeystrokeSent = false; // guards sendPasteKeystrokeOnce against double-firing
-let lastSyncedClipboardText = '';
+let advertsInFlight = 0;        // our Format Lists the remote has not answered yet
+const keysDown = new Set();     // physical keys held, to re-press released modifiers
+let clipWatchTimer = null;
+let clipCheckBusy = false;
+let clipReadState = 'unsupported';  // clipboard-read permission: granted | prompt | denied
+// The channel's init exchange ends with the remote's first Format List
+// Response; a Format List sent before it would go out ahead of our
+// capabilities (out of [MS-RDPECLIP] 1.3.2.1 order), so sync waits for it.
+let clipChannelReady = false;
 
-// Clipboard ownership. A CLIPRDR Format List makes its *sender* the clipboard
-// owner, so advertising the browser host's clipboard on every Ctrl+V destroyed
-// whatever the user had just copied inside the session — copy a file in
-// Explorer, press Ctrl+V, and the host's stale text replaced it, so nothing
-// pasted. Measured against Server 2025: the remote clipboard went from
-// `files=payload.txt` to `text=HOST-TEXT-MARKER` on the keystroke.
-// While the remote owns the clipboard, Ctrl+V is a pure passthrough. The list's
-// *contents* are no guide to whether it matters: Windows signals an in-session
-// copy with an empty Format List naming no formats, so only its arrival counts.
-let remoteOwnsClipboard = false;
-let lastHostClipboardText = null;   // last host text we observed, for focus-time change detection
-// Lets the guard yield after one paste. Without it a host clipboard that never
-// changes can never be advertised again, so a session that opened with a remote
-// Format List (both xrdp and Windows send one immediately) swallowed every
-// paste for its whole life.
-let pasteGuardUsed = false;
+// Fingerprint of the host clipboard content the session already reflects —
+// we advertised it, or it came from the session. Anything else on the host is
+// a copy the remote has not seen. This comparison is the whole ownership model:
+// an in-session copy leaves the host unchanged, so it is never overwritten.
+let syncedHostFp = null;
+// A remote image comes back from the host re-encoded, so its bytes can't be
+// matched; the first host image seen after writing one is taken as that echo.
+let remoteImageEcho = false;
 
-// Called from WASM when the remote sends a Format List.
-window.__rdp_remote_clipboard_owner = function() {
-    remoteOwnsClipboard = true;
-    pasteGuardUsed = false;
+// Called from WASM once session content has landed on the host clipboard.
+window.__rdp_host_clip_from_remote = function(text) {
+    if (text == null) remoteImageEcho = true;
+    else syncedHostFp = 't:' + text;
 };
 
-// Cheap identity for whatever the host clipboard just handed us in a paste.
-function hostPasteFingerprint(e) {
-    const d = e.clipboardData;
-    if (!d) return '';
-    const files = d.files;
-    if (files && files.length) {
-        return 'f:' + Array.from(files).map(f => `${f.name}:${f.size}`).join(',');
+function hostClipKnown(fp) {
+    if (fp === syncedHostFp) return true;
+    if (remoteImageEcho && fp.startsWith('i:')) {
+        remoteImageEcho = false;
+        syncedHostFp = fp;
+        return true;
     }
-    return 't:' + (d.getData('text/plain') || '');
+    return false;
 }
 
-// Ownership is released by onWindowFocus, which already detects a changed host
-// clipboard and advertises it — the browser's closest equivalent to the OS
-// clipboard-change notification a native client gets. That path needs a secure
-// context and permission, so onPaste below carries a plain-HTTP fallback.
+// Send a Format List and count it, so a held paste key waits for its answer.
+function advertise(send) {
+    try { send(); } catch (err) {
+        console.warn('Clipboard advertise failed:', err);
+        sendHeldPaste();
+        return;
+    }
+    advertsInFlight++;
+    if (heldPaste) {
+        clearTimeout(pasteReplayTimer);
+        pasteReplayTimer = setTimeout(sendHeldPaste, PASTE_ACK_TIMEOUT_MS);
+    }
+}
+
+// Called from WASM on the remote's Format List Response.
+window.__rdp_format_list_ack = function() {
+    advertsInFlight = Math.max(0, advertsInFlight - 1);
+    if (advertsInFlight === 0 && heldPaste) sendHeldPaste();
+    if (!clipChannelReady) {
+        clipChannelReady = true;
+        checkHostClipboard(true);   // what the user copied before connecting
+    }
+};
+
+// The permission is (re)requested on every connect and every paste key while
+// undecided. Once denied the browser never prompts again, so each session says
+// how to re-enable it instead (doConnect).
+async function initClipboardRead() {
+    if (!textClipboardEnabled || !window.isSecureContext || !navigator.clipboard?.readText
+        || !navigator.permissions) return;
+    try {
+        const st = await navigator.permissions.query({ name: 'clipboard-read' });
+        clipReadState = st.state;
+        st.onchange = () => {
+            clipReadState = st.state;
+            if (st.state === 'granted') checkHostClipboard(true);
+        };
+    } catch (_) {
+        // Firefox has no clipboard-read permission: every read needs its own
+        // click, so polling is impossible there and the paste-key path is used.
+        clipReadState = 'unsupported';
+    }
+}
+
+function requestClipboardRead() {
+    if (clipReadState !== 'prompt') return;
+    // readText() is what raises the browser's permission prompt.
+    navigator.clipboard.readText().catch(() => {});
+}
+
+// Advertise the host clipboard if the session hasn't seen it. Text is checked
+// every CLIP_WATCH_MS while focused (an unchanged readText is a cheap IPC);
+// images only on focus — re-reading a screenshot's PNG every tick would not be.
+async function checkHostClipboard(withImages) {
+    if (!session || !textClipboardEnabled || !clipChannelReady || clipCheckBusy || !navigator.clipboard) return;
+    clipCheckBusy = true;
+    try {
+        // Session content that arrived while the tab was unfocused: write it
+        // now rather than reading over it.
+        if (window.__rdp_remote_clipboard_pending && window.__rdp_remote_clipboard_text != null) {
+            const t = window.__rdp_remote_clipboard_text;
+            await navigator.clipboard.writeText(t);
+            window.__rdp_remote_clipboard_pending = false;
+            syncedHostFp = 't:' + t;
+            return;
+        }
+        if (clipReadState !== 'granted') return;
+        if (withImages && navigator.clipboard.read) {
+            const item = (await navigator.clipboard.read())[0];
+            if (item && item.types.includes('image/png')) {
+                const png = await item.getType('image/png');
+                const fp = 'i:' + png.size;
+                if (hostClipKnown(fp)) return;
+                const bytes = new Uint8Array(await png.arrayBuffer());
+                if (!session) return;
+                syncedHostFp = fp;
+                advertise(() => wasm.set_pending_clipboard_image(bytes, session));
+                return;
+            }
+        }
+        const text = await navigator.clipboard.readText();
+        if (!text || !session || hostClipKnown('t:' + text)) return;
+        syncedHostFp = 't:' + text;
+        advertise(() => wasm.set_pending_clipboard(text, session));
+    } catch (_) {
+        // Unfocused, or permission revoked mid-session: try again next tick.
+    } finally {
+        clipCheckBusy = false;
+    }
+}
+
+function startClipboardWatch() {
+    if (clipWatchTimer || !textClipboardEnabled) return;
+    clipWatchTimer = setInterval(() => {
+        if (clipReadState === 'granted' && document.hasFocus()) checkHostClipboard(false);
+    }, CLIP_WATCH_MS);
+}
+
+// Per-session clipboard state, reset whenever a session is torn down.
+function resetClipboardState() {
+    if (clipWatchTimer) { clearInterval(clipWatchTimer); clipWatchTimer = null; }
+    if (pasteReplayTimer) { clearTimeout(pasteReplayTimer); pasteReplayTimer = null; }
+    heldPaste = null;
+    pasteKeyUp = null;
+    advertsInFlight = 0;
+    clipChannelReady = false;
+    keysDown.clear();
+    syncedHostFp = null;
+    remoteImageEcho = false;
+}
 // Wheel scroll state: accumulate delta between throttle ticks
 let lastWheelTime = 0;
 let accWheelDeltaY = 0;
@@ -430,6 +546,9 @@ loginForm.addEventListener('submit', async (e) => {
 
     setConnecting(true);
     hideError();
+    // Ask for clipboard-read on every connect until it is granted (requests
+    // need the click's user activation, so this can't wait for the session).
+    initClipboardRead().then(requestClipboardRead);
     flapCount = 0; // fresh user-initiated connect — clean slate for flap detection
 
     try {
@@ -702,7 +821,7 @@ async function doConnectRedirected() {
     window.removeEventListener('focus', onWindowFocus);
     document.removeEventListener('paste', onPaste);
     document.removeEventListener('copy', onCopy);
-    lastSyncedClipboardText = '';
+    resetClipboardState();
     lastWheelTime = 0; accWheelDeltaY = 0; accWheelDeltaX = 0;
     lastFrameTimestamp = 0;
 
@@ -797,6 +916,12 @@ function hideError() {
 function setupInputHandlers() {
     // Keyboard + clipboard on the main document.
     setupDocInput(document, window);
+    startClipboardWatch();
+    if (clipReadState === 'denied') {
+        showToast('Clipboard access is blocked for this site, so only Ctrl+V and Shift+Insert '
+            + 'paste from this computer. Allow Clipboard in the site settings (left of the address bar) '
+            + 'to paste with any shortcut or menu.');
+    }
     // Mouse on the main canvas. Single-monitor: offset (0,0). Multi-monitor:
     // setupMonitorSurfaces overwrites __rdpOffset with the primary's actual
     // position in the combined desktop (may be non-zero after normalization).
@@ -854,6 +979,7 @@ function attachFileDrop(el) {
 function releaseAllModifiers() {
     if (!session) return;
     altTabHolding = false;
+    keysDown.clear();
     session.send_keyboard(0x1D, false, false);  // Ctrl left up
     session.send_keyboard(0x1D, false, true);   // Ctrl right up
     session.send_keyboard(0x2A, false, false);  // Shift left up
@@ -866,6 +992,7 @@ function releaseAllModifiers() {
 
 function onKeyDown(e) {
     if (!session) return;
+    keysDown.add(e.code);
 
     // Intercept Ctrl+Shift+F → fullscreen toggle
     if (e.ctrlKey && e.shiftKey && e.code === 'KeyF') {
@@ -895,25 +1022,23 @@ function onKeyDown(e) {
         return;
     }
 
-    // Paste (Ctrl+V / Cmd+V): the V keystroke must always reach the remote —
-    // that's what makes paste work at all, including purely remote-internal
-    // copy/paste that never touches the host clipboard. When clipboard sync is
-    // enabled, give onPaste a short window to advertise the host clipboard's
-    // content via CLIPRDR first, since sending V before the remote has
-    // registered our Format List makes it paste stale data (needing a 2nd
-    // Ctrl+V on Windows, lagging on xrdp). Either way the keystroke is
-    // guaranteed to be sent: onPaste falls through to sendPasteKeystrokeOnce()
-    // when it has nothing to advertise, and the timer below is the fallback if
-    // the 'paste' DOM event never fires at all.
-    if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') {
-        suppressVUp = true; // also swallow the matching keyup
-        pasteKeystrokeSent = false;
-        if (!textClipboardEnabled && !fileClipboardEnabled) {
-            sendPasteKeystrokeOnce(); // nothing to advertise — same passthrough as Ctrl+C
-        } else {
-            pasteReplayTimer = setTimeout(sendPasteKeystrokeOnce, PASTE_KEYSTROKE_DELAY_MS);
-        }
-        return; // no preventDefault (paste fires)
+    // The browser's paste keys (Ctrl/Cmd+V, Ctrl+Shift+V, Shift+Insert): hold
+    // the key so onPaste can advertise host content the remote hasn't seen
+    // before the remote app reads its clipboard (see the sync model above).
+    // Unchanged content releases it at once; the timer covers a 'paste' event
+    // that never fires. No preventDefault, or the browser fires no 'paste'.
+    const pasteKey = ((e.ctrlKey || e.metaKey) && e.code === 'KeyV')
+        || (e.shiftKey && !e.ctrlKey && e.code === 'Insert');
+    if (pasteKey && (textClipboardEnabled || fileClipboardEnabled)) {
+        if (heldPaste) sendHeldPaste(); // keep key order on a fast second press
+        heldPaste = {
+            mapping: SCANCODE_MAP[e.code],
+            mods: MODIFIER_CODES.filter(c => keysDown.has(c)),
+        };
+        pasteKeyUp = e.code;
+        pasteReplayTimer = setTimeout(sendHeldPaste, PASTE_KEYSTROKE_DELAY_MS);
+        requestClipboardRead();
+        return;
     }
 
     // Allow Ctrl+C/Cmd+C to pass through so the browser fires the native 'copy' event.
@@ -933,9 +1058,10 @@ function onKeyUp(e) {
     if (altTabHolding && (e.code === 'ControlLeft' || e.code === 'ControlRight')) {
         endAltTab();
     }
-    // Swallow the V keyup that pairs with a deferred paste (see onKeyDown).
-    if (suppressVUp && e.code === 'KeyV') {
-        suppressVUp = false;
+    keysDown.delete(e.code);
+    // Swallow the keyup that pairs with a held paste key; sendHeldPaste sends it.
+    if (pasteKeyUp === e.code) {
+        pasteKeyUp = null;
         return;
     }
     const mapping = SCANCODE_MAP[e.code];
@@ -944,16 +1070,21 @@ function onKeyUp(e) {
     }
 }
 
-// Deliver the deferred Ctrl+V to the remote. Ctrl is still physically held by
-// the user, so we send only V down/up. Idempotent per keypress — both the
-// clipboard-advertise path in onPaste and the onKeyDown fallback timer call
-// this, and only the first call must actually send anything.
-function sendPasteKeystrokeOnce() {
+// Deliver a held paste key. A modifier released meanwhile has already reached
+// the remote as a keyup, so it is pressed again around the key — otherwise a
+// quick Ctrl+V tap arrives as a bare "v". Idempotent: onPaste, the ack and both
+// timers all call this, and only the first finds a key to send.
+function sendHeldPaste() {
     if (pasteReplayTimer) { clearTimeout(pasteReplayTimer); pasteReplayTimer = null; }
-    if (pasteKeystrokeSent || !session) return;
-    pasteKeystrokeSent = true;
-    session.send_keyboard(0x2F, true, false);  // V down
-    session.send_keyboard(0x2F, false, false); // V up
+    const p = heldPaste;
+    heldPaste = null;
+    if (!p || !p.mapping || !session) return;
+    const released = p.mods.filter(c => !keysDown.has(c));
+    const send = (m, down) => session.send_keyboard(m[0], down, m[1]);
+    for (const c of released) send(SCANCODE_MAP[c], true);
+    send(p.mapping, true);
+    send(p.mapping, false);
+    for (const c of released.reverse()) send(SCANCODE_MAP[c], false);
 }
 
 function getCanvasCoords(e) {
@@ -1012,108 +1143,42 @@ function onWheel(e) {
     if (dx !== 0) session.send_mouse_wheel(true, dx);
 }
 
-async function onWindowFocus() {
-    if (!session || !textClipboardEnabled) return;
-    try {
-        const text = await navigator.clipboard.readText();
-        if (text && text !== lastSyncedClipboardText) {
-            lastSyncedClipboardText = text;
-            lastHostClipboardText = 't:' + text;
-            // The host clipboard genuinely changed, so the user copied outside
-            // the session: we take ownership back from the remote.
-            remoteOwnsClipboard = false;
-            wasm.set_pending_clipboard(text, session);
-        }
-    } catch (_) {}
+function onWindowFocus() {
+    checkHostClipboard(true);
 }
 
+// Paste event: the browser's only clipboard hand-over without the read
+// permission, and a last check with it. Advertise content the session hasn't
+// seen, then let the held key go once the remote acknowledges.
 function onPaste(e) {
-    if (!session || !wasm) { sendPasteKeystrokeOnce(); return; }
+    if (pasteReplayTimer) { clearTimeout(pasteReplayTimer); pasteReplayTimer = null; }
+    const d = e.clipboardData;
+    if (!session || !wasm || !d || !clipChannelReady) { sendHeldPaste(); return; }
 
-    // The user's most recent copy happened inside the session, so the remote's
-    // own clipboard is what they mean to paste. Advertising ours here would
-    // take ownership away and discard it. Just deliver the keystroke.
-    const hostNow = hostPasteFingerprint(e);
-    if (remoteOwnsClipboard) {
-        // ...unless the host clipboard has demonstrably changed since the last
-        // paste, which means the user copied something outside the session
-        // after all. The browser gives no clipboard-change event on plain HTTP,
-        // so this comparison is the fallback; onWindowFocus above catches it a
-        // paste earlier wherever the async Clipboard API works.
-        if (lastHostClipboardText !== null && hostNow !== lastHostClipboardText) {
-            remoteOwnsClipboard = false;
-        } else if (pasteGuardUsed) {
-            // Second press with the same host clipboard: the first one already
-            // delivered the remote's own copy, so take them at their word.
-            remoteOwnsClipboard = false;
-        } else {
-            pasteGuardUsed = true;
-            lastHostClipboardText = hostNow;
-            sendPasteKeystrokeOnce();
-            return;
-        }
-    }
-    lastHostClipboardText = hostNow;
+    const first = d.files?.[0];
+    const file = fileClipboardEnabled && first && !first.type.startsWith('image/') ? first : null;
+    const image = !file && textClipboardEnabled
+        ? Array.from(d.items || []).find(i => i.type === 'image/png')?.getAsFile() : null;
+    const text = !file && !image && textClipboardEnabled ? d.getData('text/plain') : '';
+    const fp = file ? `f:${file.name}:${file.size}` : image ? `i:${image.size}` : text ? `t:${text}` : null;
 
-    // Files: Local→Remote file transfer via CLIPRDR.
-    if (fileClipboardEnabled) {
-        const files = e.clipboardData?.files;
-        if (files?.length > 0) {
-            const file = files[0];
-            if (!file.type.startsWith('image/')) {
-                file.arrayBuffer().then(buf => {
-                    try {
-                        wasm.set_pending_clipboard_file(file.name, new Uint8Array(buf), session);
-                    } catch (err) {
-                        console.warn('Clipboard file paste to WASM failed:', err);
-                    } finally {
-                        sendPasteKeystrokeOnce(); // Advertise (if any) then deliver the paste keystroke
-                    }
-                });
-                return;
-            }
-        }
-    }
+    // Nothing we sync, or content the session already reflects (including an
+    // in-session copy, which leaves the host clipboard as it was): the remote's
+    // own clipboard is the one to paste, so just deliver the key.
+    if (!fp || hostClipKnown(fp)) { sendHeldPaste(); return; }
+    syncedHostFp = fp;
 
-    if (textClipboardEnabled) {
-        // Check for image data first (screenshots, copied images)
-        const items = e.clipboardData?.items;
-        if (items) {
-            for (const item of items) {
-                if (item.type === 'image/png') {
-                    const blob = item.getAsFile();
-                    if (blob) {
-                        blob.arrayBuffer().then(buf => {
-                            try {
-                                const bytes = new Uint8Array(buf);
-                                wasm.set_pending_clipboard_image(bytes, session);
-                            } catch (err) {
-                                console.warn('Clipboard image paste to WASM failed:', err);
-                            } finally {
-                                sendPasteKeystrokeOnce();
-                            }
-                        });
-                        return; // image takes priority
-                    }
-                }
-            }
-        }
-
-        // Fall back to text
-        const text = e.clipboardData?.getData('text/plain');
-        if (text) {
-            try {
-                wasm.set_pending_clipboard(text, session);
-            } catch (err) {
-                console.warn('Clipboard paste to WASM failed:', err);
-            }
-        }
-    }
-
-    // Nothing left to advertise here (sync off for this content type, empty
-    // clipboard, or a purely remote-internal paste) — the keystroke must still
-    // reach the remote.
-    sendPasteKeystrokeOnce();
+    if (text) { advertise(() => wasm.set_pending_clipboard(text, session)); return; }
+    (file || image).arrayBuffer().then(buf => {
+        if (!session) return;
+        const bytes = new Uint8Array(buf);
+        advertise(() => file
+            ? wasm.set_pending_clipboard_file(file.name, bytes, session)
+            : wasm.set_pending_clipboard_image(bytes, session));
+    }).catch(err => {
+        console.warn('Clipboard paste to WASM failed:', err);
+        sendHeldPaste();
+    });
 }
 
 function onCopy(e) {
@@ -1696,21 +1761,14 @@ function cleanupSession() {
     window.removeEventListener('focus', onWindowFocus);
     document.removeEventListener('paste', onPaste);
     document.removeEventListener('copy', onCopy);
-    lastSyncedClipboardText = '';
+    resetClipboardState();
     lastWheelTime = 0; accWheelDeltaY = 0; accWheelDeltaX = 0;
     lastFrameTimestamp = 0;
     // Stop stats interval
     if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
     prevRxBytes = 0;
     prevTxBytes = 0;
-    // Reset deferred-paste state
-    if (pasteReplayTimer) { clearTimeout(pasteReplayTimer); pasteReplayTimer = null; }
-    suppressVUp = false;
-    pasteKeystrokeSent = false;
     altTabHolding = false;
-    remoteOwnsClipboard = false;
-    pasteGuardUsed = false;
-    lastHostClipboardText = null;
     const fileToast = document.getElementById('rdp-file-toast');
     if (fileToast) fileToast.hidden = true;
     // Close audio context and tear down the worklet graph
@@ -1789,7 +1847,7 @@ async function attemptReconnect() {
             window.removeEventListener('focus', onWindowFocus);
             document.removeEventListener('paste', onPaste);
             document.removeEventListener('copy', onCopy);
-            lastSyncedClipboardText = '';
+            resetClipboardState();
             lastWheelTime = 0; accWheelDeltaY = 0; accWheelDeltaX = 0;
             lastFrameTimestamp = 0;
 

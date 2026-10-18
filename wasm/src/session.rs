@@ -960,7 +960,7 @@ impl Session {
         // absent, the server sends no audio PDUs and the main loop is free from
         // audio-processing overhead — critical for smooth video playback.
         let connector = ClientConnector::new(config, socket_addr)
-            .with_static_channel(cliprdr);
+            .with_static_channel(crate::clipboard::AckCliprdr(cliprdr));
         let connector = if enable_audio {
             let rdpsnd = ironrdp::rdpsnd::client::Rdpsnd::new(
                 Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac))
@@ -1222,7 +1222,7 @@ impl Session {
         ));
 
         let connector = ClientConnector::new(config, socket_addr)
-            .with_static_channel(cliprdr);
+            .with_static_channel(crate::clipboard::AckCliprdr(cliprdr));
         let connector = if enable_audio {
             let rdpsnd = ironrdp::rdpsnd::client::Rdpsnd::new(
                 Box::new(crate::audio::WasmRdpsndHandler::new(enable_opus, enable_aac))
@@ -2045,6 +2045,14 @@ fn full_region(width: u16, height: u16) -> ironrdp::pdu::geometry::InclusiveRect
     }
 }
 
+/// Re-tag cliprdr output for the `AckCliprdr` wrapper: the active stage finds a
+/// channel by the processor's type, and the registered type is the wrapper.
+fn cliprdr_messages(
+    messages: ironrdp::cliprdr::CliprdrSvcMessages<ironrdp::cliprdr::Client>,
+) -> ironrdp::svc::SvcProcessorMessages<crate::clipboard::AckCliprdr> {
+    ironrdp::svc::SvcProcessorMessages::new(messages.into())
+}
+
 /// Run a closure against the live RAIL SVC processor, encode whatever it emits
 /// (Activate / SysCommand PDUs) and return it as a response frame.
 fn rail_svc_messages(
@@ -2151,7 +2159,7 @@ async fn run_session(
                         }
                     }
                     Some(InputEvent::Cliprdr(message)) => {
-                        if let Some(cliprdr) = active_stage.get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>() {
+                        if let Some(crate::clipboard::AckCliprdr(cliprdr)) = active_stage.get_svc_processor_mut::<crate::clipboard::AckCliprdr>() {
                             if let Some(svc_messages) = match message {
                                 ironrdp::cliprdr::backend::ClipboardMessage::SendInitiateCopy(formats) => {
                                     match cliprdr.initiate_copy(&formats) {
@@ -2188,7 +2196,7 @@ async fn run_session(
                                     None
                                 }
                             } {
-                                let frame = active_stage.process_svc_processor_messages(svc_messages)
+                                let frame = active_stage.process_svc_processor_messages(cliprdr_messages(svc_messages))
                                     .context("encode cliprdr SVC messages")?;
                                 vec![ActiveStageOutput::ResponseFrame(frame)]
                             } else {
@@ -2200,10 +2208,10 @@ async fn run_session(
                         }
                     }
                     Some(InputEvent::FileCopy(files)) => {
-                        if let Some(cliprdr) = active_stage.get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>() {
+                        if let Some(crate::clipboard::AckCliprdr(cliprdr)) = active_stage.get_svc_processor_mut::<crate::clipboard::AckCliprdr>() {
                             match cliprdr.initiate_file_copy(files) {
                                 Ok(msgs) => {
-                                    let frame = active_stage.process_svc_processor_messages(msgs)
+                                    let frame = active_stage.process_svc_processor_messages(cliprdr_messages(msgs))
                                         .context("encode cliprdr file copy messages")?;
                                     vec![ActiveStageOutput::ResponseFrame(frame)]
                                 }
