@@ -345,8 +345,10 @@ async fn embedded_handler(
     }
 }
 
-async fn ping_handler() -> &'static str {
-    "pong"
+/// Latency probe for the HUD. `no-store`, or a reverse proxy / CDN in front of
+/// us may answer from its cache and the HUD measures that hop instead.
+async fn ping_handler() -> impl IntoResponse {
+    ([(header::CACHE_CONTROL, "no-store")], "pong")
 }
 
 async fn ws_handler(

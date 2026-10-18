@@ -2037,10 +2037,12 @@ function startStatsInterval() {
         hudCodec.textContent = session.video_codec;
         updateClipboardHud();
 
-        // Proxy latency (browser ↔ Rust server HTTP)
+        // Proxy latency (browser ↔ Rust server HTTP). Relative, so it resolves
+        // under --base-path like /ws does: an absolute '/ping' there hit whatever
+        // serves the site root. Uncached, or a cache answers instead of us.
         const pingStart = performance.now();
-        fetch('/ping').then(() => {
-            hudLatency.textContent = `${Math.round(performance.now() - pingStart)} ms`;
+        fetch('ping', { cache: 'no-store' }).then((res) => {
+            hudLatency.textContent = res.ok ? `${Math.round(performance.now() - pingStart)} ms` : '-- ms';
         }).catch(() => {
             hudLatency.textContent = '-- ms';
         });
