@@ -103,10 +103,11 @@ const bad = (n, d) => { results.push(0); console.log(`  FAIL  ${n.padEnd(22)} ${
     const stat = (c) => {
       const g = c.getContext('2d', { willReadFrequently: true });
       const px = g.getImageData(0, 0, c.width, c.height).data;
+      // Every pixel: a line of typed text is ~14 px tall, so a sampled grid
+      // can miss it entirely depending on where the window happens to land.
       let h = 0, n = 0, on = 0;
-      const sx = Math.max(1, (c.width / 48) | 0), sy = Math.max(1, (c.height / 32) | 0);
-      for (let y = 2; y < c.height; y += sy) for (let x = 2; x < c.width; x += sx) {
-        const i = (y * c.width + x) * 4; n++;
+      for (let i = 0; i < px.length; i += 4) {
+        n++;
         if (px[i] > 12 || px[i + 1] > 12 || px[i + 2] > 12) on++;
         h = (h * 31 + px[i] * 7 + px[i + 1] * 11 + px[i + 2] * 13) | 0;
       }

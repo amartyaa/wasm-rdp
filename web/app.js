@@ -1975,8 +1975,15 @@ const SC_MAXIMIZE = 0xF030, SC_RESTORE = 0xF120;
 // fill-the-canvas maximize behavior.
 const railWindowedMode = remoteAppCatalog.length > 1;
 let railMaximizedFirst = false; // one-shot: auto-maximize the app's main window
-let railMainWindowId = null;    // the maximized window; its close = app exit
-let railHadWindows = false;     // guards startup's initial 0-window state
+// The host also sends the session's own shell windows (Rdptray, Program
+// Manager, a handful of helpers) and they live as long as the session does, so
+// neither "the first active window" (that is Rdptray) nor "every window gone"
+// tracks the app. They do have a tell: every one is hidden or has zero area.
+// Their order relative to our exec result is not fixed — on a reattach they
+// can arrive after it — so the app is recognised by being on screen, not by
+// when it appeared.
+let railHadAppWindow = false;   // something has been on screen at least once
+let railActiveId = null;        // last ACTIVE_WND; it can arrive before the window
 let railExitTimer = null;       // debounce for app-closed → session end
 let railTaskbarInit = false;
 
@@ -2092,11 +2099,9 @@ window.__rdp_rail_window = function(id, isNew, hasPos, x, y, hasSize, w, h, show
         attachCanvasMouse(c, 0, 0);
         // Focus the window on press before the click reaches the server-drawn chrome.
         c.addEventListener('mousedown', () => { if (session) session.rail_activate(id >>> 0); }, true);
-        win = { el, canvas: c, x: 0, y: 0, w: 0, h: 0, hidden: false };
+        win = { el, canvas: c, x: 0, y: 0, w: 0, h: 0, hidden: false, withdrawn: false };
         railWindows.set(id, win);
         structural = true;
-        railHadWindows = true;
-        if (railExitTimer) { clearTimeout(railExitTimer); railExitTimer = null; }
     }
 
     if (hasPos && (win.x !== x || win.y !== y)) {
@@ -2119,6 +2124,9 @@ window.__rdp_rail_window = function(id, isNew, hasPos, x, y, hasSize, w, h, show
     }
 
     if (showState !== -1) {
+        // Withdrawn (SW_HIDE) is not the same as minimized: a minimized app is
+        // still running in front of the user, a hidden helper window is not.
+        win.withdrawn = showState === SW_HIDE;
         const nowHidden = showState === SW_HIDE || showState === SW_SHOWMINIMIZED;
         if (nowHidden !== win.hidden) {
             win.hidden = nowHidden;
@@ -2146,6 +2154,14 @@ window.__rdp_rail_window = function(id, isNew, hasPos, x, y, hasSize, w, h, show
     if (title != null) win.el.title = title;
     railTaskbarUpsert(id, title);
 
+    if (railOnScreen(win)) {
+        railHadAppWindow = true;
+        if (railExitTimer) { clearTimeout(railExitTimer); railExitTimer = null; }
+        if ((id >>> 0) === railActiveId) maximizeFirstRailWindow(id);
+    } else {
+        scheduleRailExitCheck();
+    }
+
     if (structural) rebuildRailSurfaces();
 };
 
@@ -2156,13 +2172,13 @@ window.__rdp_rail_window = function(id, isNew, hasPos, x, y, hasSize, w, h, show
 // The window must already exist locally (has() filters the 0xFFFFFFFF "desktop
 // deactivated" order); dialogs/child windows keep their natural size.
 function maximizeFirstRailWindow(id) {
-    // Multi-app runs windowed (taskbar + launcher), so never auto-maximize —
-    // leaving railMainWindowId null routes session-end to the all-windows-gone
-    // path, which is correct when several apps share the session.
+    // Multi-app runs windowed (taskbar + launcher), so never auto-maximize.
     if (railWindowedMode) return;
-    if (railMaximizedFirst || !session || !railWindows.has(id)) return;
+    // The host marks Rdptray active before the app exists; it is hidden, so this
+    // also keeps us from maximizing it.
+    const win = railWindows.get(id);
+    if (railMaximizedFirst || !session || !win || !railOnScreen(win)) return;
     railMaximizedFirst = true;
-    railMainWindowId = id >>> 0;
     console.log(`[RAIL] maximizing window 0x${(id >>> 0).toString(16)}`);
     session.rail_activate(id >>> 0);
     session.rail_sys_command(id >>> 0, SC_MAXIMIZE);
@@ -2174,6 +2190,7 @@ function maximizeFirstRailWindow(id) {
 // WM_SYSCOMMAND yet), so this is the sole, reliable maximize trigger. Fires with
 // 0xFFFFFFFF for "no active window"; maximizeFirstRailWindow filters that out.
 window.__rdp_rail_active = function(id) {
+    railActiveId = id >>> 0;
     maximizeFirstRailWindow(id);
     railTaskbarSetActive(id);
 };
@@ -2201,22 +2218,28 @@ window.__rdp_rail_window_deleted = function(id) {
     railWindows.delete(id);
     rebuildRailSurfaces();
     console.log(`[RAIL] window deleted 0x${(id >>> 0).toString(16)} (${railWindows.size} left)`);
-    // App exit = the visible main (maximized) window closed, OR every window is
-    // gone. Prefer the main-window signal: Win11 apps keep invisible helper
-    // windows alive for seconds after the visible window closes, so waiting for
-    // size===0 adds a multi-second lag before the session ends. The host may not
-    // log the session off either (the app lingers as a process), so we end it
-    // client-side. Debounced to ride out a window being deleted+recreated.
-    const mainGone = railMaximizedFirst && (id >>> 0) === railMainWindowId;
-    if (railHadWindows && (mainGone || railWindows.size === 0)) scheduleRailExitCheck();
+    scheduleRailExitCheck();
 };
+
+// In front of the user: not withdrawn, and with real area. Withdrawn helpers
+// don't count (Win11 apps keep invisible ones alive for seconds after the
+// visible window closes); minimized windows do, the app is still running.
+function railOnScreen(w) {
+    return !w.withdrawn && w.w > 0 && w.h > 0;
+}
+
+function railAppOnScreen() {
+    for (const w of railWindows.values()) if (railOnScreen(w)) return true;
+    return false;
+}
 
 function scheduleRailExitCheck() {
     if (railExitTimer) clearTimeout(railExitTimer);
     railExitTimer = setTimeout(() => {
         railExitTimer = null;
-        const mainGone = railMainWindowId !== null && !railWindows.has(railMainWindowId);
-        if (railInUse && session && railHadWindows && (mainGone || railWindows.size === 0)) {
+        // Debounced to ride out a window being deleted and recreated (splash →
+        // main window, a dialog replacing its owner).
+        if (railInUse && session && railHadAppWindow && !railAppOnScreen()) {
             console.log('[RAIL] app closed — ending session');
             disconnect();
             showToast('Application closed — session ended.');
@@ -2256,8 +2279,8 @@ function teardownRailWindows() {
     for (const w of railWindows.values()) w.el.remove();
     railWindows.clear();
     railMaximizedFirst = false;
-    railMainWindowId = null;
-    railHadWindows = false;
+    railHadAppWindow = false;
+    railActiveId = null;
     if (railExitTimer) { clearTimeout(railExitTimer); railExitTimer = null; }
     if (railTaskbarItems) railTaskbarItems.innerHTML = '';
     if (railTaskbar) { railTaskbar.hidden = true; railTaskbar.classList.remove('visible'); }

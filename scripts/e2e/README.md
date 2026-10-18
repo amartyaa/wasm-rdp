@@ -43,6 +43,10 @@ screenshot. A non-zero exit means at least one check failed.
   `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Terminal Server\TSAppAllowList`
   before `rail.js` can launch anything, or exec fails with
   `RAIL_EXEC_E_NOT_IN_ALLOWLIST`. Note this is *not* the `Policies` key.
+- **Windows RemoteApp sessions are reused.** `rail.js` types into Notepad and
+  leaves it unsaved, so the session is disconnected, not logged off, and the
+  next RAIL run reattaches to it with that Notepad still open. Log off the
+  test user between runs, or set `RemoteAppLogoffTimeLimit` (see CLAUDE.md §4.7).
 - **grd Remote Login** redirects to a per-session endpoint and lands on the GDM
   greeter, not a desktop. Pass `--login=<PAM password>` or every input check
   silently probes the greeter and proves nothing. The greeter password is the
